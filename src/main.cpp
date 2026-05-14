@@ -416,10 +416,12 @@ std::string select_model_path(const char *argv1_model_path) {
         return argv1_model_path;
     }
 
-    const std::string exe_model = executable_dir() + "/yolov8s.rknn";
+    const std::string exe_model = executable_dir() + "/yolov8s_single_person.rknn";
     const char *candidates[] = {
-        "./yolov8s.rknn",
         exe_model.c_str(),
+		"./yolov8s_single_person.rknn",
+		"./yolov8s.rknn",
+        
     };
     for (const char *p : candidates) {
         if (p && ::access(p, R_OK) == 0) return p;
