@@ -24,7 +24,7 @@ void ensure_gstreamer_initialized() {
 
 bool recorder_trace_enabled() {
     static int enabled = [] {
-        const char *env = std::getenv("LVGL_CAMERA_REC_TRACE");
+        const char *env = std::getenv("DOORBELL_REC_TRACE");
         return (env && env[0] == '1') ? 1 : 0;
     }();
     return enabled != 0;
@@ -127,7 +127,7 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
     }
 
     const bool enable_audio = []() {
-        const char *env = std::getenv("LVGL_CAMERA_RECORD_AUDIO");
+        const char *env = std::getenv("DOORBELL_RECORD_AUDIO");
         return env==nullptr || env[0] != '0';
     }();
 
@@ -207,7 +207,7 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
     if (enable_audio) {
         g_print("[recorder] started with audio\n");
     } else {
-        g_print("[recorder] started without audio (set LVGL_CAMERA_RECORD_AUDIO=1 to enable)\n");
+        g_print("[recorder] started without audio (set DOORBELL_RECORD_AUDIO=1 to enable)\n");
     }
     return true;
 }

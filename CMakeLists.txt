@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(lvgl_camera C CXX)
+project(doorbell C CXX)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Debug)
@@ -66,7 +66,7 @@ if (CONFIG_LV_USE_LINUX_DRM)
 
 endif()
 
-add_executable(lvgl_camera
+add_executable(doorbell
     src/main.cpp
     src/camera.cpp
 	src/ui/settings.cpp
@@ -79,7 +79,7 @@ add_executable(lvgl_camera
     ${LV_LINUX_BACKEND_SRC}
 )
 
-target_compile_definitions(lvgl_camera PRIVATE DISABLE_LIBJPEG)
+target_compile_definitions(doorbell PRIVATE DISABLE_LIBJPEG)
 
 if (CONFIG_LV_USE_LINUX_DRM_GBM_BUFFERS OR CONFIG_LV_LINUX_DRM_USE_EGL)
 
@@ -96,20 +96,20 @@ if (CONFIG_LV_USE_LINUX_DRM_GBM_BUFFERS OR CONFIG_LV_LINUX_DRM_USE_EGL)
     endif()
 
     # Build GBM/DRM compatibility shims only when GBM paths are enabled.
-    target_sources(lvgl_camera PRIVATE src/drm_compat_shim.c)
+    target_sources(doorbell PRIVATE src/drm_compat_shim.c)
 
 endif()
 
 # RGA (optional, accelerates YUV->ARGB)
 # Prefer the sysroot-provided librga (e.g., 2.1.0) instead of the bundled prebuilt.
-set(LVGL_CAMERA_TARGET_ARCH OFF)
+set(DOORBELL_TARGET_ARCH OFF)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR CMAKE_CROSSCOMPILING)
-    set(LVGL_CAMERA_TARGET_ARCH ON)
+    set(DOORBELL_TARGET_ARCH ON)
 endif()
 
 set(RGA_SYSROOT "${CMAKE_SOURCE_DIR}/../../debian/sysroots/debian11-aarch64")
 set(RGA_HINT_PATH "${RGA_SYSROOT}/usr/lib/aarch64-linux-gnu")
-if (LVGL_CAMERA_TARGET_ARCH)
+if (DOORBELL_TARGET_ARCH)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(RGA REQUIRED librga)
 
@@ -125,22 +125,22 @@ if (LVGL_CAMERA_TARGET_ARCH)
             PATHS
             ${RGA_HINT_PATH}
         )
-        if (TARGET lvgl_camera AND RGA_INCLUDE_DIR)
-            target_include_directories(lvgl_camera PRIVATE ${RGA_INCLUDE_DIR})
+        if (TARGET doorbell AND RGA_INCLUDE_DIR)
+            target_include_directories(doorbell PRIVATE ${RGA_INCLUDE_DIR})
         endif()
     endif()
 else()
-    target_compile_definitions(lvgl_camera PRIVATE LVGL_CAMERA_DISABLE_RGA DISABLE_RGA)
+    target_compile_definitions(doorbell PRIVATE DOORBELL_DISABLE_RGA DISABLE_RGA)
     message(STATUS "RGA disabled on non-aarch64 host build")
 endif()
                                                 
 set(RKNN_RUNTIME_ROOT ${CMAKE_SOURCE_DIR}/../../external/rknpu2/runtime/RK356X/Linux/librknn_api)
-set(LVGL_CAMERA_USE_RKNN_YOLO OFF)
-if (LVGL_CAMERA_TARGET_ARCH)
-    set(LVGL_CAMERA_USE_RKNN_YOLO ON)
+set(DOORBELL_USE_RKNN_YOLO OFF)
+if (DOORBELL_TARGET_ARCH)
+    set(DOORBELL_USE_RKNN_YOLO ON)
 endif()
 
-if (LVGL_CAMERA_USE_RKNN_YOLO)
+if (DOORBELL_USE_RKNN_YOLO)
     set(RKNN_INCLUDE_HINT "${RKNN_RUNTIME_ROOT}/include")
     set(RKNNRT_SO_HINT "${RKNN_RUNTIME_ROOT}/aarch64/librknnrt.so")
 
@@ -160,32 +160,32 @@ if (LVGL_CAMERA_USE_RKNN_YOLO)
     )
     endif()
 
-    target_sources(lvgl_camera PRIVATE
+    target_sources(doorbell PRIVATE
         src/ai/yolov8/cpp/yolov8.cpp
         src/ai/yolov8/cpp/postprocess.cpp
     )
-    target_compile_definitions(lvgl_camera PRIVATE LVGL_CAMERA_USE_RKNN_YOLO)
+    target_compile_definitions(doorbell PRIVATE DOORBELL_USE_RKNN_YOLO)
 
     if (RKNN_INCLUDE_DIR)
-        target_include_directories(lvgl_camera PRIVATE ${RKNN_INCLUDE_DIR})
+        target_include_directories(doorbell PRIVATE ${RKNN_INCLUDE_DIR})
     endif()
     if (RKNNRT_LIB)
         message(STATUS "Using RKNN runtime: ${RKNNRT_LIB}")
-        target_link_libraries(lvgl_camera PRIVATE ${RKNNRT_LIB})
+        target_link_libraries(doorbell PRIVATE ${RKNNRT_LIB})
     else()
         message(WARNING "librknnrt.so not found, YOLOv8 inference cannot run")
     endif()
 else()
     message(STATUS "RKNN YOLO disabled on non-aarch64 host build")
 endif()
-if (LVGL_CAMERA_TARGET_ARCH AND TARGET lvgl_camera AND RGA_LIB)
-    target_link_libraries(lvgl_camera PRIVATE ${RGA_LIB})
-elseif(LVGL_CAMERA_TARGET_ARCH AND NOT RGA_FOUND)
+if (DOORBELL_TARGET_ARCH AND TARGET doorbell AND RGA_LIB)
+    target_link_libraries(doorbell PRIVATE ${RGA_LIB})
+elseif(DOORBELL_TARGET_ARCH AND NOT RGA_FOUND)
     message(WARNING "librga not found; build will fall back to CPU conversion")
 endif()
 
 # 3) 依赖库：根据你选的后端添加
-target_link_libraries(lvgl_camera
+target_link_libraries(doorbell
     PRIVATE
       lvgl                    # 来自 add_subdirectory
       m pthread
@@ -195,10 +195,10 @@ target_link_libraries(lvgl_camera
 
 # Link GBM only when enabled in config.
 if (CONFIG_LV_USE_LINUX_DRM_GBM_BUFFERS OR CONFIG_LV_LINUX_DRM_USE_EGL)
-    target_link_libraries(lvgl_camera PRIVATE ${LIBGBM_LIBRARIES})
+    target_link_libraries(doorbell PRIVATE ${LIBGBM_LIBRARIES})
 endif()
 
-target_include_directories(lvgl_camera
+target_include_directories(doorbell
     PRIVATE
 	${CMAKE_SOURCE_DIR}
 	${CMAKE_SOURCE_DIR}/src

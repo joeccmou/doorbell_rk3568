@@ -2,7 +2,7 @@
 
 #include <cstdio>
 
-#ifdef LVGL_CAMERA_USE_RKNN_YOLO
+#ifdef DOORBELL_USE_RKNN_YOLO
 #include <algorithm>
 #include <cstring>
 
@@ -10,7 +10,7 @@
 #endif
 
 YoloPersonDetector::~YoloPersonDetector() {
-#ifdef LVGL_CAMERA_USE_RKNN_YOLO
+#ifdef DOORBELL_USE_RKNN_YOLO
     if (ready_) {
         release_yolov8_model(&app_ctx_);
     }
@@ -18,7 +18,7 @@ YoloPersonDetector::~YoloPersonDetector() {
 }
 
 bool YoloPersonDetector::load(const std::string &model_path) {
-#ifdef LVGL_CAMERA_USE_RKNN_YOLO
+#ifdef DOORBELL_USE_RKNN_YOLO
 	int ret;
 	int class_num = 0;
 
@@ -75,7 +75,7 @@ bool YoloPersonDetector::load(const std::string &model_path) {
 
 bool YoloPersonDetector::detect_person(const uint8_t *rgb, uint32_t width, uint32_t height,
                                        std::vector<PersonBox> &boxes) {
-#ifdef LVGL_CAMERA_USE_RKNN_YOLO
+#ifdef DOORBELL_USE_RKNN_YOLO
     boxes.clear();
     if (!ready_ || !rgb || width == 0 || height == 0) return false;
 

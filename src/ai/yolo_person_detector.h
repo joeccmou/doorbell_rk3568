@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#ifdef LVGL_CAMERA_USE_RKNN_YOLO
+#ifdef DOORBELL_USE_RKNN_YOLO
 #include "yolov8.h"
 #endif
 
@@ -28,7 +28,7 @@ public:
 
 private:
     bool ready_ = false;
-#ifdef LVGL_CAMERA_USE_RKNN_YOLO
+#ifdef DOORBELL_USE_RKNN_YOLO
     rknn_app_context_t app_ctx_{};
 #endif
 };

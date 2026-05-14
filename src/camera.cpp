@@ -17,7 +17,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <algorithm>
-#if !defined(LVGL_CAMERA_DISABLE_RGA)
+#if !defined(DOORBELL_DISABLE_RGA)
 #include <rga/im2d.h>
 #endif
 
@@ -51,7 +51,7 @@ int clamp8(int v) {
 
 bool rga_enabled() {
 	static int enabled = [] {
-		const char *env = std::getenv("LVGL_CAMERA_RGA");
+		const char *env = std::getenv("DOORBELL_RGA");
 		if (env && (*env == '0' || *env == 'n' || *env == 'N')) return 0;
 		return 1;
 	}();
@@ -60,8 +60,8 @@ bool rga_enabled() {
 
 const char *select_dma_heap_path() {
 	static const char *chosen = [] {
-		// Allow override. Example: LVGL_CAMERA_DMA_HEAP=/dev/dma_heap/system-dma32
-		if (const char *env = std::getenv("LVGL_CAMERA_DMA_HEAP")) return env;
+		// Allow override. Example: DOORBELL_DMA_HEAP=/dev/dma_heap/system-dma32
+		if (const char *env = std::getenv("DOORBELL_DMA_HEAP")) return env;
 		// Prefer 32-bit addressable heaps to keep RGA within <4G when possible.
 		static const char *candidates[] = {
 			"/dev/dma_heap/system-dma32",
@@ -84,7 +84,7 @@ bool try_rga_convert(Camera::PixelMode mode,
 			int src_fd,
 			const uint8_t *src_va,
 			uint8_t *dst_va) {
-#if defined(LVGL_CAMERA_DISABLE_RGA)
+#if defined(DOORBELL_DISABLE_RGA)
 	(void)mode;
 	(void)width;
 	(void)height;

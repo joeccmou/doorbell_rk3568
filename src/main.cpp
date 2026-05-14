@@ -428,9 +428,9 @@ std::string select_model_path(const char *argv1_model_path) {
 }
 
 std::string select_sd_record_dir() {
-    if (const char *env = std::getenv("LVGL_CAMERA_SD_DIR")) {
+    if (const char *env = std::getenv("DOORBELL_SD_DIR")) {
         if (::access(env, W_OK) == 0) {
-            return std::string(env) + "/lvgl_camera_videos";
+            return std::string(env) + "/doorbell_videos";
         }
     }
     const char *candidates[] = {
@@ -441,10 +441,10 @@ std::string select_sd_record_dir() {
     };
     for (const char *root : candidates) {
         if (::access(root, W_OK) == 0) {
-            return std::string(root) + "/lvgl_camera_videos";
+            return std::string(root) + "/doorbell_videos";
         }
     }
-    return "/tmp/lvgl_camera_videos";
+    return "/tmp/doorbell_videos";
 }
 
 void camera_timer_cb(lv_timer_t *timer) {
@@ -712,7 +712,7 @@ int main(int argc, char **argv) {
 
     lv_init();
 
-    const std::string perf_log_path = executable_dir() + "/lvgl_camera_perf.log";
+    const std::string perf_log_path = executable_dir() + "/doorbell_rk3568_perf.log";
     init_perf_log_file(perf_log_path);
 
     lv_display_t *disp = create_display(cfg);
