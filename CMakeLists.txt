@@ -9,6 +9,69 @@ if(POLICY CMP0079)
     cmake_policy(SET CMP0079 NEW)
 endif()
 
+function(doorbell_is_sdk_root out_var candidate)
+    if(NOT candidate)
+        set(${out_var} OFF PARENT_SCOPE)
+        return()
+    endif()
+
+    get_filename_component(candidate_abs "${candidate}" ABSOLUTE)
+    if(EXISTS "${candidate_abs}/external/lvgl/9.4/lv_port_linux/lvgl/CMakeLists.txt"
+       AND EXISTS "${candidate_abs}/external/rknpu2/runtime/RK356X/Linux/librknn_api"
+       AND EXISTS "${candidate_abs}/debian/sysroots/debian11-aarch64")
+        set(${out_var} ON PARENT_SCOPE)
+        set(DOORBELL_SDK_ROOT "${candidate_abs}" CACHE PATH "Rockchip SDK root for doorbell_rk3568" FORCE)
+    else()
+        set(${out_var} OFF PARENT_SCOPE)
+    endif()
+endfunction()
+
+set(DOORBELL_SDK_ROOT_CANDIDATES "")
+if(DEFINED DOORBELL_SDK_ROOT AND NOT "${DOORBELL_SDK_ROOT}" STREQUAL "")
+    list(APPEND DOORBELL_SDK_ROOT_CANDIDATES "${DOORBELL_SDK_ROOT}")
+endif()
+if(DEFINED ENV{DOORBELL_SDK_ROOT} AND NOT "$ENV{DOORBELL_SDK_ROOT}" STREQUAL "")
+    list(APPEND DOORBELL_SDK_ROOT_CANDIDATES "$ENV{DOORBELL_SDK_ROOT}")
+endif()
+list(APPEND DOORBELL_SDK_ROOT_CANDIDATES
+    "${CMAKE_CURRENT_LIST_DIR}/../.."
+    "${CMAKE_CURRENT_LIST_DIR}/../../rk356x-linux-25250919"
+)
+
+set(DOORBELL_SDK_ROOT_FOUND OFF)
+foreach(candidate IN LISTS DOORBELL_SDK_ROOT_CANDIDATES)
+    doorbell_is_sdk_root(DOORBELL_SDK_ROOT_FOUND "${candidate}")
+    if(DOORBELL_SDK_ROOT_FOUND)
+        break()
+    endif()
+endforeach()
+
+if(NOT DOORBELL_SDK_ROOT_FOUND)
+    message(FATAL_ERROR
+        "Could not locate Rockchip SDK root. Pass "
+        "-DDOORBELL_SDK_ROOT=/path/to/rk356x-linux-25250919 or set the "
+        "DOORBELL_SDK_ROOT environment variable."
+    )
+endif()
+
+message(STATUS "Using Rockchip SDK root: ${DOORBELL_SDK_ROOT}")
+
+# camera.cpp still has an SDK-relative quoted fallback include:
+# ../../../kernel/include/uapi/linux/dma-heap.h. Build a private compatibility
+# root so the same source also compiles when -S points at smart_doorbell.
+set(DOORBELL_SDK_COMPAT_ROOT "${CMAKE_BINARY_DIR}/doorbell_sdk_compat")
+set(DOORBELL_SDK_COMPAT_INCLUDE_ROOT "${DOORBELL_SDK_COMPAT_ROOT}/app/doorbell_rk3568/src")
+file(MAKE_DIRECTORY "${DOORBELL_SDK_COMPAT_INCLUDE_ROOT}")
+file(REMOVE "${DOORBELL_SDK_COMPAT_ROOT}/kernel")
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E create_symlink
+            "${DOORBELL_SDK_ROOT}/kernel"
+            "${DOORBELL_SDK_COMPAT_ROOT}/kernel"
+    RESULT_VARIABLE DOORBELL_SDK_COMPAT_LINK_RESULT
+)
+if(NOT DOORBELL_SDK_COMPAT_LINK_RESULT EQUAL 0)
+    message(FATAL_ERROR "Could not create SDK compatibility include symlink")
+endif()
 
 set(LV_BUILD_CONF_PATH ${CMAKE_SOURCE_DIR}/lv_conf.h CACHE PATH "" FORCE)
 
@@ -16,7 +79,7 @@ set(LV_BUILD_SET_CONFIG_OPTS ON CACHE BOOL
     "create CMAKE variables from lv_conf_internal.h" FORCE)
 
 # 1) 引入 LVGL 核心
-add_subdirectory(${CMAKE_SOURCE_DIR}/../../external/lvgl/9.4/lv_port_linux/lvgl
+add_subdirectory(${DOORBELL_SDK_ROOT}/external/lvgl/9.4/lv_port_linux/lvgl
                  ${CMAKE_BINARY_DIR}/lvgl_build)
 
 # 2) 选择并加入移植层源码（从 lv_port_linux/src/lib/… 复制或引用）
@@ -80,6 +143,7 @@ add_executable(doorbell
 )
 
 target_compile_definitions(doorbell PRIVATE DISABLE_LIBJPEG)
+target_compile_options(doorbell PRIVATE "-idirafter${DOORBELL_SDK_COMPAT_INCLUDE_ROOT}")
 
 if (CONFIG_LV_USE_LINUX_DRM_GBM_BUFFERS OR CONFIG_LV_LINUX_DRM_USE_EGL)
 
@@ -107,7 +171,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR CMAKE_CROSSCOMPILING)
     set(DOORBELL_TARGET_ARCH ON)
 endif()
 
-set(RGA_SYSROOT "${CMAKE_SOURCE_DIR}/../../debian/sysroots/debian11-aarch64")
+set(RGA_SYSROOT "${DOORBELL_SDK_ROOT}/debian/sysroots/debian11-aarch64")
 set(RGA_HINT_PATH "${RGA_SYSROOT}/usr/lib/aarch64-linux-gnu")
 if (DOORBELL_TARGET_ARCH)
     find_package(PkgConfig REQUIRED)
@@ -134,7 +198,7 @@ else()
     message(STATUS "RGA disabled on non-aarch64 host build")
 endif()
                                                 
-set(RKNN_RUNTIME_ROOT ${CMAKE_SOURCE_DIR}/../../external/rknpu2/runtime/RK356X/Linux/librknn_api)
+set(RKNN_RUNTIME_ROOT ${DOORBELL_SDK_ROOT}/external/rknpu2/runtime/RK356X/Linux/librknn_api)
 set(DOORBELL_USE_RKNN_YOLO OFF)
 if (DOORBELL_TARGET_ARCH)
     set(DOORBELL_USE_RKNN_YOLO ON)
@@ -204,8 +268,7 @@ target_include_directories(doorbell
 	${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/utils
     ${CMAKE_SOURCE_DIR}/src/ai/yolov8/cpp
-	${CMAKE_SOURCE_DIR}/src/lvgl_port_linux  
-    ${CMAKE_SOURCE_DIR}/../../external/rknpu2/examples/3rdparty/stb
-    ${CMAKE_SOURCE_DIR}/../../external/lvgl/9.4/lv_port_linux/lvgl
+	${CMAKE_SOURCE_DIR}/src/lvgl_port_linux      
+    ${DOORBELL_SDK_ROOT}/external/lvgl/9.4/lv_port_linux/lvgl
     ${PKG_CONFIG_INC}
 )
