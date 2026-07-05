@@ -129,6 +129,7 @@ private:
     std::atomic<bool> http_stop_{false};
     std::atomic<int> http_fd_{-1};
     std::atomic<bool> mqtt_stop_{false};
+    std::atomic<bool> mqtt_publish_offline_{false};
 
     std::mutex mqtt_mtx_;
     void *mqtt_client_ = nullptr;

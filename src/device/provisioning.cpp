@@ -1,4 +1,4 @@
-﻿#include "device/provisioning.h"
+#include "device/provisioning.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -986,13 +986,15 @@ void DoorbellProvisioning::provisioning_worker(WifiCredentials wifi) {
 void DoorbellProvisioning::start_mqtt_session() {
     if (mqtt_thread_.joinable()) return;
     mqtt_stop_.store(false);
+    mqtt_publish_offline_.store(false);
     mqtt_thread_ = std::thread(&DoorbellProvisioning::mqtt_loop, this);
 }
 
 void DoorbellProvisioning::stop_mqtt_session(bool publish_offline) {
     if (!mqtt_thread_.joinable()) return;
+    mqtt_publish_offline_.store(publish_offline);
+    mqtt_stop_.store(true);
     if (!publish_offline) {
-        mqtt_stop_.store(true);
         {
             std::lock_guard<std::mutex> lock(mqtt_mtx_);
             if (mqtt_client_) {
@@ -1002,6 +1004,7 @@ void DoorbellProvisioning::stop_mqtt_session(bool publish_offline) {
     }
     stop_cv_.notify_all();
     mqtt_thread_.join();
+    mqtt_publish_offline_.store(false);
 }
 
 void DoorbellProvisioning::mqtt_loop() {
@@ -1102,7 +1105,7 @@ void DoorbellProvisioning::mqtt_loop() {
             }
         }
 
-        if (stop_.load() && !mqtt_stop_.load() && connected) {
+        if ((stop_.load() || mqtt_publish_offline_.load()) && connected) {
             int rc = mosquitto_publish(client,
                                        nullptr,
                                        topic.c_str(),
@@ -1257,11 +1260,17 @@ void DoorbellProvisioning::button_loop() {
 void DoorbellProvisioning::handle_long_press_reset() {
     std::fprintf(stdout, "[button] long press reset: clear wifi and enter provisioning\n");
     clear_saved_wifi();
-    stop_mqtt_session(false);
-    if (command_available("wpa_cli")) {
-        run_command(shell_quote(command_path("wpa_cli")) + " -i " + shell_quote(sta_iface_) + " disconnect >/dev/null 2>&1", false);
-    }
+    stop_mqtt_session(true);
     set_stage(Stage::WaitingProvision);
+    if (command_available("wpa_cli")) {
+        const std::string disconnect_cmd =
+            shell_quote(command_path("wpa_cli")) + " -i " + shell_quote(sta_iface_) + " disconnect >/dev/null 2>&1";
+        if (command_available("timeout")) {
+            run_command(shell_quote(command_path("timeout")) + " 3 /bin/sh -c " + shell_quote(disconnect_cmd), false);
+        } else {
+            std::fprintf(stderr, "[provision] timeout unavailable, skip wpa_cli disconnect during reset\n");
+        }
+    }
     start_access_point();
 }
 
