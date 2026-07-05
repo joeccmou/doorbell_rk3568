@@ -113,6 +113,12 @@ pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0)
 list(APPEND PKG_CONFIG_LIB ${GSTREAMER_LIBRARIES})
 list(APPEND PKG_CONFIG_INC ${GSTREAMER_INCLUDE_DIRS})
 
+pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
+pkg_check_modules(GPIOD REQUIRED libgpiod)
+pkg_check_modules(NLOHMANN_JSON REQUIRED nlohmann_json)
+list(APPEND PKG_CONFIG_LIB ${MOSQUITTO_LIBRARIES} ${GPIOD_LIBRARIES})
+list(APPEND PKG_CONFIG_INC ${MOSQUITTO_INCLUDE_DIRS} ${GPIOD_INCLUDE_DIRS} ${NLOHMANN_JSON_INCLUDE_DIRS})
+
 if (CONFIG_LV_USE_LINUX_DRM)
 
     message("Including DRM support")
@@ -132,6 +138,7 @@ endif()
 add_executable(doorbell
     src/main.cpp
     src/camera.cpp
+    src/device/provisioning.cpp
 	src/ui/settings.cpp
     src/utils/file_utils.cpp
     src/utils/image_utils.cpp

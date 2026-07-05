@@ -25,6 +25,7 @@
 #include "src/drivers/sdl/lv_sdl_mouse.h"
 
 #include "camera.h"
+#include "device/provisioning.h"
 #include "ui/settings.h"
 #include "ai/yolo_person_detector.h"
 #include "utils/mp4_recorder.h"
@@ -712,6 +713,11 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
+    DoorbellProvisioning provisioning;
+    if (!provisioning.start()) {
+        std::fprintf(stderr, "[main] provisioning service disabled\n");
+    }
+
     lv_init();
 
     const std::string perf_log_path = executable_dir() + "/doorbell_rk3568_perf.log";
@@ -857,6 +863,7 @@ int main(int argc, char **argv) {
         ctx.record_thread.join();
     }
     close_perf_log_file();
+    provisioning.stop();
     ctx.camera->stop();
     delete ctx.camera;
     return 0;
