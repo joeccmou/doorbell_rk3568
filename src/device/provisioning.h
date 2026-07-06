@@ -8,6 +8,9 @@
 
 #include <gpiod.h>
 
+struct mosquitto;
+struct mosquitto_message;
+
 class DoorbellProvisioning {
 public:
     DoorbellProvisioning();
@@ -18,6 +21,7 @@ public:
 
     bool start();
     void stop();
+    void handle_mqtt_message(mosquitto *client, const mosquitto_message *msg);
 
 private:
     enum class Stage {

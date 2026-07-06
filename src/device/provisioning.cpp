@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -32,6 +33,15 @@ constexpr const char *kWifiConfigName = "wifi.json";
 constexpr const char *kApAddress = "192.168.4.1";
 constexpr int kHttpBacklog = 8;
 
+
+std::string iso_utc_now() {
+    std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    gmtime_r(&now, &tm);
+    char buf[32]{};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buf);
+}
 std::string env_or(const char *name, const char *fallback) {
     const char *value = std::getenv(name);
     return (value && value[0] != '\0') ? std::string(value) : std::string(fallback);
@@ -274,6 +284,7 @@ struct MqttConnectState {
     bool completed = false;
     int rc = MOSQ_ERR_SUCCESS;
     const char *label = "";
+    DoorbellProvisioning *owner = nullptr;
 };
 
 std::string key_value_from_lines(const std::string &text, const std::string &key) {
@@ -379,6 +390,12 @@ void mqtt_connect_callback(struct mosquitto *, void *userdata, int rc) {
     }
 }
 
+
+void mqtt_message_callback(struct mosquitto *client, void *userdata, const struct mosquitto_message *msg) {
+    auto *state = static_cast<MqttConnectState *>(userdata);
+    if (!state || !state->owner || !msg) return;
+    state->owner->handle_mqtt_message(client, msg);
+}
 bool wait_for_mqtt_connack(mosquitto *client, MqttConnectState *state, int timeout_ms) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -1019,6 +1036,7 @@ void DoorbellProvisioning::mqtt_loop() {
 
         MqttConnectState connect_state;
         connect_state.label = "session";
+        connect_state.owner = this;
         mosquitto *client = mosquitto_new(identity_.device_id.c_str(), true, &connect_state);
         if (!client) {
             std::fprintf(stderr, "[mqtt] create session client failed\n");
@@ -1032,6 +1050,7 @@ void DoorbellProvisioning::mqtt_loop() {
         }
 
         mosquitto_connect_callback_set(client, mqtt_connect_callback);
+        mosquitto_message_callback_set(client, mqtt_message_callback);
 
         bool connected = false;
         bool ok = configure_mqtt_client(client,
@@ -1085,6 +1104,14 @@ void DoorbellProvisioning::mqtt_loop() {
                 ok = false;
             } else {
                 ok = flush_mqtt_loop(client, "session_publish", 2000);
+                const std::string command_topic = "doorbell/devices/" + identity_.device_id + "/command";
+                int sub_rc = mosquitto_subscribe(client, nullptr, command_topic.c_str(), 1);
+                if (sub_rc != MOSQ_ERR_SUCCESS) {
+                    std::fprintf(stderr, "[mqtt] subscribe command failed topic=%s rc=%d error=%s\n", command_topic.c_str(), sub_rc, mosquitto_strerror(sub_rc));
+                    ok = false;
+                } else {
+                    std::fprintf(stdout, "[mqtt] subscribed command topic=%s\n", command_topic.c_str());
+                }
             }
         }
 
@@ -1151,6 +1178,66 @@ void DoorbellProvisioning::mqtt_loop() {
     mosquitto_lib_cleanup();
 }
 
+
+void DoorbellProvisioning::handle_mqtt_message(mosquitto *client, const mosquitto_message *msg) {
+    if (!client || !msg || !msg->topic || !msg->payload) return;
+    const std::string topic(msg->topic);
+    const std::string command_topic = "doorbell/devices/" + identity_.device_id + "/command";
+    if (topic != command_topic) return;
+
+    try {
+        const std::string body(static_cast<const char *>(msg->payload), static_cast<size_t>(msg->payloadlen));
+        auto in = nlohmann::json::parse(body);
+        const std::string action = in.value("action", "");
+        const std::string trace_id = in.value("trace_id", "");
+        const std::string cmd_id = in.value("cmd_id", "");
+        const std::string call_id = in.value("call_id", "");
+        const auto publish_ack = [&]() {
+            nlohmann::json ack;
+            ack["trace_id"] = trace_id;
+            ack["cmd_id"] = cmd_id;
+            ack["device_id"] = identity_.device_id;
+            ack["ok"] = true;
+            ack["error_code"] = nullptr;
+            ack["ts"] = iso_utc_now();
+            const std::string ack_topic = "doorbell/devices/" + identity_.device_id + "/command_ack";
+            const std::string ack_payload = ack.dump();
+            mosquitto_publish(client, nullptr, ack_topic.c_str(), static_cast<int>(ack_payload.size()), ack_payload.data(), 1, false);
+        };
+
+        const auto publish_media_state = [&](const std::string &media_state) {
+            nlohmann::json media;
+            media["trace_id"] = trace_id;
+            media["device_id"] = identity_.device_id;
+            media["media_state"] = media_state;
+            media["occupant_user_id"] = nullptr;
+            media["mode"] = media_state == "idle" ? nlohmann::json(nullptr) : nlohmann::json("live_view");
+            media["call_id"] = media_state == "idle" ? nlohmann::json(nullptr) : nlohmann::json(call_id);
+            media["updated_at"] = iso_utc_now();
+            const std::string media_topic = "doorbell/devices/" + identity_.device_id + "/media_state";
+            const std::string media_payload = media.dump();
+            mosquitto_publish(client, nullptr, media_topic.c_str(), static_cast<int>(media_payload.size()), media_payload.data(), 1, true);
+        };
+
+        if (action == "start_live") {
+            publish_ack();
+            publish_media_state("connecting");
+            std::fprintf(stdout, "[mqtt] accepted start_live call_id=%s\n", call_id.c_str());
+            return;
+        }
+
+        if (action == "hangup") {
+            publish_ack();
+            publish_media_state("idle");
+            std::fprintf(stdout, "[mqtt] accepted hangup call_id=%s\n", call_id.c_str());
+            return;
+        }
+
+        std::fprintf(stdout, "[mqtt] ignore unsupported command action=%s\n", action.c_str());
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[mqtt] invalid command payload topic=%s error=%s\n", topic.c_str(), e.what());
+    }
+}
 void DoorbellProvisioning::start_led() {
     if (!configure_led_class()) {
         std::fprintf(stderr, "[led] LED class unavailable or not controllable path=%s\n", led_path_.c_str());
