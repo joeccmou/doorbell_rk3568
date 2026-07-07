@@ -2,11 +2,14 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 
 #include <gpiod.h>
+
+#include "device/live_webrtc_session.h"
 
 struct mosquitto;
 struct mosquitto_message;
@@ -22,6 +25,9 @@ public:
     bool start();
     void stop();
     void handle_mqtt_message(mosquitto *client, const mosquitto_message *msg);
+    void set_live_frame_provider(LiveWebRtcSession::FrameProvider provider);
+    void publish_live_signal(const std::string &payload);
+    void publish_live_media_state(const std::string &trace_id, const std::string &call_id, const std::string &media_state, const std::string &error_code = "", const std::string &error_message = "");
 
 private:
     enum class Stage {
@@ -80,6 +86,7 @@ private:
     void start_mqtt_session();
     void stop_mqtt_session(bool publish_offline);
     void mqtt_loop();
+    bool publish_mqtt_payload(const std::string &topic, const std::string &payload, int qos, bool retained);
 
     void start_led();
     void stop_led();
@@ -137,6 +144,7 @@ private:
 
     std::mutex mqtt_mtx_;
     void *mqtt_client_ = nullptr;
+    std::unique_ptr<LiveWebRtcSession> live_session_;
 
     GpioLine button_gpio_;
 

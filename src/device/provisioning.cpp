@@ -1,4 +1,5 @@
 #include "device/provisioning.h"
+#include "device/live_webrtc_session.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <utility>
 
@@ -517,6 +519,11 @@ DoorbellProvisioning::DoorbellProvisioning()
       button_chip_(env_or("DOORBELL_BUTTON_GPIOCHIP", "gpiochip3")),
       button_line_(env_uint_or("DOORBELL_BUTTON_LINE", 9)),
       button_active_low_(env_bool_or("DOORBELL_BUTTON_ACTIVE_LOW", true)) {
+    live_session_ = std::make_unique<LiveWebRtcSession>(
+        [this](const std::string &payload) { publish_live_signal(payload); },
+        [this](const std::string &trace_id, const std::string &call_id, const std::string &media_state) {
+            publish_live_media_state(trace_id, call_id, media_state);
+        });
     if (led_path_.empty()) {
         led_path_ = "/sys/class/leds/" + led_name_;
     }
@@ -559,6 +566,7 @@ void DoorbellProvisioning::stop() {
     stop_cv_.notify_all();
 
     stop_http_server();
+    if (live_session_) live_session_->stop();
     if (provision_thread_.joinable()) provision_thread_.join();
     stop_mqtt_session(true);
     stop_button();
@@ -1024,6 +1032,54 @@ void DoorbellProvisioning::stop_mqtt_session(bool publish_offline) {
     mqtt_publish_offline_.store(false);
 }
 
+
+bool DoorbellProvisioning::publish_mqtt_payload(const std::string &topic, const std::string &payload, int qos, bool retained) {
+    std::lock_guard<std::mutex> lock(mqtt_mtx_);
+    mosquitto *client = static_cast<mosquitto *>(mqtt_client_);
+    if (!client) return false;
+    int rc = mosquitto_publish(client,
+                               nullptr,
+                               topic.c_str(),
+                               static_cast<int>(payload.size()),
+                               payload.data(),
+                               qos,
+                               retained);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        std::fprintf(stderr, "[mqtt] publish failed topic=%s rc=%d error=%s\n", topic.c_str(), rc, mosquitto_strerror(rc));
+        return false;
+    }
+    return true;
+}
+
+void DoorbellProvisioning::set_live_frame_provider(LiveWebRtcSession::FrameProvider provider) {
+    if (live_session_) {
+        live_session_->set_frame_provider(std::move(provider));
+    }
+}
+void DoorbellProvisioning::publish_live_signal(const std::string &payload) {
+    const std::string signal_topic = "doorbell/devices/" + identity_.device_id + "/signal";
+    publish_mqtt_payload(signal_topic, payload, 1, false);
+}
+
+void DoorbellProvisioning::publish_live_media_state(const std::string &trace_id,
+                                                    const std::string &call_id,
+                                                    const std::string &media_state,
+                                                    const std::string &error_code,
+                                                    const std::string &error_message) {
+    nlohmann::json media;
+    media["trace_id"] = trace_id;
+    media["device_id"] = identity_.device_id;
+    const bool has_error = !error_code.empty();
+    media["media_state"] = media_state;
+    media["occupant_user_id"] = nullptr;
+    media["mode"] = (media_state == "idle" && !has_error) ? nlohmann::json(nullptr) : nlohmann::json("live_view");
+    media["call_id"] = (media_state == "idle" && !has_error) ? nlohmann::json(nullptr) : nlohmann::json(call_id);
+    media["error_code"] = has_error ? nlohmann::json(error_code) : nlohmann::json(nullptr);
+    media["error_message"] = has_error ? nlohmann::json(error_message) : nlohmann::json(nullptr);
+    media["updated_at"] = iso_utc_now();
+    const std::string media_topic = "doorbell/devices/" + identity_.device_id + "/media_state";
+    publish_mqtt_payload(media_topic, media.dump(), 1, true);
+}
 void DoorbellProvisioning::mqtt_loop() {
     mosquitto_lib_init();
 
@@ -1038,6 +1094,7 @@ void DoorbellProvisioning::mqtt_loop() {
         connect_state.label = "session";
         connect_state.owner = this;
         mosquitto *client = mosquitto_new(identity_.device_id.c_str(), true, &connect_state);
+        if (client) mosquitto_threaded_set(client, true);
         if (!client) {
             std::fprintf(stderr, "[mqtt] create session client failed\n");
             if (wait_for_stop_or(std::chrono::seconds(2)) || mqtt_stop_.load()) break;
@@ -1112,6 +1169,16 @@ void DoorbellProvisioning::mqtt_loop() {
                 } else {
                     std::fprintf(stdout, "[mqtt] subscribed command topic=%s\n", command_topic.c_str());
                 }
+                if (ok) {
+                    const std::string signal_topic = "doorbell/devices/" + identity_.device_id + "/signal";
+                    sub_rc = mosquitto_subscribe(client, nullptr, signal_topic.c_str(), 1);
+                    if (sub_rc != MOSQ_ERR_SUCCESS) {
+                        std::fprintf(stderr, "[mqtt] subscribe signal failed topic=%s rc=%d error=%s\n", signal_topic.c_str(), sub_rc, mosquitto_strerror(sub_rc));
+                        ok = false;
+                    } else {
+                        std::fprintf(stdout, "[mqtt] subscribed signal topic=%s\n", signal_topic.c_str());
+                    }
+                }
             }
         }
 
@@ -1183,10 +1250,16 @@ void DoorbellProvisioning::handle_mqtt_message(mosquitto *client, const mosquitt
     if (!client || !msg || !msg->topic || !msg->payload) return;
     const std::string topic(msg->topic);
     const std::string command_topic = "doorbell/devices/" + identity_.device_id + "/command";
+    const std::string signal_topic = "doorbell/devices/" + identity_.device_id + "/signal";
+    const std::string body(static_cast<const char *>(msg->payload), static_cast<size_t>(msg->payloadlen));
+
+    if (topic == signal_topic) {
+        if (live_session_) live_session_->handle_signal(body);
+        return;
+    }
     if (topic != command_topic) return;
 
     try {
-        const std::string body(static_cast<const char *>(msg->payload), static_cast<size_t>(msg->payloadlen));
         auto in = nlohmann::json::parse(body);
         const std::string action = in.value("action", "");
         const std::string trace_id = in.value("trace_id", "");
@@ -1205,30 +1278,47 @@ void DoorbellProvisioning::handle_mqtt_message(mosquitto *client, const mosquitt
             mosquitto_publish(client, nullptr, ack_topic.c_str(), static_cast<int>(ack_payload.size()), ack_payload.data(), 1, false);
         };
 
-        const auto publish_media_state = [&](const std::string &media_state) {
-            nlohmann::json media;
-            media["trace_id"] = trace_id;
-            media["device_id"] = identity_.device_id;
-            media["media_state"] = media_state;
-            media["occupant_user_id"] = nullptr;
-            media["mode"] = media_state == "idle" ? nlohmann::json(nullptr) : nlohmann::json("live_view");
-            media["call_id"] = media_state == "idle" ? nlohmann::json(nullptr) : nlohmann::json(call_id);
-            media["updated_at"] = iso_utc_now();
-            const std::string media_topic = "doorbell/devices/" + identity_.device_id + "/media_state";
-            const std::string media_payload = media.dump();
-            mosquitto_publish(client, nullptr, media_topic.c_str(), static_cast<int>(media_payload.size()), media_payload.data(), 1, true);
-        };
-
         if (action == "start_live") {
             publish_ack();
-            publish_media_state("connecting");
-            std::fprintf(stdout, "[mqtt] accepted start_live call_id=%s\n", call_id.c_str());
+            publish_live_media_state(trace_id, call_id, "connecting");
+
+            LiveWebRtcSession::StartRequest request;
+            request.trace_id = trace_id;
+            request.call_id = call_id;
+            request.device_id = identity_.device_id;
+            request.quality = in.value("quality", "720p");
+            if (in.contains("ice_servers") && in["ice_servers"].is_array()) {
+                for (const auto &item : in["ice_servers"]) {
+                    LiveWebRtcSession::IceServer server;
+                    if (item.contains("urls")) {
+                        if (item["urls"].is_array()) {
+                            for (const auto &url : item["urls"]) {
+                                if (url.is_string()) server.urls.push_back(url.get<std::string>());
+                            }
+                        } else if (item["urls"].is_string()) {
+                            server.urls.push_back(item["urls"].get<std::string>());
+                        }
+                    }
+                    server.username = item.value("username", "");
+                    server.credential = item.value("credential", "");
+                    request.ice_servers.push_back(std::move(server));
+                }
+            }
+
+            std::string error_message;
+            if (!live_session_ || !live_session_->start(request, &error_message)) {
+                publish_live_media_state(trace_id, call_id, "idle", "MEDIA_PIPELINE_FAILED", error_message);
+                std::fprintf(stderr, "[mqtt] start_live failed call_id=%s error=%s\n", call_id.c_str(), error_message.c_str());
+                return;
+            }
+            std::fprintf(stdout, "[mqtt] accepted start_live call_id=%s quality=%s\n", call_id.c_str(), request.quality.c_str());
             return;
         }
 
         if (action == "hangup") {
             publish_ack();
-            publish_media_state("idle");
+            if (live_session_) live_session_->stop();
+            publish_live_media_state(trace_id, call_id, "idle");
             std::fprintf(stdout, "[mqtt] accepted hangup call_id=%s\n", call_id.c_str());
             return;
         }

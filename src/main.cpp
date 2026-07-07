@@ -759,6 +759,21 @@ int main(int argc, char **argv) {
     ctx.camera->set_frame_ready_callback([&ctx] {
         notify_record_new_frame(&ctx);
     });
+    provisioning.set_live_frame_provider([&ctx](LiveWebRtcSession::VideoFrame &frame) {
+        thread_local std::vector<uint8_t> scratch_rgb;
+        std::lock_guard<std::mutex> camera_lock(ctx.camera_mtx);
+        if (!ctx.camera || !ctx.camera->ready()) {
+            return false;
+        }
+        frame.width = ctx.camera->width();
+        frame.height = ctx.camera->height();
+        return ctx.camera->copy_latest_frames(
+            scratch_rgb,
+            frame.data,
+            frame.seq,
+            frame.ts_ns,
+            frame.pixfmt);
+    });
     std::fprintf(stdout, "[main] camera started\n");
 
     // Wait briefly for first frame; fallback to blank buffer

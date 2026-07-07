@@ -15,7 +15,7 @@ public:
     struct Config {
         std::string device = "/dev/video0";
         uint32_t width = 1280;
-        uint32_t height = 800;
+        uint32_t height = 720;
         uint32_t fps = 24;
         uint32_t pixelformat = V4L2_PIX_FMT_UYVY;
     };

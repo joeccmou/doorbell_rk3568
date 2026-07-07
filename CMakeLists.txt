@@ -109,7 +109,7 @@ if (CONFIG_LV_USE_SDL OR CONFIG_LV_USE_DRAW_SDL)
 endif()
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0)
+pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-webrtc-1.0 gstreamer-sdp-1.0)
 list(APPEND PKG_CONFIG_LIB ${GSTREAMER_LIBRARIES})
 list(APPEND PKG_CONFIG_INC ${GSTREAMER_INCLUDE_DIRS})
 
@@ -139,6 +139,7 @@ add_executable(doorbell
     src/main.cpp
     src/camera.cpp
     src/device/provisioning.cpp
+    src/device/live_webrtc_session.cpp
 	src/ui/settings.cpp
     src/utils/file_utils.cpp
     src/utils/image_utils.cpp
@@ -149,7 +150,7 @@ add_executable(doorbell
     ${LV_LINUX_BACKEND_SRC}
 )
 
-target_compile_definitions(doorbell PRIVATE DISABLE_LIBJPEG)
+target_compile_definitions(doorbell PRIVATE DISABLE_LIBJPEG GST_USE_UNSTABLE_API)
 target_compile_options(doorbell PRIVATE "-idirafter${DOORBELL_SDK_COMPAT_INCLUDE_ROOT}")
 
 if (CONFIG_LV_USE_LINUX_DRM_GBM_BUFFERS OR CONFIG_LV_LINUX_DRM_USE_EGL)
