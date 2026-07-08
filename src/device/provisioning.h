@@ -11,8 +11,8 @@
 
 #include "device/live_webrtc_session.h"
 
-struct mosquitto;
-struct mosquitto_message;
+class LiveViewSession;
+class MqttDeviceClient;
 
 class DoorbellProvisioning {
 public:
@@ -24,10 +24,7 @@ public:
 
     bool start();
     void stop();
-    void handle_mqtt_message(mosquitto *client, const mosquitto_message *msg);
     void set_live_frame_provider(LiveWebRtcSession::FrameProvider provider);
-    void publish_live_signal(const std::string &payload);
-    void publish_live_media_state(const std::string &trace_id, const std::string &call_id, const std::string &media_state, const std::string &error_code = "", const std::string &error_message = "");
 
 private:
     enum class Stage {
@@ -74,7 +71,6 @@ private:
     bool start_access_point();
     void stop_access_point();
     bool connect_sta(const WifiCredentials &wifi);
-    bool run_mqtt_online_probe();
 
     void start_http_server();
     void stop_http_server();
@@ -82,11 +78,6 @@ private:
     void handle_http_client(int client_fd);
     void begin_provisioning(const WifiCredentials &wifi);
     void provisioning_worker(WifiCredentials wifi);
-
-    void start_mqtt_session();
-    void stop_mqtt_session(bool publish_offline);
-    void mqtt_loop();
-    bool publish_mqtt_payload(const std::string &topic, const std::string &payload, int qos, bool retained);
 
     void start_led();
     void stop_led();
@@ -139,12 +130,9 @@ private:
 
     std::atomic<bool> http_stop_{false};
     std::atomic<int> http_fd_{-1};
-    std::atomic<bool> mqtt_stop_{false};
-    std::atomic<bool> mqtt_publish_offline_{false};
 
-    std::mutex mqtt_mtx_;
-    void *mqtt_client_ = nullptr;
-    std::unique_ptr<LiveWebRtcSession> live_session_;
+    std::unique_ptr<MqttDeviceClient> mqtt_client_;
+    std::unique_ptr<LiveViewSession> live_view_session_;
 
     GpioLine button_gpio_;
 
@@ -152,5 +140,4 @@ private:
     std::thread led_thread_;
     std::thread button_thread_;
     std::thread provision_thread_;
-    std::thread mqtt_thread_;
 };

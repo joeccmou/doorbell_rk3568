@@ -15,10 +15,14 @@
 class LiveWebRtcSession {
 public:
     struct VideoFrame {
-        std::vector<uint8_t> data;
+        const uint8_t *data = nullptr;
+        size_t size = 0;
+        int dmabuf_fd = -1;
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t pixfmt = 0;
+        uint32_t stride_y = 0;
+        uint32_t stride_uv = 0;
         uint64_t seq = 0;
         uint64_t ts_ns = 0;
     };

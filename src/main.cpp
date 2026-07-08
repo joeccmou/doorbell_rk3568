@@ -182,8 +182,7 @@ void recorder_worker(UiContext *ctx) {
     uint64_t seq_duplicate_count = 0;
     uint64_t seq_regress_count = 0;
     const uint64_t hold_ns = static_cast<uint64_t>(kRecordHoldMs) * 1000ULL * 1000ULL;
-    std::vector<uint8_t> scratch_rgb;
-    std::vector<uint8_t> scratch_raw;
+    Camera::MediaFrame media_frame;
     uint64_t consumed_frame_gen = 0;
 
     {
@@ -244,7 +243,7 @@ void recorder_worker(UiContext *ctx) {
             }
             camera_width = ctx->camera->width();
             camera_height = ctx->camera->height();
-            camera_pixfmt = ctx->camera->pixel_format();
+            camera_pixfmt = ctx->camera->media_pixel_format();
         }
 
 		if (!ctx->recorder.running() || running_width != camera_width || running_height != camera_height) {
@@ -286,12 +285,14 @@ void recorder_worker(UiContext *ctx) {
             if (!ctx->camera || !ctx->camera->ready()) {
                 continue;
             }
-            frame.width = ctx->camera->width();
-            frame.height = ctx->camera->height();
-            if (!ctx->camera->copy_latest_frames(scratch_rgb, scratch_raw, frame.seq, frame.ts_ns, frame.pixfmt)) {
-                assert(false && "copy_latest_frames failed");
+            if (!ctx->camera->copy_latest_media_frame(media_frame)) {
                 continue;
             }
+            frame.width = media_frame.width;
+            frame.height = media_frame.height;
+            frame.seq = media_frame.seq;
+            frame.ts_ns = media_frame.ts_ns;
+            frame.pixfmt = media_frame.pixfmt;
         }
         if (frame.seq == 0) {
             ++seq_zero_count;
@@ -324,14 +325,11 @@ void recorder_worker(UiContext *ctx) {
             continue;
         }
         last_seen_seq = frame.seq;
-        frame.raw = std::move(scratch_raw);
-        scratch_raw.clear();
-
-        if (frame.raw.empty() || frame.width == 0 || frame.height == 0) {
+        if (media_frame.data == nullptr || media_frame.size == 0 || frame.width == 0 || frame.height == 0) {
             continue;
         }
 
-        assert(frame.width > 0 && frame.height > 0 && !frame.raw.empty() && "invalid frame");
+        assert(frame.width > 0 && frame.height > 0 && media_frame.data != nullptr && media_frame.size > 0 && "invalid media frame");
 
         // if (frame.ts_ns != 0 && last_written_ts_ns != 0) {
         //     if (frame.ts_ns > last_written_ts_ns && (frame.ts_ns - last_written_ts_ns) < kRecordFrameIntervalNs) {
@@ -344,7 +342,7 @@ void recorder_worker(UiContext *ctx) {
         // }
 
         uint64_t write_begin_ns = monotonic_time_ns();
-        bool write_ok = ctx->recorder.write_frame(frame.raw.data(), frame.raw.size(), frame.ts_ns);
+        bool write_ok = ctx->recorder.write_frame(media_frame.data, media_frame.size, frame.ts_ns);
         uint64_t write_end_ns = monotonic_time_ns();
         perf_log("record write ts_ns=%llu seq=%llu wait_ms=%.3f write_ms=%.3f ok=%d bytes=%zu\n",
                  static_cast<unsigned long long>(frame.ts_ns),
@@ -352,7 +350,7 @@ void recorder_worker(UiContext *ctx) {
                  wait_ms,
                  static_cast<double>(write_end_ns - write_begin_ns) / 1000000.0,
                  write_ok ? 1 : 0,
-                 frame.raw.size());
+                 media_frame.size);
 
         if (write_ok && frame.ts_ns != 0) {
             last_written_ts_ns = frame.ts_ns;
@@ -760,19 +758,25 @@ int main(int argc, char **argv) {
         notify_record_new_frame(&ctx);
     });
     provisioning.set_live_frame_provider([&ctx](LiveWebRtcSession::VideoFrame &frame) {
-        thread_local std::vector<uint8_t> scratch_rgb;
+        Camera::MediaFrame media_frame;
         std::lock_guard<std::mutex> camera_lock(ctx.camera_mtx);
         if (!ctx.camera || !ctx.camera->ready()) {
             return false;
         }
-        frame.width = ctx.camera->width();
-        frame.height = ctx.camera->height();
-        return ctx.camera->copy_latest_frames(
-            scratch_rgb,
-            frame.data,
-            frame.seq,
-            frame.ts_ns,
-            frame.pixfmt);
+        if (!ctx.camera->copy_latest_media_frame(media_frame)) {
+            return false;
+        }
+        frame.data = media_frame.data;
+        frame.size = media_frame.size;
+        frame.dmabuf_fd = media_frame.fd;
+        frame.width = media_frame.width;
+        frame.height = media_frame.height;
+        frame.pixfmt = media_frame.pixfmt;
+        frame.stride_y = media_frame.stride_y;
+        frame.stride_uv = media_frame.stride_uv;
+        frame.seq = media_frame.seq;
+        frame.ts_ns = media_frame.ts_ns;
+        return true;
     });
     std::fprintf(stdout, "[main] camera started\n");
 

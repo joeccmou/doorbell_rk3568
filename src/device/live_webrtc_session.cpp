@@ -246,6 +246,95 @@ std::string normalize_stun_url(const std::string &url) {
     return url;
 }
 
+std::string summarize_ice_candidate(const std::string &candidate) {
+    std::string normalized = candidate;
+    if (normalized.rfind("candidate:", 0) == 0) {
+        normalized = normalized.substr(10);
+    }
+
+    std::istringstream in(normalized);
+    std::vector<std::string> tokens;
+    std::string token;
+    while (in >> token) {
+        tokens.push_back(token);
+    }
+    if (tokens.size() < 6) {
+        return candidate;
+    }
+
+    const std::string &foundation = tokens[0];
+    const std::string &component = tokens[1];
+    const std::string &transport = tokens[2];
+    const std::string &priority = tokens[3];
+    const std::string &address = tokens[4];
+    const std::string &port = tokens[5];
+
+    std::string candidate_type;
+    std::string related_address;
+    std::string related_port;
+    std::string tcp_type;
+
+    for (size_t i = 6; i + 1 < tokens.size(); ++i) {
+        if (tokens[i] == "typ") {
+            candidate_type = tokens[i + 1];
+            ++i;
+        } else if (tokens[i] == "raddr") {
+            related_address = tokens[i + 1];
+            ++i;
+        } else if (tokens[i] == "rport") {
+            related_port = tokens[i + 1];
+            ++i;
+        } else if (tokens[i] == "tcptype") {
+            tcp_type = tokens[i + 1];
+            ++i;
+        }
+    }
+
+    std::ostringstream out;
+    out << "foundation=" << foundation
+        << " component=" << component
+        << " transport=" << transport
+        << " priority=" << priority
+        << " addr=" << address << ':' << port;
+    if (!candidate_type.empty()) {
+        out << " type=" << candidate_type;
+    }
+    if (!related_address.empty()) {
+        out << " raddr=" << related_address;
+    }
+    if (!related_port.empty()) {
+        out << " rport=" << related_port;
+    }
+    if (!tcp_type.empty()) {
+        out << " tcptype=" << tcp_type;
+    }
+    return out.str();
+}
+
+void log_sdp_candidate_lines(const char *label, const std::string &sdp) {
+    std::istringstream in(sdp);
+    std::string line;
+    size_t candidate_index = 0;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.rfind("a=candidate:", 0) == 0) {
+            ++candidate_index;
+            std::fprintf(stderr,
+                         "[live] %s sdp-candidate[%zu] %s\n",
+                         label,
+                         candidate_index,
+                         summarize_ice_candidate(line.substr(2)).c_str());
+        } else if (line.rfind("c=IN ", 0) == 0) {
+            std::fprintf(stderr,
+                         "[live] %s sdp-connection %s\n",
+                         label,
+                         line.c_str());
+        }
+    }
+}
+
 void on_negotiation_needed_cb(GstElement *, gpointer user_data) {
     static_cast<LiveWebRtcSession *>(user_data)->on_negotiation_needed();
 }
@@ -324,8 +413,9 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
     VideoFrame initial_frame;
     bool got_initial_frame = false;
     for (int attempt = 0; attempt < 50 && !got_initial_frame; ++attempt) {
-        got_initial_frame = provider(initial_frame) &&
-                            !initial_frame.data.empty() &&
+                got_initial_frame = provider(initial_frame) &&
+                            initial_frame.data != nullptr &&
+                            initial_frame.size != 0 &&
                             initial_frame.width != 0 &&
                             initial_frame.height != 0;
         if (!got_initial_frame) {
@@ -339,7 +429,7 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
 
     const char *gst_format = gst_format_for_pixfmt(initial_frame.pixfmt);
     const size_t frame_size = raw_frame_size(initial_frame.pixfmt, initial_frame.width, initial_frame.height);
-    if (!gst_format || frame_size == 0 || initial_frame.data.size() < frame_size) {
+    if (!gst_format || frame_size == 0 || initial_frame.size < frame_size) {
         if (error_message) *error_message = "camera frame format unsupported for WebRTC";
         std::fprintf(stderr,
                      "[live] unsupported camera frame fmt=%c%c%c%c size=%ux%u bytes=%zu expected=%zu\n",
@@ -349,7 +439,7 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
                      (initial_frame.pixfmt >> 24) & 0xFF,
                      initial_frame.width,
                      initial_frame.height,
-                     initial_frame.data.size(),
+                     initial_frame.size,
                      frame_size);
         return false;
     }
@@ -370,9 +460,7 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
          << "caps=video/x-raw,format=" << gst_format
          << ",width=" << initial_frame.width
          << ",height=" << initial_frame.height
-         << ",framerate=24/1 ! queue name=raw_queue leaky=downstream max-size-buffers=2 ! "
-         << "videoconvert ! "
-         << "mpph264enc name=live_enc bps=" << profile.bitrate << " gop=24 header-mode=each-idr ! "
+         << ",framerate=24/1 ! queue name=raw_queue leaky=downstream max-size-buffers=2 ! "         << "mpph264enc name=live_enc bps=" << profile.bitrate << " gop=24 header-mode=each-idr ! "
          << "h264parse name=live_parse config-interval=-1 ! "
          << "rtph264pay name=live_pay pt=96 config-interval=-1 ! "
          << kH264RtpCaps << " ! queue name=rtp_queue";
@@ -763,8 +851,9 @@ void LiveWebRtcSession::frame_push_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(3));
             continue;
         }
-        if (frame.width != expected_width || frame.height != expected_height ||
-            frame.pixfmt != expected_pixfmt || frame.data.size() < expected_size) {
+        if (frame.data == nullptr ||
+            frame.width != expected_width || frame.height != expected_height ||
+            frame.pixfmt != expected_pixfmt || frame.size < expected_size) {
             std::fprintf(stderr,
                          "[live] drop camera frame seq=%llu reason=caps-mismatch got=%ux%u fmt=%c%c%c%c bytes=%zu expected=%ux%u fmt=%c%c%c%c bytes=%zu\n",
                          static_cast<unsigned long long>(frame.seq),
@@ -774,7 +863,7 @@ void LiveWebRtcSession::frame_push_loop() {
                          (frame.pixfmt >> 8) & 0xFF,
                          (frame.pixfmt >> 16) & 0xFF,
                          (frame.pixfmt >> 24) & 0xFF,
-                         frame.data.size(),
+                         frame.size,
                          expected_width,
                          expected_height,
                          expected_pixfmt & 0xFF,
@@ -799,7 +888,7 @@ void LiveWebRtcSession::frame_push_loop() {
             gst_object_unref(appsrc);
             continue;
         }
-        std::memcpy(map.data, frame.data.data(), expected_size);
+        std::memcpy(map.data, frame.data, expected_size);
         gst_buffer_unmap(buffer, &map);
 
         uint64_t pts_ns = pushed * kFrameDurationNs;
@@ -958,6 +1047,7 @@ void LiveWebRtcSession::on_offer_created(GstPromise *promise) {
     if (sdp_text) {
         std::string sdp(sdp_text);
         std::fprintf(stderr, "[live] offer created sdp_len=%zu\n", sdp.size());
+        log_sdp_candidate_lines("local-offer", sdp);
         publish_signal("offer", &sdp, nullptr);
         g_free(sdp_text);
     }
@@ -969,12 +1059,14 @@ void LiveWebRtcSession::on_offer_created(GstPromise *promise) {
 
 void LiveWebRtcSession::on_ice_candidate(unsigned int mline_index, const char *candidate) {
     if (!candidate || candidate[0] == '\0') return;
+    const std::string candidate_text(candidate);
     std::fprintf(stderr,
-                 "[live] ICE candidate generated mline=%u len=%zu\n",
+                 "[live] ICE local candidate mline=%u len=%zu %s\n",
                  mline_index,
-                 std::string(candidate).size());
+                 candidate_text.size(),
+                 summarize_ice_candidate(candidate_text).c_str());
     nlohmann::json value;
-    value["candidate"] = candidate;
+    value["candidate"] = candidate_text;
     value["sdpMid"] = "0";
     value["sdpMLineIndex"] = mline_index;
     publish_signal("candidate", nullptr, &value);
@@ -1022,6 +1114,7 @@ void LiveWebRtcSession::handle_answer(const nlohmann::json &signal) {
                  "[live] handle answer call_id=%s sdp_len=%zu\n",
                  signal.value("call_id", "").c_str(),
                  sdp.size());
+    log_sdp_candidate_lines("remote-answer", sdp);
     if (sdp.empty()) return;
 
     GstSDPMessage *sdp_msg = nullptr;
@@ -1057,8 +1150,9 @@ void LiveWebRtcSession::handle_candidate(const nlohmann::json &signal) {
     if (candidate.empty()) return;
     const unsigned int mline_index = candidate_value.value("sdpMLineIndex", 0u);
     std::fprintf(stderr,
-                 "[live] handle remote candidate mline=%u len=%zu\n",
+                 "[live] ICE remote candidate mline=%u len=%zu %s\n",
                  mline_index,
-                 candidate.size());
+                 candidate.size(),
+                 summarize_ice_candidate(candidate).c_str());
     g_signal_emit_by_name(webrtc, "add-ice-candidate", mline_index, candidate.c_str());
 }

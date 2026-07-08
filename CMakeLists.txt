@@ -3,6 +3,7 @@ project(doorbell C CXX)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Debug)
+include(CTest)
 
 # Allow linking to targets defined in subdirectories (lvgl) from this directory.
 if(POLICY CMP0079)
@@ -78,11 +79,11 @@ set(LV_BUILD_CONF_PATH ${CMAKE_SOURCE_DIR}/lv_conf.h CACHE PATH "" FORCE)
 set(LV_BUILD_SET_CONFIG_OPTS ON CACHE BOOL
     "create CMAKE variables from lv_conf_internal.h" FORCE)
 
-# 1) 引入 LVGL 核心
+# 1) 寮曞叆 LVGL 鏍稿績
 add_subdirectory(${DOORBELL_SDK_ROOT}/external/lvgl/9.4/lv_port_linux/lvgl
                  ${CMAKE_BINARY_DIR}/lvgl_build)
 
-# 2) 选择并加入移植层源码（从 lv_port_linux/src/lib/… 复制或引用）
+# 2) 閫夋嫨骞跺姞鍏ョЩ妞嶅眰婧愮爜锛堜粠 lv_port_linux/src/lib/鈥?澶嶅埗鎴栧紩鐢級
 set(LV_LINUX_BACKEND_SRC "")
 
 if (CONFIG_LV_USE_EVDEV)
@@ -138,7 +139,9 @@ endif()
 add_executable(doorbell
     src/main.cpp
     src/camera.cpp
+    src/device/mqtt_device_client.cpp
     src/device/provisioning.cpp
+    src/device/live_view_session.cpp
     src/device/live_webrtc_session.cpp
 	src/ui/settings.cpp
     src/utils/file_utils.cpp
@@ -256,10 +259,10 @@ elseif(DOORBELL_TARGET_ARCH AND NOT RGA_FOUND)
     message(WARNING "librga not found; build will fall back to CPU conversion")
 endif()
 
-# 3) 依赖库：根据你选的后端添加
+# 3) 渚濊禆搴擄細鏍规嵁浣犻€夌殑鍚庣娣诲姞
 target_link_libraries(doorbell
     PRIVATE
-      lvgl                    # 来自 add_subdirectory
+      lvgl                    # 鏉ヨ嚜 add_subdirectory
       m pthread
       ${PKG_CONFIG_LIB}
       ${LIBDRM_LIBRARIES}
@@ -280,3 +283,24 @@ target_include_directories(doorbell
     ${DOORBELL_SDK_ROOT}/external/lvgl/9.4/lv_port_linux/lvgl
     ${PKG_CONFIG_INC}
 )
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/live_view_session_test.cpp")
+    add_executable(live_view_session_test
+        tests/live_view_session_test.cpp
+        src/device/live_view_session.cpp
+        src/device/live_webrtc_session.cpp
+    )
+    target_compile_definitions(live_view_session_test PRIVATE GST_USE_UNSTABLE_API)
+    target_include_directories(live_view_session_test
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src
+        ${PKG_CONFIG_INC}
+    )
+    target_link_libraries(live_view_session_test
+        PRIVATE
+        pthread
+        ${GSTREAMER_LIBRARIES}
+    )
+    add_test(NAME live_view_session_test COMMAND live_view_session_test)
+endif()

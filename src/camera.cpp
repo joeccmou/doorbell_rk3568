@@ -108,11 +108,11 @@ bool try_rga_convert(Camera::PixelMode mode,
 	switch (mode) {
 		case Camera::PixelMode::UYVY:
 			rga_fmt = RK_FORMAT_UYVY_422;
-			src_wstride_px = src_stride_bytes / 2; // 2 bytes per pixel
+			src_wstride_px = src_stride_bytes / 2;
 			break;
 		case Camera::PixelMode::NV12:
 			rga_fmt = RK_FORMAT_YCbCr_420_SP;
-			src_wstride_px = src_stride_bytes; // 1 byte per Y pixel
+			src_wstride_px = src_stride_bytes;
 			break;
 		case Camera::PixelMode::NV21:
 			rga_fmt = RK_FORMAT_YCrCb_420_SP;
@@ -135,7 +135,6 @@ bool try_rga_convert(Camera::PixelMode mode,
 	rga_buffer_t dst_buf = wrapbuffer_virtualaddr(dst_va, width, height, RK_FORMAT_RGB_888,
 				static_cast<int>(width), static_cast<int>(height));
 
-	// Force limited-range BT.601, matching most USB/MIPI camera outputs to avoid green/dark cast.
 	IM_STATUS st = imcvtcolor(src_buf, dst_buf, rga_fmt, RK_FORMAT_RGB_888, IM_YUV_TO_RGB_BT709_LIMIT, 1, nullptr);
 	static bool logged = false;
 	if (st != IM_STATUS_SUCCESS) {
@@ -146,7 +145,89 @@ bool try_rga_convert(Camera::PixelMode mode,
 		rga_suppressed = true;
 		return false;
 	}
-	// std::fprintf(stdout, "[rga] imcvtcolor success fmt=%d %ux%u\n", rga_fmt, width, height);
+	return true;
+#endif
+}
+
+bool try_rga_convert_to_nv12(Camera::PixelMode mode,
+				 uint32_t width,
+				 uint32_t height,
+				 uint32_t src_stride_bytes,
+				 uint32_t src_hstride,
+				 int src_fd,
+				 const uint8_t *src_va,
+				 int dst_fd,
+				 uint8_t *dst_va) {
+#if defined(DOORBELL_DISABLE_RGA)
+	(void)mode;
+	(void)width;
+	(void)height;
+	(void)src_stride_bytes;
+	(void)src_hstride;
+	(void)src_fd;
+	(void)src_va;
+	(void)dst_fd;
+	(void)dst_va;
+	return false;
+#else
+	if (!rga_enabled() || (dst_fd < 0 && !dst_va)) {
+		return false;
+	}
+
+	int src_fmt = 0;
+	uint32_t src_wstride_px = 0;
+	switch (mode) {
+		case Camera::PixelMode::UYVY:
+			src_fmt = RK_FORMAT_UYVY_422;
+			src_wstride_px = src_stride_bytes / 2;
+			break;
+		case Camera::PixelMode::NV12:
+			src_fmt = RK_FORMAT_YCbCr_420_SP;
+			src_wstride_px = src_stride_bytes;
+			break;
+		case Camera::PixelMode::NV21:
+			src_fmt = RK_FORMAT_YCrCb_420_SP;
+			src_wstride_px = src_stride_bytes;
+			break;
+		default:
+			return false;
+	}
+	if (!src_wstride_px || !src_hstride) return false;
+
+	rga_buffer_t src_buf;
+	if (src_fd >= 0) {
+		src_buf = wrapbuffer_fd(src_fd, width, height, src_fmt,
+				 static_cast<int>(src_wstride_px), static_cast<int>(src_hstride));
+	} else {
+		src_buf = wrapbuffer_virtualaddr(const_cast<uint8_t *>(src_va), width, height, src_fmt,
+				 static_cast<int>(src_wstride_px), static_cast<int>(src_hstride));
+	}
+
+	rga_buffer_t dst_buf;
+	if (dst_fd >= 0) {
+		dst_buf = wrapbuffer_fd(dst_fd, width, height, RK_FORMAT_YCbCr_420_SP,
+				 static_cast<int>(width), static_cast<int>(height));
+	} else {
+		dst_buf = wrapbuffer_virtualaddr(dst_va, width, height, RK_FORMAT_YCbCr_420_SP,
+				 static_cast<int>(width), static_cast<int>(height));
+	}
+
+	im_rect srect = {0, 0, static_cast<int>(width), static_cast<int>(height)};
+	im_rect drect = {0, 0, static_cast<int>(width), static_cast<int>(height)};
+	im_rect prect;
+	memset(&prect, 0, sizeof(prect));
+	rga_buffer_t pat;
+	memset(&pat, 0, sizeof(pat));
+
+	IM_STATUS st = improcess(src_buf, dst_buf, pat, srect, drect, prect, 0);
+	if (st != IM_STATUS_SUCCESS) {
+		static bool logged = false;
+		if (!logged) {
+			std::fprintf(stderr, "[rga] improcess to NV12 failed status=%d, fallback to CPU\n", st);
+			logged = true;
+		}
+		return false;
+	}
 	return true;
 #endif
 }
@@ -154,10 +235,9 @@ bool try_rga_convert(Camera::PixelMode mode,
 
 Camera::Camera(const Config &cfg) : cfg_(cfg) {
 	rgb_size_ = static_cast<size_t>(cfg_.width) * static_cast<size_t>(cfg_.height) * 3;
+	media_size_ = packed_raw_size(V4L2_PIX_FMT_NV12, cfg_.width, cfg_.height);
 	rgb_[0].resize(rgb_size_);
 	rgb_[1].resize(rgb_size_);
-	raw_[0].resize(packed_raw_size(cfg_.pixelformat, cfg_.width, cfg_.height));
-	raw_[1].resize(packed_raw_size(cfg_.pixelformat, cfg_.width, cfg_.height));
 }
 
 Camera::~Camera() {
@@ -169,16 +249,20 @@ bool Camera::start() {
 
 	if (!open_device()) return false;
 	if (!set_format()) return false;
+	if (!alloc_media_buffers()) return false;
 	if (!request_buffers()) return false;
 	if (!start_stream()) return false;
-		
 
-	std::fprintf(stdout, "[camera] started fmt=%c%c%c%c planes=%u %ux%u\n",
-		    cfg_.pixelformat & 0xFF,
-		    (cfg_.pixelformat >> 8) & 0xFF,
-		    (cfg_.pixelformat >> 16) & 0xFF,
-		    (cfg_.pixelformat >> 24) & 0xFF,
-		    num_planes_, cfg_.width, cfg_.height);
+	std::fprintf(stdout, "[camera] started fmt=%c%c%c%c media=%c%c%c%c planes=%u %ux%u\n",
+	    cfg_.pixelformat & 0xFF,
+	    (cfg_.pixelformat >> 8) & 0xFF,
+	    (cfg_.pixelformat >> 16) & 0xFF,
+	    (cfg_.pixelformat >> 24) & 0xFF,
+	    V4L2_PIX_FMT_NV12 & 0xFF,
+	    (V4L2_PIX_FMT_NV12 >> 8) & 0xFF,
+	    (V4L2_PIX_FMT_NV12 >> 16) & 0xFF,
+	    (V4L2_PIX_FMT_NV12 >> 24) & 0xFF,
+	    num_planes_, cfg_.width, cfg_.height);
 
 	running_.store(true);
 	worker_ = std::thread(&Camera::capture_loop, this);
@@ -244,21 +328,43 @@ bool Camera::copy_latest_frames(std::vector<uint8_t> &out_rgb,
 								uint32_t &pixfmt) const {
 	for (int attempt = 0; attempt < 3; ++attempt) {
 		int idx = latest_.load(std::memory_order_acquire);
-		if (idx < 0) return false;
+		if (idx < 0 || !media_[idx].start) return false;
 
 		if (out_rgb.size() != rgb_size_) out_rgb.resize(rgb_size_);
 		::memcpy(out_rgb.data(), rgb_[idx].data(), rgb_size_);
 
-		if (out_raw.size() != raw_[idx].size()) out_raw.resize(raw_[idx].size());
-		if (!raw_[idx].empty()) {
-			::memcpy(out_raw.data(), raw_[idx].data(), raw_[idx].size());
-		}
+		if (out_raw.size() != media_size_) out_raw.resize(media_size_);
+		::memcpy(out_raw.data(), media_[idx].start, media_size_);
 
 		int idx_after = latest_.load(std::memory_order_acquire);
 		if (idx == idx_after) {
 			seq = frame_seq_[idx].load(std::memory_order_acquire);
 			ts_ns = frame_ts_ns_[idx].load(std::memory_order_acquire);
-			pixfmt = cfg_.pixelformat;
+			pixfmt = V4L2_PIX_FMT_NV12;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool Camera::copy_latest_media_frame(MediaFrame &out_frame) const {
+	for (int attempt = 0; attempt < 3; ++attempt) {
+		int idx = latest_.load(std::memory_order_acquire);
+		if (idx < 0 || !media_[idx].start) return false;
+
+		out_frame.data = static_cast<const uint8_t *>(media_[idx].start);
+		out_frame.size = media_size_;
+		out_frame.fd = media_[idx].fd;
+		out_frame.width = cfg_.width;
+		out_frame.height = cfg_.height;
+		out_frame.pixfmt = V4L2_PIX_FMT_NV12;
+		out_frame.stride_y = media_[idx].stride_y;
+		out_frame.stride_uv = media_[idx].stride_uv;
+
+		int idx_after = latest_.load(std::memory_order_acquire);
+		if (idx == idx_after) {
+			out_frame.seq = frame_seq_[idx].load(std::memory_order_acquire);
+			out_frame.ts_ns = frame_ts_ns_[idx].load(std::memory_order_acquire);
 			return true;
 		}
 	}
@@ -278,6 +384,10 @@ uint32_t Camera::pixel_format() const {
 	return cfg_.pixelformat;
 }
 
+uint32_t Camera::media_pixel_format() const {
+	return V4L2_PIX_FMT_NV12;
+}
+
 size_t Camera::frame_size() const {
 	return rgb_size_;
 }
@@ -290,8 +400,7 @@ uint32_t Camera::height() const {
 	return cfg_.height;
 }
 
-bool Camera::open_dma_heap() {
-	if (dma_heap_fd_ >= 0) return true;
+bool Camera::open_dma_heap() {	if (dma_heap_fd_ >= 0) return true;
 	const char *heap = select_dma_heap_path();
 	dma_heap_fd_ = open(heap, O_RDWR | O_CLOEXEC);
 	if (dma_heap_fd_ < 0) {
@@ -316,6 +425,42 @@ int Camera::alloc_dma_buf(size_t length) {
 		return -1;
 	}
 	return static_cast<int>(data.fd);
+}
+
+bool Camera::alloc_media_buffers() {
+	if (media_size_ == 0) {
+		return false;
+	}
+
+	for (auto &buffer : media_) {
+		if (buffer.start && buffer.length) {
+			munmap(buffer.start, buffer.length);
+			buffer.start = nullptr;
+		}
+		if (buffer.fd >= 0) {
+			close(buffer.fd);
+			buffer.fd = -1;
+		}
+		buffer.length = 0;
+		buffer.stride_y = cfg_.width;
+		buffer.stride_uv = cfg_.width;
+
+		buffer.fd = alloc_dma_buf(media_size_);
+		if (buffer.fd < 0) {
+			return false;
+		}
+		buffer.length = media_size_;
+		buffer.start = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED, buffer.fd, 0);
+		if (buffer.start == MAP_FAILED) {
+			std::perror("mmap media dma-buf failed");
+			close(buffer.fd);
+			buffer.fd = -1;
+			buffer.start = nullptr;
+			return false;
+		}
+		memset(buffer.start, 0, buffer.length);
+	}
+	return true;
 }
 
 bool Camera::open_device() {
@@ -361,9 +506,7 @@ bool Camera::set_format() {
 	rgb_size_ = static_cast<size_t>(cfg_.width) * static_cast<size_t>(cfg_.height) * 3;
 	rgb_[0].assign(rgb_size_, 0);
 	rgb_[1].assign(rgb_size_, 0);
-	size_t raw_size = packed_raw_size(cfg_.pixelformat, cfg_.width, cfg_.height);
-	raw_[0].assign(raw_size, 0);
-	raw_[1].assign(raw_size, 0);
+	media_size_ = packed_raw_size(V4L2_PIX_FMT_NV12, cfg_.width, cfg_.height);
 	is_mplane_ = true;
 	num_planes_ = fmt.fmt.pix_mp.num_planes ? fmt.fmt.pix_mp.num_planes : 1;
 	for (uint32_t p = 0; p < num_planes_ && p < VIDEO_MAX_PLANES; ++p) {
@@ -617,9 +760,8 @@ bool Camera::dequeue_and_convert(int write_index) {
 				stride = static_cast<uint32_t>(planes[p].bytesused / denom);
 			}
 		}
-		// Fallback to visible width if stride is still zero
 		if (!stride) {
-			stride = cfg_.width;          // NV12/NV21 或其他至少等于宽度
+			stride = (pix_mode_ == PixelMode::UYVY) ? (cfg_.width * 2) : cfg_.width;
 		}
 		plane_stride[p] = stride;
 
@@ -632,15 +774,12 @@ bool Camera::dequeue_and_convert(int write_index) {
 			uint32_t by_stride = static_cast<uint32_t>(planes[p].bytesused / stride);
 			rows = std::min<uint32_t>(rows_cap, by_stride);
 		}
-		// Also clamp rows by mapped length if available.
 		if (stride && buffers_[buf.index].planes[p].length >= stride) {
 			uint32_t max_rows_by_len = static_cast<uint32_t>(buffers_[buf.index].planes[p].length / stride);
 			rows = std::min<uint32_t>(rows, max_rows_by_len);
 		}
-		// Ensure rows even for chroma so j/2 does not exceed plane data due to odd rows.
 		if ((pix_mode_ == PixelMode::NV12 || pix_mode_ == PixelMode::NV21) && p == 1) {
 			rows &= ~1U;
-			// Also clamp chroma rows to luma rows/2 when luma is smaller than expected.
 			if (plane_rows[0]) {
 				rows = std::min<uint32_t>(rows, plane_rows[0] / 2);
 			}
@@ -648,75 +787,17 @@ bool Camera::dequeue_and_convert(int write_index) {
 		plane_rows[p] = rows;
 	}
 
-	uint32_t rows_written = cfg_.height;
-
-	// Pack raw frame into tight layout for recording path.
-	if (!raw_[write_index].empty()) {
-		switch (pix_mode_) {
-			case PixelMode::UYVY: {
-				uint32_t stride = plane_stride[0] ? plane_stride[0] : cfg_.width * 2;
-				uint32_t rows = plane_rows[0] ? plane_rows[0] : cfg_.height;
-				uint8_t *dst = raw_[write_index].data();
-				const uint8_t *src = plane_base[0];
-				for (uint32_t row = 0; row < std::min(rows, cfg_.height); ++row) {
-					::memcpy(dst + static_cast<size_t>(row) * cfg_.width * 2,
-							 src + static_cast<size_t>(row) * stride,
-							 static_cast<size_t>(cfg_.width) * 2);
-				}
-				break;
-			}
-			case PixelMode::NV12:
-			case PixelMode::NV21: {
-				uint8_t *dst = raw_[write_index].data();
-				uint32_t y_stride = plane_stride[0] ? plane_stride[0] : cfg_.width;
-				uint32_t c_stride = plane_stride[1] ? plane_stride[1] : cfg_.width;
-				uint32_t y_rows = plane_rows[0] ? plane_rows[0] : cfg_.height;
-				uint32_t c_rows = plane_rows[1] ? plane_rows[1] : (cfg_.height / 2);
-				for (uint32_t row = 0; row < std::min(y_rows, cfg_.height); ++row) {
-					::memcpy(dst + static_cast<size_t>(row) * cfg_.width,
-							 plane_base[0] + static_cast<size_t>(row) * y_stride,
-							 cfg_.width);
-				}
-				uint8_t *dst_c = dst + static_cast<size_t>(cfg_.width) * cfg_.height;
-				const uint8_t *src_c = (num_planes_ > 1 && plane_base[1])
-					? plane_base[1]
-					: (plane_base[0] + static_cast<size_t>(y_stride) * cfg_.height);
-				for (uint32_t row = 0; row < std::min(c_rows, cfg_.height / 2); ++row) {
-					::memcpy(dst_c + static_cast<size_t>(row) * cfg_.width,
-							 src_c + static_cast<size_t>(row) * c_stride,
-							 cfg_.width);
-				}
-				break;
-			}			
-		}
-	}
-
+	bool media_ok = false;
 	switch (pix_mode_) {
 		case PixelMode::UYVY: {
 			const uint8_t *base = plane_base[0];
 			uint32_t stride = plane_stride[0] ? plane_stride[0] : cfg_.width * 2;
 			uint32_t rows = plane_rows[0] ? plane_rows[0] : cfg_.height;
-			uint32_t hstride = rows ? rows : cfg_.height;
-			if (try_rga_convert(pix_mode_, cfg_.width, cfg_.height, stride, hstride,
-					 buffers_[buf.index].planes[0].fd, base, rgb_[write_index].data())) {
-				rows_written = std::min(cfg_.height, hstride);
-				break;
-			} else {
-				std::fprintf(stderr, "[rga] UYVY -> RGB fallback to CPU\n");
-			}
-			rows_written = std::min(rows, cfg_.height);
-			for (uint32_t row = 0; row < rows_written; ++row) {
-				const uint8_t *src = base + row * stride;
-				uint8_t *dst = rgb_[write_index].data() + row * cfg_.width * 3;
-				for (uint32_t col = 0; col + 1 < cfg_.width; col += 2) {
-					int u = src[0] - 128;
-					int y0 = src[1];
-					int v = src[2] - 128;
-					int y1 = src[3];
-					src += 4;
-					yuv_to_rgb_pair(y0, y1, u, v, dst + col * 3);
-				}
-			}
+			media_ok = fill_media_buffer_from_uyvy(write_index,
+			                                      base,
+			                                      stride,
+			                                      rows,
+			                                      buffers_[buf.index].planes[0].fd);
 			break;
 		}
 		case PixelMode::NV12: {
@@ -729,9 +810,6 @@ bool Camera::dequeue_and_convert(int write_index) {
 			size_t len_uv_avail = 0;
 			size_t uv_offset = static_cast<size_t>(y_stride) * cfg_.height;
 			size_t uv_span = static_cast<size_t>(y_stride) * (cfg_.height / 2);
-			// If the allocator padded height (len0 encodes aligned height), prefer the padded UV start to avoid
-			// landing inside the tail of the Y plane. This helps when bytesused reports active height but the
-			// buffer length includes alignment (e.g., height rounded to 16).
 			size_t padded_h = 0;
 			if (y_stride) {
 				padded_h = static_cast<size_t>((len0 * 2) / (3 * y_stride));
@@ -742,7 +820,6 @@ bool Camera::dequeue_and_convert(int write_index) {
 				uv_stride = plane_stride[1] ? plane_stride[1] : cfg_.width;
 				len_uv_avail = planes[1].bytesused ? planes[1].bytesused : buffers_[buf.index].planes[1].length;
 			} else {
-				// Single-plane: start UV at the padded Y height when available; otherwise fall back to bytesused.
 				if (uv_offset_padded >= uv_offset && uv_offset_padded + uv_span <= len0) {
 					uv_offset = uv_offset_padded;
 				} else if (used0 > uv_span) {
@@ -753,41 +830,13 @@ bool Camera::dequeue_and_convert(int write_index) {
 				uv_stride = y_stride;
 				len_uv_avail = (uv_offset < len0) ? (len0 - uv_offset) : 0;
 			}
-
 			uint32_t rows_y = plane_rows[0] ? plane_rows[0] : std::min<uint32_t>(cfg_.height, static_cast<uint32_t>(used0 / y_stride));
 			uint32_t rows_uv = plane_rows[1] ? plane_rows[1] : (cfg_.height / 2);
-			uint32_t rows_uv_len = 0;
 			if (uv_stride) {
-				rows_uv_len = static_cast<uint32_t>(len_uv_avail / uv_stride);
-				rows_uv = std::min<uint32_t>(rows_uv, rows_uv_len);
+				rows_uv = std::min<uint32_t>(rows_uv, static_cast<uint32_t>(len_uv_avail / uv_stride));
 			}
 			rows_uv = std::min<uint32_t>(rows_uv, rows_y / 2);
-			rows_written = std::min<uint32_t>({cfg_.height, rows_y, rows_uv * 2});
-			uint32_t y_hstride = y_stride ? static_cast<uint32_t>(uv_offset / y_stride) : rows_y;
-			if (!y_hstride) y_hstride = rows_y;
-			if (buffers_[buf.index].planes.size() == 1 &&
-				try_rga_convert(pix_mode_, cfg_.width, cfg_.height, y_stride, y_hstride,
-					 buffers_[buf.index].planes[0].fd, y_base, rgb_[write_index].data())) {
-				rows_written = std::min(cfg_.height, y_hstride);
-				break;
-			}
-			for (uint32_t j = 0; j < rows_written; ++j) {
-				size_t y_off = static_cast<size_t>(j) * y_stride;
-				if (y_off + cfg_.width > used0) break;
-				const uint8_t *y_row = y_base + y_off;
-				uint32_t uv_row_idx = std::min<uint32_t>(j / 2, rows_uv ? rows_uv - 1 : j / 2);
-				size_t uv_off = static_cast<size_t>(uv_row_idx) * uv_stride;
-				if (uv_off + cfg_.width > len_uv_avail) break;
-				const uint8_t *uv_row = uv_base + uv_off;
-				uint8_t *out = rgb_[write_index].data() + j * cfg_.width * 3;
-				for (uint32_t i = 0; i < cfg_.width; i += 2) {
-					int Y0 = y_row[i];
-					int Y1 = y_row[i + 1];
-					int U = uv_row[i & ~1] - 128;
-					int V = uv_row[(i & ~1) + 1] - 128;
-					yuv_to_rgb_pair(Y0, Y1, U, V, out + i * 3);
-				}
-			}
+			media_ok = fill_media_buffer_from_nv12(write_index, y_base, uv_base, y_stride, uv_stride, rows_y, rows_uv);
 			break;
 		}
 		case PixelMode::NV21: {
@@ -810,7 +859,6 @@ bool Camera::dequeue_and_convert(int write_index) {
 				vu_stride = plane_stride[1] ? plane_stride[1] : cfg_.width;
 				len_vu_avail = planes[1].bytesused ? planes[1].bytesused : buffers_[buf.index].planes[1].length;
 			} else {
-				// Single-plane: prefer padded Y height derived from buffer length to locate chroma start.
 				if (vu_offset_padded >= vu_offset && vu_offset_padded + vu_span <= len0) {
 					vu_offset = vu_offset_padded;
 				} else if (used0 > vu_span) {
@@ -821,60 +869,22 @@ bool Camera::dequeue_and_convert(int write_index) {
 				vu_stride = y_stride;
 				len_vu_avail = (vu_offset < len0) ? (len0 - vu_offset) : 0;
 			}
-
 			uint32_t rows_y = plane_rows[0] ? plane_rows[0] : std::min<uint32_t>(cfg_.height, static_cast<uint32_t>(used0 / y_stride));
 			uint32_t rows_vu = plane_rows[1] ? plane_rows[1] : (cfg_.height / 2);
 			if (vu_stride) {
-				uint32_t rows_vu_len = static_cast<uint32_t>(len_vu_avail / vu_stride);
-				rows_vu = std::min<uint32_t>(rows_vu, rows_vu_len);
+				rows_vu = std::min<uint32_t>(rows_vu, static_cast<uint32_t>(len_vu_avail / vu_stride));
 			}
 			rows_vu = std::min<uint32_t>(rows_vu, rows_y / 2);
-			rows_written = std::min<uint32_t>({cfg_.height, rows_y, rows_vu * 2});
-			uint32_t y_hstride = y_stride ? static_cast<uint32_t>(vu_offset / y_stride) : rows_y;
-			if (!y_hstride) y_hstride = rows_y;
-			if (buffers_[buf.index].planes.size() == 1 &&
-				try_rga_convert(pix_mode_, cfg_.width, cfg_.height, y_stride, y_hstride,
-					 buffers_[buf.index].planes[0].fd, y_base, rgb_[write_index].data())) {
-				rows_written = std::min(cfg_.height, y_hstride);
-				break;
-			}
-			for (uint32_t j = 0; j < rows_written; ++j) {
-				size_t y_off = static_cast<size_t>(j) * y_stride;
-				if (y_off + cfg_.width > used0) break;
-				const uint8_t *y_row = y_base + y_off;
-				uint32_t vu_row_idx = std::min<uint32_t>(j / 2, rows_vu ? rows_vu - 1 : j / 2);
-				size_t vu_off = static_cast<size_t>(vu_row_idx) * vu_stride;
-				if (vu_off + cfg_.width > len_vu_avail) break;
-				const uint8_t *vu_row = vu_base + vu_off;
-				uint8_t *out = rgb_[write_index].data() + j * cfg_.width * 3;
-				for (uint32_t i = 0; i < cfg_.width; i += 2) {
-					int Y0 = y_row[i];
-					int Y1 = y_row[i + 1];
-					int V = vu_row[i & ~1] - 128;
-					int U = vu_row[(i & ~1) + 1] - 128;
-					yuv_to_rgb_pair(Y0, Y1, U, V, out + i * 3);
-				}
-			}
+			media_ok = fill_media_buffer_from_nv21(write_index, y_base, vu_base, y_stride, vu_stride, rows_y, rows_vu);
 			break;
 		}
-		
 	}
 
-	// For NV12/NV21, defensively clear a few bottom rows to mask any tail padding artifacts.
-	if ((pix_mode_ == PixelMode::NV12 || pix_mode_ == PixelMode::NV21) && rows_written > 0) {
-		uint8_t *dst = rgb_[write_index].data();
-		uint32_t rows_to_clear = std::min<uint32_t>(rows_written, 16);
-		size_t off = static_cast<size_t>(rows_written - rows_to_clear) * cfg_.width * 3;
-		size_t bytes = static_cast<size_t>(rows_to_clear) * cfg_.width * 3;
-		memset(dst + off, 0, bytes);
+	if (media_ok) {
+		media_ok = media_to_rgb(write_index);
 	}
-
-	// Emit partial-frame info after conversion.
-	// Clear any trailing rows not written (e.g., if bytesused reported fewer rows) to avoid flicker/green line.
-	if (rows_written < cfg_.height) {
-		uint8_t *dst = rgb_[write_index].data();
-		size_t remain = static_cast<size_t>(cfg_.height - rows_written) * cfg_.width * 3;
-		memset(dst + rows_written * cfg_.width * 3, 0, remain);
+	if (!media_ok) {
+		memset(rgb_[write_index].data(), 0, rgb_size_);
 	}
 
 	if (xioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
@@ -882,10 +892,22 @@ bool Camera::dequeue_and_convert(int write_index) {
 		std::fflush(stderr);
 		return false;
 	}
-	return true;
+	return media_ok;
 }
 
 void Camera::cleanup_buffers() {
+	for (auto &buffer : media_) {
+		if (buffer.start && buffer.length) {
+			munmap(buffer.start, buffer.length);
+			buffer.start = nullptr;
+		}
+		if (buffer.fd >= 0) {
+			close(buffer.fd);
+			buffer.fd = -1;
+		}
+		buffer.length = 0;
+	}
+
 	for (auto &b : buffers_) {
 		for (auto &p : b.planes) {
 			if (p.start && p.length) {
@@ -914,7 +936,7 @@ int Camera::xioctl(int fd, unsigned long request, void *arg) {
 
 // Fixed-point fast YUV->RGB (full-range). Coeffs are Q14 approximations of the float path.
 inline void Camera::yuv_to_rgb_pair(int y0, int y1, int u, int v, uint8_t *dst) {
-	// Convert limited-range YUV to RGB with BT.601 coefficients (full-range tends暗/偏色).
+	// Convert limited-range YUV to RGB with BT.601 coefficients (full-range tends閺?閸嬪繗澹?.
 	// Y in [16,235], U/V in [16,240]; clamp after applying offsets.
 	y0 = std::max(16, std::min(235, y0));
 	y1 = std::max(16, std::min(235, y1));
@@ -955,7 +977,7 @@ void Camera::nv12_to_rgb888(const uint8_t *y, const uint8_t *uv, uint8_t *dst,
 					uint32_t width, uint32_t height) {
 	for (uint32_t j = 0; j < height; ++j) {
 		const uint8_t *y_row = y + j * width;
-		const uint8_t *uv_row = uv + (j / 2) * width; // UV is interleaved, width bytes per row
+		const uint8_t *uv_row = uv + (j / 2) * width;
 		uint8_t *out = dst + j * width * 3;
 		for (uint32_t i = 0; i < width; i += 2) {
 			int Y0 = y_row[i];
@@ -965,4 +987,139 @@ void Camera::nv12_to_rgb888(const uint8_t *y, const uint8_t *uv, uint8_t *dst,
 			yuv_to_rgb_pair(Y0, Y1, U, V, out + i * 3);
 		}
 	}
+}
+
+void Camera::uyvy_to_nv12(const uint8_t *src,
+				 uint32_t src_stride,
+				 uint8_t *dst_y,
+				 uint8_t *dst_uv,
+				 uint32_t width,
+				 uint32_t height) {
+	for (uint32_t row = 0; row < height; ++row) {
+		const uint8_t *src_row = src + static_cast<size_t>(row) * src_stride;
+		uint8_t *dst_row = dst_y + static_cast<size_t>(row) * width;
+		for (uint32_t col = 0; col + 1 < width; col += 2) {
+			dst_row[col] = src_row[1];
+			dst_row[col + 1] = src_row[3];
+			src_row += 4;
+		}
+	}
+
+	for (uint32_t row = 0; row < height; row += 2) {
+		const uint8_t *src_row0 = src + static_cast<size_t>(row) * src_stride;
+		const uint8_t *src_row1 = src + static_cast<size_t>(std::min<uint32_t>(row + 1, height - 1)) * src_stride;
+		uint8_t *dst_row = dst_uv + static_cast<size_t>(row / 2) * width;
+		for (uint32_t col = 0; col + 1 < width; col += 2) {
+			const size_t off = static_cast<size_t>(col) * 2;
+			dst_row[col] = static_cast<uint8_t>((static_cast<uint32_t>(src_row0[off + 0]) + static_cast<uint32_t>(src_row1[off + 0]) + 1U) / 2U);
+			dst_row[col + 1] = static_cast<uint8_t>((static_cast<uint32_t>(src_row0[off + 2]) + static_cast<uint32_t>(src_row1[off + 2]) + 1U) / 2U);
+		}
+	}
+}
+
+void Camera::nv21_to_nv12(uint8_t *dst_uv, const uint8_t *src_vu, uint32_t width, uint32_t chroma_rows) {
+	for (uint32_t row = 0; row < chroma_rows; ++row) {
+		const uint8_t *src_row = src_vu + static_cast<size_t>(row) * width;
+		uint8_t *dst_row = dst_uv + static_cast<size_t>(row) * width;
+		for (uint32_t col = 0; col + 1 < width; col += 2) {
+			dst_row[col] = src_row[col + 1];
+			dst_row[col + 1] = src_row[col];
+		}
+	}
+}
+
+bool Camera::fill_media_buffer_from_uyvy(int write_index,
+					     const uint8_t *src,
+					     uint32_t src_stride,
+					     uint32_t src_rows,
+					     int src_fd) {
+	if (!media_[write_index].start) return false;
+	uint8_t *dst = static_cast<uint8_t *>(media_[write_index].start);
+	memset(dst, 0, media_size_);
+	const uint32_t rows = std::min(src_rows, cfg_.height);
+	if (rows == cfg_.height &&
+		try_rga_convert_to_nv12(PixelMode::UYVY,
+				       cfg_.width,
+				       cfg_.height,
+				       src_stride,
+				       rows,
+				       src_fd,
+				       src,
+				       media_[write_index].fd,
+				       dst)) {
+		return true;
+	}
+	uyvy_to_nv12(src, src_stride, dst, dst + static_cast<size_t>(cfg_.width) * cfg_.height, cfg_.width, rows);
+	return rows == cfg_.height;
+}
+
+bool Camera::fill_media_buffer_from_nv12(int write_index,
+					     const uint8_t *y_base,
+					     const uint8_t *uv_base,
+					     uint32_t y_stride,
+					     uint32_t uv_stride,
+					     uint32_t rows_y,
+					     uint32_t rows_uv) {
+	if (!media_[write_index].start || !y_base || !uv_base) return false;
+	uint8_t *dst = static_cast<uint8_t *>(media_[write_index].start);
+	uint8_t *dst_uv = dst + static_cast<size_t>(cfg_.width) * cfg_.height;
+	memset(dst, 0, media_size_);
+	rows_y = std::min(rows_y, cfg_.height);
+	rows_uv = std::min(rows_uv, cfg_.height / 2);
+	for (uint32_t row = 0; row < rows_y; ++row) {
+		::memcpy(dst + static_cast<size_t>(row) * cfg_.width,
+				 y_base + static_cast<size_t>(row) * y_stride,
+				 cfg_.width);
+	}
+	for (uint32_t row = 0; row < rows_uv; ++row) {
+		::memcpy(dst_uv + static_cast<size_t>(row) * cfg_.width,
+				 uv_base + static_cast<size_t>(row) * uv_stride,
+				 cfg_.width);
+	}
+	return rows_y == cfg_.height && rows_uv == (cfg_.height / 2);
+}
+
+bool Camera::fill_media_buffer_from_nv21(int write_index,
+					     const uint8_t *y_base,
+					     const uint8_t *vu_base,
+					     uint32_t y_stride,
+					     uint32_t vu_stride,
+					     uint32_t rows_y,
+					     uint32_t rows_vu) {
+	if (!media_[write_index].start || !y_base || !vu_base) return false;
+	uint8_t *dst = static_cast<uint8_t *>(media_[write_index].start);
+	uint8_t *dst_uv = dst + static_cast<size_t>(cfg_.width) * cfg_.height;
+	memset(dst, 0, media_size_);
+	rows_y = std::min(rows_y, cfg_.height);
+	rows_vu = std::min(rows_vu, cfg_.height / 2);
+	for (uint32_t row = 0; row < rows_y; ++row) {
+		::memcpy(dst + static_cast<size_t>(row) * cfg_.width,
+				 y_base + static_cast<size_t>(row) * y_stride,
+				 cfg_.width);
+	}
+	for (uint32_t row = 0; row < rows_vu; ++row) {
+		nv21_to_nv12(dst_uv + static_cast<size_t>(row) * cfg_.width,
+				     vu_base + static_cast<size_t>(row) * vu_stride,
+				     cfg_.width,
+				     1);
+	}
+	return rows_y == cfg_.height && rows_vu == (cfg_.height / 2);
+}
+
+bool Camera::media_to_rgb(int write_index) {
+	if (!media_[write_index].start) return false;
+	const uint8_t *y = static_cast<const uint8_t *>(media_[write_index].start);
+	const uint8_t *uv = y + static_cast<size_t>(cfg_.width) * cfg_.height;
+	if (try_rga_convert(PixelMode::NV12,
+				    cfg_.width,
+				    cfg_.height,
+				    cfg_.width,
+				    cfg_.height,
+				    media_[write_index].fd,
+				    y,
+				    rgb_[write_index].data())) {
+		return true;
+	}
+	nv12_to_rgb888(y, uv, rgb_[write_index].data(), cfg_.width, cfg_.height);
+	return true;
 }

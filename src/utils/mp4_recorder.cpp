@@ -98,27 +98,15 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
 
     ensure_gstreamer_initialized();
 
-    const char *gst_format = nullptr;
+        const char *gst_format = nullptr;
     size_t frame_size = 0;
     switch (pixfmt) {
-        case V4L2_PIX_FMT_UYVY:
-            gst_format = "UYVY";
-            frame_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 2;
-            break;
         case V4L2_PIX_FMT_NV12:
             gst_format = "NV12";
             frame_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 3 / 2;
             break;
-        case V4L2_PIX_FMT_NV21:
-            gst_format = "NV21";
-            frame_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 3 / 2;
-            break;
-        case V4L2_PIX_FMT_YUYV:
-            gst_format = "YUY2";
-            frame_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 2;
-            break;
         default:
-            g_printerr("[recorder] unsupported pixfmt: %c%c%c%c\n",
+            g_printerr("[recorder] unsupported media pixfmt: %c%c%c%c\n",
                        pixfmt & 0xFF,
                        (pixfmt >> 8) & 0xFF,
                        (pixfmt >> 16) & 0xFF,
@@ -135,9 +123,7 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
     if (enable_audio) {
         pipeline_desc = g_strdup_printf(
             "appsrc name=vsrc is-live=true block=false format=time do-timestamp=true "
-            "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "
-            "! videoconvert "
-            "! queue leaky=downstream max-size-buffers=2 "
+            "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "            "! queue leaky=downstream max-size-buffers=2 "
             "! mpph264enc ! h264parse ! queue ! mux. "
             "alsasrc device=hw:0,0 do-timestamp=true "
             "! queue ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux. "
@@ -146,9 +132,7 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
     } else {
         pipeline_desc = g_strdup_printf(
             "appsrc name=vsrc is-live=true block=false format=time do-timestamp=true "
-            "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "
-            "! videoconvert "
-            "! queue leaky=downstream max-size-buffers=2 "
+            "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "            "! queue leaky=downstream max-size-buffers=2 "
             "! mpph264enc ! h264parse ! mp4mux faststart=true "
             "! filesink location=%s sync=false async=false",
             gst_format, width, height, fps, last_file_.c_str());
