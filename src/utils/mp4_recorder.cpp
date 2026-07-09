@@ -114,10 +114,9 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
             return false;
     }
 
-    const bool enable_audio = []() {
-        const char *env = std::getenv("DOORBELL_RECORD_AUDIO");
-        return env==nullptr || env[0] != '0';
-    }();
+    const char *record_audio_env = std::getenv("DOORBELL_RECORD_AUDIO");
+    const bool enable_audio = (record_audio_env == nullptr || record_audio_env[0] != '0') &&
+                              audio_dispatcher_ != nullptr;
 
     gchar *pipeline_desc = nullptr;
     if (enable_audio) {
@@ -125,8 +124,10 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
             "appsrc name=vsrc is-live=true block=false format=time do-timestamp=true "
             "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "            "! queue leaky=downstream max-size-buffers=2 "
             "! mpph264enc ! h264parse ! queue ! mux. "
-            "alsasrc device=hw:0,0 do-timestamp=true "
-            "! queue ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux. "
+            "appsrc name=asrc is-live=true block=false format=time do-timestamp=false "
+            "caps=audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1 "
+            "! queue leaky=downstream max-size-buffers=16 ! audioconvert ! audioresample "
+            "! voaacenc bitrate=128000 ! aacparse ! queue ! mux. "
             "mp4mux name=mux faststart=true ! filesink location=%s sync=false async=false",
             gst_format, width, height, fps, last_file_.c_str());
     } else {
@@ -162,6 +163,20 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
         return false;
     }
 
+    if (enable_audio) {
+        audio_appsrc_ = gst_bin_get_by_name(GST_BIN(pipeline_), "asrc");
+        if (!audio_appsrc_) {
+            g_printerr("[recorder] audio appsrc not found in pipeline\n");
+            gst_object_unref(appsrc_);
+            appsrc_ = nullptr;
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+            last_file_.clear();
+            return false;
+        }
+        gst_app_src_set_stream_type(GST_APP_SRC(audio_appsrc_), GST_APP_STREAM_TYPE_STREAM);
+        g_object_set(G_OBJECT(audio_appsrc_), "block", FALSE, nullptr);
+    }
     gst_app_src_set_stream_type(GST_APP_SRC(appsrc_), GST_APP_STREAM_TYPE_STREAM);
     g_object_set(G_OBJECT(appsrc_), "block", FALSE, nullptr);
 
@@ -171,6 +186,10 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
               static_cast<double>(play_end_ns - start_begin_ns) / 1000000.0);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         g_printerr("[recorder] failed to set pipeline PLAYING\n");
+        if (audio_appsrc_) {
+            gst_object_unref(audio_appsrc_);
+            audio_appsrc_ = nullptr;
+        }
         gst_object_unref(appsrc_);
         appsrc_ = nullptr;
         gst_object_unref(pipeline_);
@@ -189,6 +208,15 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
     has_first_frame_ts_ = false;
 
     if (enable_audio) {
+        {
+            std::lock_guard<std::mutex> lock(audio_mtx_);
+            audio_timestamp_rebaser_.reset();
+            audio_frame_count_ = 0;
+        }
+        audio_consumer_id_ = audio_dispatcher_->register_consumer(
+            [this](const AudioFrame &frame) {
+                push_audio_frame(frame);
+            });
         g_print("[recorder] started with audio\n");
     } else {
         g_print("[recorder] started without audio (set DOORBELL_RECORD_AUDIO=1 to enable)\n");
@@ -201,6 +229,17 @@ void Mp4Recorder::stop() {
 
     uint64_t stop_begin_ns = mono_time_ns();
     rec_trace("stop enter frame_index=%llu", static_cast<unsigned long long>(frame_index_));
+
+    unregister_audio_consumer();
+    GstElement *audio_appsrc = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audio_mtx_);
+        audio_appsrc = audio_appsrc_;
+        audio_appsrc_ = nullptr;
+    }
+    if (audio_appsrc) {
+        gst_app_src_end_of_stream(GST_APP_SRC(audio_appsrc));
+    }
 
     if (appsrc_) {
         gst_app_src_end_of_stream(GST_APP_SRC(appsrc_));
@@ -228,6 +267,9 @@ void Mp4Recorder::stop() {
     if (appsrc_) {
         gst_object_unref(appsrc_);
         appsrc_ = nullptr;
+    }
+    if (audio_appsrc) {
+        gst_object_unref(audio_appsrc);
     }
     if (bus_) {
         gst_object_unref(bus_);
@@ -411,4 +453,45 @@ bool Mp4Recorder::process_bus_messages(bool wait_eos, bool *received_eos) {
     }
 
     return true;
+}
+
+void Mp4Recorder::unregister_audio_consumer() {
+    if (audio_dispatcher_ && audio_consumer_id_ != 0) {
+        audio_dispatcher_->unregister_consumer(audio_consumer_id_);
+        audio_consumer_id_ = 0;
+    }
+}
+
+void Mp4Recorder::push_audio_frame(const AudioFrame &frame) {
+    std::lock_guard<std::mutex> lock(audio_mtx_);
+    if (!audio_appsrc_ || !frame.data || frame.size == 0) return;
+
+    GstBuffer *buffer = gst_buffer_new_allocate(nullptr, frame.size, nullptr);
+    if (!buffer) return;
+
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+        gst_buffer_unref(buffer);
+        return;
+    }
+    std::memcpy(map.data, frame.data, frame.size);
+    gst_buffer_unmap(buffer, &map);
+
+    const uint64_t rebased_pts_ns = audio_timestamp_rebaser_.rebase(frame.pts_ns, frame.duration_ns);
+    GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(rebased_pts_ns);
+    GST_BUFFER_DTS(buffer) = static_cast<GstClockTime>(rebased_pts_ns);
+    GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(frame.duration_ns);
+
+    ++audio_frame_count_;
+    if (audio_frame_count_ == 1 || audio_frame_count_ % 500 == 0) {
+        g_print("[recorder] audio input count=%llu source_pts_ns=%llu rebased_pts_ns=%llu\n",
+                static_cast<unsigned long long>(audio_frame_count_),
+                static_cast<unsigned long long>(frame.pts_ns),
+                static_cast<unsigned long long>(rebased_pts_ns));
+    }
+
+    GstFlowReturn flow_ret = gst_app_src_push_buffer(GST_APP_SRC(audio_appsrc_), buffer);
+    if (flow_ret != GST_FLOW_OK && flow_ret != GST_FLOW_FLUSHING) {
+        g_printerr("[recorder] audio appsrc push failed: %d\n", flow_ret);
+    }
 }

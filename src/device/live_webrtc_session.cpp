@@ -1,6 +1,7 @@
 #include "device/live_webrtc_session.h"
 
 #include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 #include <gst/sdp/sdp.h>
 #include <gst/webrtc/webrtc.h>
 
@@ -21,6 +22,10 @@ std::once_flag g_gst_init_once;
 constexpr const char *kH264RtpCaps =
     "application/x-rtp,media=(string)video,encoding-name=(string)H264,"
     "payload=(int)96,clock-rate=(int)90000,packetization-mode=(string)1";
+
+constexpr const char *kOpusRtpCaps =
+    "application/x-rtp,media=(string)audio,encoding-name=(string)OPUS,"
+    "payload=(int)97,clock-rate=(int)48000,encoding-params=(string)2";
 
 const char *gst_format_for_pixfmt(uint32_t pixfmt) {
     switch (pixfmt) {
@@ -360,6 +365,17 @@ GstPadProbeReturn on_rtp_probe_cb(GstPad *, GstPadProbeInfo *info, gpointer user
     return static_cast<LiveWebRtcSession *>(user_data)->on_rtp_probe(info);
 }
 
+void on_incoming_pad_added_cb(GstElement *, GstPad *pad, gpointer user_data) {
+    static_cast<LiveWebRtcSession *>(user_data)->on_incoming_pad_added(pad);
+}
+GstPadProbeReturn on_audio_rtp_probe_cb(GstPad *, GstPadProbeInfo *info, gpointer user_data) {
+    return static_cast<LiveWebRtcSession *>(user_data)->on_audio_rtp_probe(info);
+}
+
+GstFlowReturn on_remote_audio_sample_cb(GstAppSink *sink, gpointer user_data) {
+    return static_cast<LiveWebRtcSession *>(user_data)->on_remote_audio_sample(GST_ELEMENT(sink));
+}
+
 const char *message_source_name(GstMessage *message) {
     if (!message || !GST_MESSAGE_SRC(message)) return "unknown";
     return GST_OBJECT_NAME(GST_MESSAGE_SRC(message));
@@ -401,9 +417,11 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
     const std::string stun_server = stun_server_for(request.ice_servers);
 
     FrameProvider provider;
+    AudioCaptureManager *audio_manager = nullptr;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         provider = frame_provider_;
+        audio_manager = audio_manager_;
     }
     if (!provider) {
         if (error_message) *error_message = "camera frame provider unavailable";
@@ -460,10 +478,19 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
          << "caps=video/x-raw,format=" << gst_format
          << ",width=" << initial_frame.width
          << ",height=" << initial_frame.height
-         << ",framerate=24/1 ! queue name=raw_queue leaky=downstream max-size-buffers=2 ! "         << "mpph264enc name=live_enc bps=" << profile.bitrate << " gop=24 header-mode=each-idr ! "
+         << ",framerate=24/1 ! queue name=raw_queue leaky=downstream max-size-buffers=2 ! "
+         << "mpph264enc name=live_enc bps=" << profile.bitrate << " gop=24 header-mode=each-idr ! "
          << "h264parse name=live_parse config-interval=-1 ! "
          << "rtph264pay name=live_pay pt=96 config-interval=-1 ! "
-         << kH264RtpCaps << " ! queue name=rtp_queue";
+         << kH264RtpCaps << " ! queue name=rtp_queue "
+         << "appsrc name=live_audio_appsrc is-live=true block=false format=time do-timestamp=false "
+         << "caps=audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1 "
+         << "! queue name=audio_raw_queue leaky=downstream max-size-buffers=16 ! audioconvert ! audioresample "
+         << "! opusenc bitrate=32000 audio-type=voice frame-size=20 ! rtpopuspay name=live_audio_pay pt=97 ! "
+         << kOpusRtpCaps << " ! queue name=audio_rtp_queue "
+         << "queue name=remote_audio_queue ! rtpopusdepay ! opusdec ! audioconvert ! audioresample "
+         << "! audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1 "
+         << "! appsink name=remote_audio_sink emit-signals=true sync=false max-buffers=8 drop=true";
 
     GError *error = nullptr;
     GstElement *pipeline = gst_parse_launch(desc.str().c_str(), &error);
@@ -504,6 +531,24 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         return false;
     }
 
+    GstElement *audio_appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "live_audio_appsrc");
+    GstElement *audio_rtp_queue = gst_bin_get_by_name(GST_BIN(pipeline), "audio_rtp_queue");
+    GstElement *remote_audio_queue = gst_bin_get_by_name(GST_BIN(pipeline), "remote_audio_queue");
+    GstElement *remote_audio_sink = gst_bin_get_by_name(GST_BIN(pipeline), "remote_audio_sink");
+    if (!audio_appsrc || !audio_rtp_queue || !remote_audio_queue || !remote_audio_sink) {
+        if (audio_appsrc) gst_object_unref(audio_appsrc);
+        if (audio_rtp_queue) gst_object_unref(audio_rtp_queue);
+        if (remote_audio_queue) gst_object_unref(remote_audio_queue);
+        if (remote_audio_sink) gst_object_unref(remote_audio_sink);
+        gst_object_unref(rtp_queue);
+        gst_object_unref(appsrc);
+        gst_object_unref(webrtc);
+        gst_object_unref(pipeline);
+        if (error_message) *error_message = "WebRTC audio elements not found";
+        return false;
+    }
+    gst_app_src_set_stream_type(GST_APP_SRC(audio_appsrc), GST_APP_STREAM_TYPE_STREAM);
+    g_object_set(G_OBJECT(audio_appsrc), "block", FALSE, nullptr);
     GstCaps *rtp_caps = gst_caps_from_string(kH264RtpCaps);
     GstPadTemplate *sink_template = gst_element_class_get_pad_template(GST_ELEMENT_GET_CLASS(webrtc), "sink_%u");
     GstPad *rtp_src_pad = gst_element_get_static_pad(rtp_queue, "src");
@@ -551,6 +596,58 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         return false;
     }
 
+    GstCaps *audio_rtp_caps = gst_caps_from_string(kOpusRtpCaps);
+    GstPad *audio_rtp_src_pad = gst_element_get_static_pad(audio_rtp_queue, "src");
+    std::fprintf(stderr, "[live] request webrtc audio RTP sink pad\n");
+    GstPad *webrtc_audio_sink_pad = request_webrtc_sink_pad_with_probe(pipeline,
+                                                                       webrtc,
+                                                                       sink_template,
+                                                                       &pipeline_readied_for_request);
+    if (!audio_rtp_caps || !audio_rtp_src_pad || !webrtc_audio_sink_pad) {
+        log_webrtc_request_pad_failure(webrtc, audio_rtp_caps, sink_template, audio_rtp_src_pad, webrtc_audio_sink_pad);
+        if (webrtc_audio_sink_pad) {
+            gst_element_release_request_pad(webrtc, webrtc_audio_sink_pad);
+            gst_object_unref(webrtc_audio_sink_pad);
+        }
+        if (audio_rtp_src_pad) gst_object_unref(audio_rtp_src_pad);
+        if (audio_rtp_caps) gst_caps_unref(audio_rtp_caps);
+        gst_element_release_request_pad(webrtc, webrtc_sink_pad);
+        gst_object_unref(webrtc_sink_pad);
+        gst_object_unref(audio_rtp_queue);
+        gst_object_unref(remote_audio_queue);
+        gst_object_unref(remote_audio_sink);
+        gst_object_unref(audio_appsrc);
+        gst_object_unref(appsrc);
+        gst_object_unref(webrtc);
+        if (pipeline_readied_for_request) gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        if (error_message) *error_message = "request webrtc audio RTP sink pad failed";
+        return false;
+    }
+
+    GstPadLinkReturn audio_link_ret = gst_pad_link(audio_rtp_src_pad, webrtc_audio_sink_pad);
+    gst_object_unref(audio_rtp_src_pad);
+    gst_caps_unref(audio_rtp_caps);
+    gst_object_unref(audio_rtp_queue);
+    if (audio_link_ret != GST_PAD_LINK_OK) {
+        const char *link_name = gst_pad_link_get_name(audio_link_ret);
+        std::fprintf(stderr, "[live] link audio RTP payloader to webrtc failed: %s\n", link_name);
+        gst_element_release_request_pad(webrtc, webrtc_audio_sink_pad);
+        gst_object_unref(webrtc_audio_sink_pad);
+        gst_element_release_request_pad(webrtc, webrtc_sink_pad);
+        gst_object_unref(webrtc_sink_pad);
+        gst_object_unref(remote_audio_queue);
+        gst_object_unref(remote_audio_sink);
+        gst_object_unref(audio_appsrc);
+        gst_object_unref(appsrc);
+        gst_object_unref(webrtc);
+        if (pipeline_readied_for_request) gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        if (error_message) {
+            *error_message = std::string("link audio RTP payloader to webrtc failed: ") + link_name;
+        }
+        return false;
+    }
     gulong rtp_probe_id = gst_pad_add_probe(webrtc_sink_pad,
                                             GST_PAD_PROBE_TYPE_BUFFER,
                                             on_rtp_probe_cb,
@@ -560,6 +657,11 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
                  "[live] RTP probe installed pad=%s id=%lu\n",
                  GST_OBJECT_NAME(webrtc_sink_pad),
                  static_cast<unsigned long>(rtp_probe_id));
+    gulong audio_rtp_probe_id = gst_pad_add_probe(webrtc_audio_sink_pad,
+                                                   GST_PAD_PROBE_TYPE_BUFFER,
+                                                   on_audio_rtp_probe_cb,
+                                                   this,
+                                                   nullptr);
 
     guint bus_watch_id = 0;
     GstBus *bus = gst_element_get_bus(pipeline);
@@ -573,6 +675,8 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
     g_signal_connect(webrtc, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed_cb), this);
     g_signal_connect(webrtc, "on-ice-candidate", G_CALLBACK(on_ice_candidate_cb), this);
     g_signal_connect(webrtc, "notify::ice-connection-state", G_CALLBACK(on_ice_connection_state_notify_cb), this);
+    g_signal_connect(webrtc, "pad-added", G_CALLBACK(on_incoming_pad_added_cb), this);
+    g_signal_connect(remote_audio_sink, "new-sample", G_CALLBACK(on_remote_audio_sample_cb), this);
 
     main_loop_ = g_main_loop_new(nullptr, false);
     loop_thread_ = std::thread([this]() {
@@ -585,9 +689,20 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         pipeline_ = pipeline;
         webrtc_ = webrtc;
         appsrc_ = appsrc;
+        audio_appsrc_ = audio_appsrc;
+        remote_audio_queue_ = remote_audio_queue;
+        remote_audio_sink_ = remote_audio_sink;
         webrtc_sink_pad_ = webrtc_sink_pad;
+        webrtc_audio_sink_pad_ = webrtc_audio_sink_pad;
         bus_watch_id_ = bus_watch_id;
         rtp_probe_id_ = rtp_probe_id;
+        audio_rtp_probe_id_ = audio_rtp_probe_id;
+        audio_rtp_buffer_count_ = 0;
+        audio_rtp_bytes_ = 0;
+        audio_timestamp_rebaser_.reset();
+        audio_input_count_.store(0);
+        remote_audio_count_.store(0);
+        video_input_count_.store(0);
         rtp_buffer_count_ = 0;
         rtp_bytes_ = 0;
         appsrc_width_ = initial_frame.width;
@@ -606,6 +721,17 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         return false;
     }
 
+    if (audio_manager) {
+        size_t consumer_id = audio_manager->register_consumer(
+            [this](const AudioFrame &frame) {
+                push_audio_frame(frame);
+            });
+        std::lock_guard<std::mutex> lock(mtx_);
+        audio_consumer_id_ = consumer_id;
+    } else {
+        std::fprintf(stderr, "[live] audio manager unavailable; device microphone track will be silent\n");
+    }
+
     frame_thread_ = std::thread(&LiveWebRtcSession::frame_push_loop, this);
 
     std::fprintf(stdout,
@@ -622,15 +748,27 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
 }
 
 void LiveWebRtcSession::stop() {
+    unregister_audio_consumer();
+
     GstElement *pipeline = nullptr;
     GstElement *webrtc = nullptr;
     GstElement *appsrc = nullptr;
+    GstElement *audio_appsrc = nullptr;
+    GstElement *remote_audio_queue = nullptr;
+    GstElement *remote_audio_sink = nullptr;
     GstPad *webrtc_sink_pad = nullptr;
+    GstPad *webrtc_audio_sink_pad = nullptr;
     GMainLoop *main_loop = nullptr;
     guint bus_watch_id = 0;
     gulong rtp_probe_id = 0;
+    gulong audio_rtp_probe_id = 0;
     guint64 rtp_buffer_count = 0;
     guint64 rtp_bytes = 0;
+    guint64 audio_rtp_buffer_count = 0;
+    guint64 audio_rtp_bytes = 0;
+    uint64_t audio_input_count = 0;
+    uint64_t remote_audio_count = 0;
+    uint64_t video_input_count = 0;
     std::thread loop_thread;
     std::thread frame_thread;
 
@@ -640,21 +778,38 @@ void LiveWebRtcSession::stop() {
         pipeline = pipeline_;
         webrtc = webrtc_;
         appsrc = appsrc_;
+        audio_appsrc = audio_appsrc_;
+        remote_audio_queue = remote_audio_queue_;
+        remote_audio_sink = remote_audio_sink_;
         webrtc_sink_pad = webrtc_sink_pad_;
+        webrtc_audio_sink_pad = webrtc_audio_sink_pad_;
         main_loop = main_loop_;
         bus_watch_id = bus_watch_id_;
         rtp_probe_id = rtp_probe_id_;
+        audio_rtp_probe_id = audio_rtp_probe_id_;
         rtp_buffer_count = rtp_buffer_count_;
         rtp_bytes = rtp_bytes_;
+        audio_rtp_buffer_count = audio_rtp_buffer_count_;
+        audio_rtp_bytes = audio_rtp_bytes_;
+        audio_input_count = audio_input_count_.load();
+        remote_audio_count = remote_audio_count_.load();
+        video_input_count = video_input_count_.load();
         pipeline_ = nullptr;
         webrtc_ = nullptr;
         appsrc_ = nullptr;
+        audio_appsrc_ = nullptr;
+        remote_audio_queue_ = nullptr;
+        remote_audio_sink_ = nullptr;
         webrtc_sink_pad_ = nullptr;
+        webrtc_audio_sink_pad_ = nullptr;
         main_loop_ = nullptr;
         bus_watch_id_ = 0;
         rtp_probe_id_ = 0;
+        audio_rtp_probe_id_ = 0;
         rtp_buffer_count_ = 0;
         rtp_bytes_ = 0;
+        audio_rtp_buffer_count_ = 0;
+        audio_rtp_bytes_ = 0;
         appsrc_width_ = 0;
         appsrc_height_ = 0;
         appsrc_pixfmt_ = 0;
@@ -668,18 +823,27 @@ void LiveWebRtcSession::stop() {
 
     if (frame_thread.joinable()) frame_thread.join();
     if (appsrc) gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
+    if (audio_appsrc) gst_app_src_end_of_stream(GST_APP_SRC(audio_appsrc));
     if (webrtc_sink_pad && rtp_probe_id != 0) {
         gst_pad_remove_probe(webrtc_sink_pad, rtp_probe_id);
+    }
+    if (webrtc_audio_sink_pad && audio_rtp_probe_id != 0) {
+        gst_pad_remove_probe(webrtc_audio_sink_pad, audio_rtp_probe_id);
     }
     if (bus_watch_id != 0) {
         g_source_remove(bus_watch_id);
     }
-    if (rtp_buffer_count != 0 || rtp_bytes != 0) {
-        std::fprintf(stderr,
-                     "[live] RTP probe final buffers=%llu bytes=%llu\n",
-                     static_cast<unsigned long long>(rtp_buffer_count),
-                     static_cast<unsigned long long>(rtp_bytes));
-    }
+    std::fprintf(stderr,
+                 "[live] media final video_in=%llu video_rtp_buffers=%llu video_rtp_bytes=%llu "
+                 "audio_in=%llu audio_rtp_buffers=%llu audio_rtp_bytes=%llu remote_audio=%llu\n",
+                 static_cast<unsigned long long>(video_input_count),
+                 static_cast<unsigned long long>(rtp_buffer_count),
+                 static_cast<unsigned long long>(rtp_bytes),
+                 static_cast<unsigned long long>(audio_input_count),
+                 static_cast<unsigned long long>(audio_rtp_buffer_count),
+                 static_cast<unsigned long long>(audio_rtp_bytes),
+                 static_cast<unsigned long long>(remote_audio_count));
+    if (remote_audio_sink) g_signal_handlers_disconnect_by_data(remote_audio_sink, this);
     if (pipeline) gst_element_set_state(pipeline, GST_STATE_NULL);
     if (main_loop) g_main_loop_quit(main_loop);
     if (loop_thread_.joinable()) {
@@ -687,20 +851,178 @@ void LiveWebRtcSession::stop() {
     }
     if (loop_thread.joinable()) loop_thread.join();
     if (main_loop) g_main_loop_unref(main_loop);
+    if (webrtc && webrtc_audio_sink_pad) {
+        gst_element_release_request_pad(webrtc, webrtc_audio_sink_pad);
+        gst_object_unref(webrtc_audio_sink_pad);
+    }
     if (webrtc && webrtc_sink_pad) {
         gst_element_release_request_pad(webrtc, webrtc_sink_pad);
         gst_object_unref(webrtc_sink_pad);
     }
+    if (audio_appsrc) gst_object_unref(audio_appsrc);
+    if (remote_audio_queue) gst_object_unref(remote_audio_queue);
+    if (remote_audio_sink) gst_object_unref(remote_audio_sink);
     if (appsrc) gst_object_unref(appsrc);
     if (webrtc) gst_object_unref(webrtc);
     if (pipeline) gst_object_unref(pipeline);
 }
-
 void LiveWebRtcSession::set_frame_provider(FrameProvider provider) {
     std::lock_guard<std::mutex> lock(mtx_);
     frame_provider_ = std::move(provider);
 }
 
+
+void LiveWebRtcSession::set_audio_manager(AudioCaptureManager *manager) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    audio_manager_ = manager;
+}
+
+void LiveWebRtcSession::unregister_audio_consumer() {
+    AudioCaptureManager *manager = nullptr;
+    size_t consumer_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        manager = audio_manager_;
+        consumer_id = audio_consumer_id_;
+        audio_consumer_id_ = 0;
+    }
+    if (manager && consumer_id != 0) {
+        manager->unregister_consumer(consumer_id);
+    }
+}
+
+void LiveWebRtcSession::push_audio_frame(const AudioFrame &frame) {
+    if (!frame.data || frame.size == 0) return;
+
+    GstElement *audio_appsrc = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        audio_appsrc = audio_appsrc_;
+        if (audio_appsrc) gst_object_ref(audio_appsrc);
+    }
+    if (!audio_appsrc) return;
+
+    GstBuffer *buffer = gst_buffer_new_allocate(nullptr, frame.size, nullptr);
+    if (!buffer) {
+        gst_object_unref(audio_appsrc);
+        return;
+    }
+
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+        gst_buffer_unref(buffer);
+        gst_object_unref(audio_appsrc);
+        return;
+    }
+    std::memcpy(map.data, frame.data, frame.size);
+    gst_buffer_unmap(buffer, &map);
+
+    const uint64_t rebased_pts_ns = audio_timestamp_rebaser_.rebase(frame.pts_ns, frame.duration_ns);
+    GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(rebased_pts_ns);
+    GST_BUFFER_DTS(buffer) = static_cast<GstClockTime>(rebased_pts_ns);
+    GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(frame.duration_ns);
+
+    const uint64_t count = audio_input_count_.fetch_add(1) + 1;
+    if (count == 1 || count % 500 == 0) {
+        std::fprintf(stderr,
+                     "[live] audio input count=%llu source_pts_ns=%llu rebased_pts_ns=%llu bytes=%zu\n",
+                     static_cast<unsigned long long>(count),
+                     static_cast<unsigned long long>(frame.pts_ns),
+                     static_cast<unsigned long long>(rebased_pts_ns),
+                     frame.size);
+    }
+
+    GstFlowReturn flow_ret = gst_app_src_push_buffer(GST_APP_SRC(audio_appsrc), buffer);
+    if (flow_ret != GST_FLOW_OK && flow_ret != GST_FLOW_FLUSHING) {
+        std::fprintf(stderr, "[live] audio appsrc push failed: %d\n", flow_ret);
+    }
+    gst_object_unref(audio_appsrc);
+}
+
+GstFlowReturn LiveWebRtcSession::on_remote_audio_sample(GstElement *sink) {
+    GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
+    if (!sample) return GST_FLOW_OK;
+
+    AudioCaptureManager *manager = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        manager = audio_manager_;
+    }
+
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstMapInfo map;
+    bool pushed = false;
+    if (manager && buffer && gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        AudioFrame frame;
+        frame.data = map.data;
+        frame.size = map.size;
+        frame.duration_ns = GST_CLOCK_TIME_IS_VALID(GST_BUFFER_DURATION(buffer))
+            ? GST_BUFFER_DURATION(buffer)
+            : 20ULL * 1000ULL * 1000ULL;
+        pushed = manager->push_playback_frame(frame);
+        gst_buffer_unmap(buffer, &map);
+    }
+    gst_sample_unref(sample);
+
+    if (pushed) {
+        const uint64_t count = remote_audio_count_.fetch_add(1) + 1;
+        if (count == 1 || count % 500 == 0) {
+            std::fprintf(stderr, "[live] remote audio playback count=%llu\n",
+                         static_cast<unsigned long long>(count));
+        }
+    }
+    return GST_FLOW_OK;
+}
+
+void LiveWebRtcSession::on_incoming_pad_added(GstPad *pad) {
+    if (!pad) return;
+
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    if (!caps) caps = gst_pad_query_caps(pad, nullptr);
+
+    bool is_audio = false;
+    std::string caps_text = caps_to_string(caps);
+    if (caps && gst_caps_get_size(caps) > 0) {
+        const GstStructure *structure = gst_caps_get_structure(caps, 0);
+        const char *media = gst_structure_get_string(structure, "media");
+        const char *encoding = gst_structure_get_string(structure, "encoding-name");
+        is_audio = media && g_ascii_strcasecmp(media, "audio") == 0 &&
+                   (!encoding || g_ascii_strcasecmp(encoding, "OPUS") == 0);
+    }
+    if (caps) gst_caps_unref(caps);
+
+    if (!is_audio) {
+        std::fprintf(stderr, "[live] ignore incoming non-audio pad caps=%s\n", caps_text.c_str());
+        return;
+    }
+
+    GstElement *remote_audio_queue = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        remote_audio_queue = remote_audio_queue_;
+        if (remote_audio_queue) gst_object_ref(remote_audio_queue);
+    }
+    if (!remote_audio_queue) return;
+
+    GstPad *sink_pad = gst_element_get_static_pad(remote_audio_queue, "sink");
+    if (!sink_pad) {
+        gst_object_unref(remote_audio_queue);
+        return;
+    }
+    if (gst_pad_is_linked(sink_pad)) {
+        gst_object_unref(sink_pad);
+        gst_object_unref(remote_audio_queue);
+        return;
+    }
+
+    GstPadLinkReturn link_ret = gst_pad_link(pad, sink_pad);
+    std::fprintf(stderr,
+                 "[live] incoming audio pad link result=%s caps=%s\n",
+                 gst_pad_link_get_name(link_ret),
+                 caps_text.c_str());
+    gst_object_unref(sink_pad);
+    gst_object_unref(remote_audio_queue);
+}
 void LiveWebRtcSession::handle_signal(const std::string &payload) {
     try {
         const auto signal = nlohmann::json::parse(payload);
@@ -795,9 +1117,9 @@ GstPadProbeReturn LiveWebRtcSession::on_rtp_probe(GstPadProbeInfo *info) {
         call_id = current_.call_id;
     }
 
-    if (count <= 5 || count % 24 == 0) {
+    if (count == 1 || count % 240 == 0) {
         std::fprintf(stderr,
-                     "[live] RTP buffer call_id=%s count=%llu size=%zu total_bytes=%llu pts_ns=%llu dts_ns=%llu\n",
+                     "[live] video RTP call_id=%s buffers=%llu size=%zu total_bytes=%llu pts_ns=%llu dts_ns=%llu\n",
                      call_id.c_str(),
                      static_cast<unsigned long long>(count),
                      size,
@@ -807,6 +1129,19 @@ GstPadProbeReturn LiveWebRtcSession::on_rtp_probe(GstPadProbeInfo *info) {
     }
     return GST_PAD_PROBE_OK;
 }
+GstPadProbeReturn LiveWebRtcSession::on_audio_rtp_probe(GstPadProbeInfo *info) {
+    if (!info || !(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) return GST_PAD_PROBE_OK;
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    audio_rtp_buffer_count_ += 1;
+    audio_rtp_bytes_ += static_cast<guint64>(gst_buffer_get_size(buffer));
+    return GST_PAD_PROBE_OK;
+}
+
 void LiveWebRtcSession::frame_push_loop() {
     constexpr uint64_t kFrameDurationNs = 1000000000ULL / 24ULL;
     uint64_t last_seq = 0;
@@ -915,8 +1250,9 @@ void LiveWebRtcSession::frame_push_loop() {
         last_seq = frame.seq;
         last_pts_ns = pts_ns;
         ++pushed;
+        video_input_count_.store(pushed);
 
-        if (pushed <= 5 || pushed % 24 == 0 || flow_ret != GST_FLOW_OK) {
+        if (pushed <= 5 || pushed % 240 == 0 || flow_ret != GST_FLOW_OK) {
             std::fprintf(stderr,
                          "[live] appsrc push call_id=%s seq=%llu count=%llu bytes=%zu flow=%d pts_ns=%llu\n",
                          call_id.c_str(),

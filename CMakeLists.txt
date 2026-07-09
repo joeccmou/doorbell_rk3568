@@ -146,6 +146,7 @@ add_executable(doorbell
 	src/ui/settings.cpp
     src/utils/file_utils.cpp
     src/utils/image_utils.cpp
+    src/utils/audio_capture_manager.cpp
     src/utils/image_drawing.c
     src/utils/perf_logger.cpp
     src/utils/mp4_recorder.cpp
@@ -289,6 +290,7 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/live_view_session_test.cp
         tests/live_view_session_test.cpp
         src/device/live_view_session.cpp
         src/device/live_webrtc_session.cpp
+        src/utils/audio_capture_manager.cpp
     )
     target_compile_definitions(live_view_session_test PRIVATE GST_USE_UNSTABLE_API)
     target_include_directories(live_view_session_test
@@ -303,4 +305,34 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/live_view_session_test.cp
         ${GSTREAMER_LIBRARIES}
     )
     add_test(NAME live_view_session_test COMMAND live_view_session_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/audio_capture_manager_test.cpp")
+    add_executable(audio_capture_manager_test
+        tests/audio_capture_manager_test.cpp
+        src/utils/audio_capture_manager.cpp
+    )
+    target_include_directories(audio_capture_manager_test
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src
+        ${PKG_CONFIG_INC}
+    )
+    target_link_libraries(audio_capture_manager_test
+        PRIVATE
+        pthread
+        ${GSTREAMER_LIBRARIES}
+    )
+    add_test(NAME audio_capture_manager_test COMMAND audio_capture_manager_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/audio_timestamp_rebaser_test.cpp")
+    add_executable(audio_timestamp_rebaser_test
+        tests/audio_timestamp_rebaser_test.cpp
+    )
+    target_include_directories(audio_timestamp_rebaser_test
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    add_test(NAME audio_timestamp_rebaser_test COMMAND audio_timestamp_rebaser_test)
 endif()

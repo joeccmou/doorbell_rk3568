@@ -30,11 +30,16 @@ public:
         frame_provider_set = static_cast<bool>(provider);
     }
 
+    void set_audio_manager(AudioCaptureManager *manager) override {
+        audio_manager = manager;
+    }
+
     bool fail_start = false;
     std::string fail_message = "pipeline failed";
     bool start_called = false;
     bool stop_called = false;
     bool frame_provider_set = false;
+    AudioCaptureManager *audio_manager = nullptr;
     LiveWebRtcSession::StartRequest last_request;
     std::vector<std::string> signals;
 };
@@ -145,6 +150,17 @@ void test_hangup_stops_backend() {
     assert(capture.media_states[0]["call_id"].is_null());
 }
 
+void test_audio_manager_delegates_to_backend() {
+    PublishCapture capture;
+    FakeRtcBackend *backend = nullptr;
+    auto session = make_session(&capture, std::make_unique<FakeRtcBackend>(), &backend);
+    AudioCaptureManager manager;
+
+    session.set_audio_manager(&manager);
+
+    assert(backend != nullptr);
+    assert(backend->audio_manager == &manager);
+}
 void test_signal_delegates_to_backend() {
     PublishCapture capture;
     FakeRtcBackend *backend = nullptr;
@@ -162,5 +178,6 @@ int main() {
     test_start_live_failure_reports_idle_error();
     test_hangup_stops_backend();
     test_signal_delegates_to_backend();
+    test_audio_manager_delegates_to_backend();
     return 0;
 }

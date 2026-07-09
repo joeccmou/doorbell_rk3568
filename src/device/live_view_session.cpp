@@ -41,6 +41,10 @@ public:
         session_.set_frame_provider(std::move(provider));
     }
 
+    void set_audio_manager(AudioCaptureManager *manager) override {
+        session_.set_audio_manager(manager);
+    }
+
 private:
     LiveWebRtcSession session_;
 };
@@ -70,6 +74,12 @@ LiveViewSession::~LiveViewSession() = default;
 void LiveViewSession::set_frame_provider(FrameProvider provider) {
     if (backend_) {
         backend_->set_frame_provider(std::move(provider));
+    }
+}
+
+void LiveViewSession::set_audio_manager(AudioCaptureManager *manager) {
+    if (backend_) {
+        backend_->set_audio_manager(manager);
     }
 }
 

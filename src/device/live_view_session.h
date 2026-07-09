@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include "device/live_webrtc_session.h"
+#include "utils/audio_capture_manager.h"
 
 class LiveViewSession {
 public:
@@ -19,6 +20,7 @@ public:
         virtual void stop() = 0;
         virtual void handle_signal(const std::string &payload) = 0;
         virtual void set_frame_provider(FrameProvider provider) = 0;
+        virtual void set_audio_manager(AudioCaptureManager *manager) = 0;
     };
 
     struct Publishers {
@@ -38,6 +40,7 @@ public:
     LiveViewSession &operator=(const LiveViewSession &) = delete;
 
     void set_frame_provider(FrameProvider provider);
+    void set_audio_manager(AudioCaptureManager *manager);
     bool handle_command(const std::string &payload);
     void handle_signal(const std::string &payload);
     void stop();

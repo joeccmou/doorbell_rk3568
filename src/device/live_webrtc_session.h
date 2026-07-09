@@ -12,6 +12,8 @@
 #include <gst/gst.h>
 #include <nlohmann/json.hpp>
 
+#include "utils/audio_capture_manager.h"
+
 class LiveWebRtcSession {
 public:
     struct VideoFrame {
@@ -57,6 +59,7 @@ public:
     void stop();
     void handle_signal(const std::string &payload);
     void set_frame_provider(FrameProvider provider);
+    void set_audio_manager(AudioCaptureManager *manager);
 
     void on_negotiation_needed();
     void on_offer_created(GstPromise *promise);
@@ -64,6 +67,9 @@ public:
     void on_ice_connection_state_changed();
     void on_bus_message(GstMessage *message);
     GstPadProbeReturn on_rtp_probe(GstPadProbeInfo *info);
+    GstPadProbeReturn on_audio_rtp_probe(GstPadProbeInfo *info);
+    GstFlowReturn on_remote_audio_sample(GstElement *sink);
+    void on_incoming_pad_added(GstPad *pad);
 
 private:
     struct QualityProfile {
@@ -81,6 +87,8 @@ private:
     void publish_state(const std::string &media_state);
     void request_offer(const char *reason);
     void frame_push_loop();
+    void push_audio_frame(const AudioFrame &frame);
+    void unregister_audio_consumer();
     void handle_answer(const nlohmann::json &signal);
     void handle_candidate(const nlohmann::json &signal);
 
@@ -92,13 +100,22 @@ private:
     GstElement *pipeline_ = nullptr;
     GstElement *webrtc_ = nullptr;
     GstElement *appsrc_ = nullptr;
+    GstElement *audio_appsrc_ = nullptr;
+    GstElement *remote_audio_queue_ = nullptr;
+    GstElement *remote_audio_sink_ = nullptr;
     GstPad *webrtc_sink_pad_ = nullptr;
+    GstPad *webrtc_audio_sink_pad_ = nullptr;
     GMainLoop *main_loop_ = nullptr;
     FrameProvider frame_provider_;
+    AudioCaptureManager *audio_manager_ = nullptr;
+    size_t audio_consumer_id_ = 0;
     guint bus_watch_id_ = 0;
     gulong rtp_probe_id_ = 0;
+    gulong audio_rtp_probe_id_ = 0;
     guint64 rtp_buffer_count_ = 0;
     guint64 rtp_bytes_ = 0;
+    guint64 audio_rtp_buffer_count_ = 0;
+    guint64 audio_rtp_bytes_ = 0;
     uint32_t appsrc_width_ = 0;
     uint32_t appsrc_height_ = 0;
     uint32_t appsrc_pixfmt_ = 0;
@@ -106,6 +123,10 @@ private:
     std::thread loop_thread_;
     std::thread frame_thread_;
     std::atomic<bool> frame_stop_{false};
+    AudioTimestampRebaser audio_timestamp_rebaser_;
+    std::atomic<uint64_t> audio_input_count_{0};
+    std::atomic<uint64_t> remote_audio_count_{0};
+    std::atomic<uint64_t> video_input_count_{0};
     bool active_published_ = false;
     bool offer_requested_ = false;
 };

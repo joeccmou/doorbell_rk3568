@@ -10,6 +10,7 @@
 #include <gpiod.h>
 
 #include "device/live_webrtc_session.h"
+#include "utils/audio_capture_manager.h"
 
 class LiveViewSession;
 class MqttDeviceClient;
@@ -25,6 +26,7 @@ public:
     bool start();
     void stop();
     void set_live_frame_provider(LiveWebRtcSession::FrameProvider provider);
+    void set_live_audio_manager(AudioCaptureManager *manager);
 
 private:
     enum class Stage {

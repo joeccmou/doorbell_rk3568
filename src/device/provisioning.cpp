@@ -866,6 +866,12 @@ void DoorbellProvisioning::set_live_frame_provider(LiveWebRtcSession::FrameProvi
     }
 }
 
+void DoorbellProvisioning::set_live_audio_manager(AudioCaptureManager *manager) {
+    if (live_view_session_) {
+        live_view_session_->set_audio_manager(manager);
+    }
+}
+
 void DoorbellProvisioning::start_led() {
     if (!configure_led_class()) {
         std::fprintf(stderr, "[led] LED class unavailable or not controllable path=%s\n", led_path_.c_str());

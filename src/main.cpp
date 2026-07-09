@@ -29,6 +29,7 @@
 #include "ui/settings.h"
 #include "ai/yolo_person_detector.h"
 #include "utils/mp4_recorder.h"
+#include "utils/audio_capture_manager.h"
 #include "utils/perf_logger.h"
 #include "utils/image_utils.h"
 #include "utils/image_drawing.h"
@@ -104,6 +105,7 @@ struct UiContext {
 
     std::vector<uint8_t> display_frame;
     Mp4Recorder recorder;
+    AudioCaptureManager audio_capture;
     std::string record_dir;
     // SDL_Window *sdl_window = nullptr;
 };
@@ -742,6 +744,14 @@ int main(int argc, char **argv) {
     UiContext ctx;
     ctx.cfg = cfg;
     ctx.disp = disp;
+    ctx.recorder.set_audio_dispatcher(ctx.audio_capture.dispatcher());
+    provisioning.set_live_audio_manager(&ctx.audio_capture);
+    std::string audio_error;
+    if (!ctx.audio_capture.start("plughw:0,0", &audio_error)) {
+        std::fprintf(stderr, "[audio] capture disabled: %s\n", audio_error.c_str());
+    } else {
+        std::fprintf(stdout, "[audio] capture manager started device=plughw:0,0\n");
+    }
     // ctx.sdl_window = lv_sdl_window_get_window(disp);
     // if (ctx.sdl_window) {
     //     if (SDL_SetWindowFullscreen(ctx.sdl_window, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) {
@@ -883,6 +893,7 @@ int main(int argc, char **argv) {
     }
     close_perf_log_file();
     provisioning.stop();
+    ctx.audio_capture.stop();
     ctx.camera->stop();
     delete ctx.camera;
     return 0;
