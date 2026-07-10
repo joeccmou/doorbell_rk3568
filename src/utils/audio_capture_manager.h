@@ -11,6 +11,7 @@
 
 #include <gst/gst.h>
 
+#include "utils/audio_signal_metrics.h"
 #include "utils/audio_timestamp_rebaser.h"
 
 struct AudioFrame {
@@ -62,8 +63,15 @@ private:
   GstElement *pipeline_ = nullptr;
   GstElement *appsink_ = nullptr;
   GstElement *playback_appsrc_ = nullptr;
+  GstPad *playback_sink_pad_ = nullptr;
+  gulong playback_sink_probe_id_ = 0;
   std::mutex playback_mtx_;
   std::thread pull_thread_;
   std::atomic<bool> stop_requested_{false};
+  PcmS16LevelMeter playback_level_meter_;
+  PcmS16LevelMeter playback_sink_level_meter_;
+  PcmS16LevelMeter capture_level_meter_;
+  std::atomic<uint64_t> latest_playback_pts_ns_{0};
+  uint64_t last_metrics_log_ns_ = 0;
   uint64_t seq_ = 0;
 };

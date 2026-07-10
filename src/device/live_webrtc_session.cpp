@@ -1,4 +1,4 @@
-#include "device/live_webrtc_session.h"
+﻿#include "device/live_webrtc_session.h"
 
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
@@ -923,7 +923,7 @@ void LiveWebRtcSession::push_audio_frame(const AudioFrame &frame) {
     GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(frame.duration_ns);
 
     const uint64_t count = audio_input_count_.fetch_add(1) + 1;
-    if (count == 1 || count % 500 == 0) {
+    if (count == 1 || count % 2000 == 0) {
         std::fprintf(stderr,
                      "[live] audio input count=%llu source_pts_ns=%llu rebased_pts_ns=%llu bytes=%zu\n",
                      static_cast<unsigned long long>(count),
@@ -1117,7 +1117,7 @@ GstPadProbeReturn LiveWebRtcSession::on_rtp_probe(GstPadProbeInfo *info) {
         call_id = current_.call_id;
     }
 
-    if (count == 1 || count % 240 == 0) {
+    if (count == 1 || count % 600 == 0) {
         std::fprintf(stderr,
                      "[live] video RTP call_id=%s buffers=%llu size=%zu total_bytes=%llu pts_ns=%llu dts_ns=%llu\n",
                      call_id.c_str(),
@@ -1252,7 +1252,7 @@ void LiveWebRtcSession::frame_push_loop() {
         ++pushed;
         video_input_count_.store(pushed);
 
-        if (pushed <= 5 || pushed % 240 == 0 || flow_ret != GST_FLOW_OK) {
+        if (pushed <= 5 || pushed % 600 == 0 || flow_ret != GST_FLOW_OK) {
             std::fprintf(stderr,
                          "[live] appsrc push call_id=%s seq=%llu count=%llu bytes=%zu flow=%d pts_ns=%llu\n",
                          call_id.c_str(),

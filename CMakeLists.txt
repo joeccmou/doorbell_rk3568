@@ -326,6 +326,28 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/audio_capture_manager_tes
     add_test(NAME audio_capture_manager_test COMMAND audio_capture_manager_test)
 endif()
 
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/audio_signal_metrics_test.cpp")
+    add_executable(audio_signal_metrics_test
+        tests/audio_signal_metrics_test.cpp
+    )
+    target_include_directories(audio_signal_metrics_test
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    add_test(NAME audio_signal_metrics_test COMMAND audio_signal_metrics_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/audio_pipeline_config_test.cpp")
+    add_executable(audio_pipeline_config_test
+        tests/audio_pipeline_config_test.cpp
+    )
+    target_include_directories(audio_pipeline_config_test
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    add_test(NAME audio_pipeline_config_test COMMAND audio_pipeline_config_test)
+endif()
+
 if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/audio_timestamp_rebaser_test.cpp")
     add_executable(audio_timestamp_rebaser_test
         tests/audio_timestamp_rebaser_test.cpp
