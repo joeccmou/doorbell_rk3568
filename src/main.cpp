@@ -13,6 +13,8 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
 #include <cassert>
@@ -26,6 +28,11 @@
 
 #include "camera.h"
 #include "device/provisioning.h"
+#include "events/device_event_processor.h"
+#include "events/event_paths.h"
+#include "events/person_event_gate.h"
+#include "events/person_recording_policy.h"
+#include "events/snapshot_candidate_selector.h"
 #include "ui/settings.h"
 #include "ai/yolo_person_detector.h"
 #include "utils/mp4_recorder.h"
@@ -37,7 +44,6 @@
 namespace {
 std::atomic<bool> g_stop{false};
 constexpr uint32_t kDetectIntervalMs = 250;
-constexpr uint32_t kRecordHoldMs = 3000;
 constexpr uint32_t kRecordFpsLimit = 24;
 constexpr uint64_t kRecordFrameIntervalNs = 1000000000ULL / kRecordFpsLimit;
 constexpr uint64_t kOverlayFreshNs = 300ULL * 1000ULL * 1000ULL;
@@ -94,6 +100,10 @@ struct UiContext {
     std::mutex infer_mtx;
     std::condition_variable infer_cv;
     std::thread infer_thread;
+    PersonEventGate person_event_gate{std::chrono::seconds(30)};
+    SnapshotCandidateSelector snapshot_candidate_selector{std::chrono::seconds(2)};
+    std::optional<EventRecord> pending_person_event;
+    std::unique_ptr<DeviceEventProcessor> event_processor;
 
     bool record_exit = false;
     std::mutex record_mtx;
@@ -107,6 +117,9 @@ struct UiContext {
     Mp4Recorder recorder;
     AudioCaptureManager audio_capture;
     std::string record_dir;
+    std::string pending_record_file;
+    std::string pending_record_clip_ref;
+    std::string current_record_clip_ref;
     // SDL_Window *sdl_window = nullptr;
 };
 
@@ -160,6 +173,61 @@ void inference_worker(UiContext *ctx) {
                  infer_ms,
                  has_person ? 1 : 0,
                  boxes.size());
+        const auto selection_now = std::chrono::steady_clock::now();
+        const bool create_event = ctx->person_event_gate.update(has_person, selection_now);
+        if (create_event && ctx->event_processor) {
+            double confidence = 0.0;
+            for (const auto &box : boxes) confidence = std::max(confidence, static_cast<double>(box.score));
+            std::string existing_clip_ref;
+            {
+                std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
+                existing_clip_ref = !ctx->current_record_clip_ref.empty()
+                    ? ctx->current_record_clip_ref
+                    : ctx->pending_record_clip_ref;
+            }
+            std::string error;
+            auto event = ctx->event_processor->begin_person_event_with_clip(
+                confidence, std::chrono::system_clock::now(), existing_clip_ref, &error);
+            if (!event) {
+                std::fprintf(stderr, "[event] persist person event failed error=%s\n", error.c_str());
+            } else {
+                std::fprintf(stdout, "[event] created person event_id=%s\n", event->event_id.c_str());
+                ctx->pending_person_event = *event;
+                ctx->snapshot_candidate_selector.start(selection_now);
+                if (!event->clip_ref.empty()) {
+                    std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
+                    if (ctx->current_record_clip_ref.empty() && ctx->pending_record_clip_ref.empty()) {
+                        ctx->pending_record_clip_ref = event->clip_ref;
+                        ctx->pending_record_file = ctx->record_dir + "/" + event->clip_ref;
+                    }
+                }
+            }
+        }
+        if (ctx->snapshot_candidate_selector.active()) {
+            if (has_person) {
+                std::vector<SnapshotPersonBox> snapshot_boxes;
+                snapshot_boxes.reserve(boxes.size());
+                for (const auto &box : boxes) {
+                    snapshot_boxes.push_back(SnapshotPersonBox{
+                        box.left, box.top, box.right, box.bottom, box.score});
+                }
+                ctx->snapshot_candidate_selector.consider(
+                    frame.rgb, frame.width, frame.height, snapshot_boxes, selection_now);
+            }
+            auto selected = ctx->snapshot_candidate_selector.take_if_ready(selection_now);
+            if (selected && ctx->pending_person_event && ctx->event_processor) {
+                const std::string event_id = ctx->pending_person_event->event_id;
+                ctx->event_processor->submit_person_snapshot(
+                    std::move(*ctx->pending_person_event),
+                    std::move(selected->rgb),
+                    selected->width,
+                    selected->height);
+                ctx->pending_person_event.reset();
+                std::fprintf(stdout,
+                             "[event] selected snapshot event_id=%s score=%.3f confidence=%.3f\n",
+                             event_id.c_str(), selected->score, selected->confidence);
+            }
+        }
         {
             std::lock_guard<std::mutex> guard(ctx->detect_mtx);
             if (has_person) {
@@ -183,7 +251,6 @@ void recorder_worker(UiContext *ctx) {
     uint64_t seq_zero_count = 0;
     uint64_t seq_duplicate_count = 0;
     uint64_t seq_regress_count = 0;
-    const uint64_t hold_ns = static_cast<uint64_t>(kRecordHoldMs) * 1000ULL * 1000ULL;
     Camera::MediaFrame media_frame;
     uint64_t consumed_frame_gen = 0;
 
@@ -214,10 +281,7 @@ void recorder_worker(UiContext *ctx) {
         }
 
         const uint64_t now_ns = monotonic_time_ns();
-        bool want_record = false;
-        if (last_person_ts_ns != 0 && now_ns >= last_person_ts_ns) {
-            want_record = (now_ns - last_person_ts_ns) <= hold_ns;
-        }
+        const bool want_record = person_recording_active(last_person_ts_ns, now_ns);
 
         if (!want_record) {
             if (ctx->recorder.running()) {
@@ -231,6 +295,8 @@ void recorder_worker(UiContext *ctx) {
                 running_width = 0;
                 running_height = 0;
                 last_written_ts_ns = 0;
+                std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
+                ctx->current_record_clip_ref.clear();
             }
             continue;
         }
@@ -257,9 +323,33 @@ void recorder_worker(UiContext *ctx) {
                 perf_log("record stop ts_ns=%llu stop_ms=%.3f reason=resolution_change\n",
                          static_cast<unsigned long long>(stop_end_ns),
                          static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
+                std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
+                ctx->current_record_clip_ref.clear();
             }
             uint64_t start_begin_ns = monotonic_time_ns();
-            bool started = ctx->recorder.start(ctx->record_dir, camera_width, camera_height, kRecordFpsLimit, camera_pixfmt);
+			std::string output_file;
+			std::string selected_clip_ref;
+			{
+				std::lock_guard<std::mutex> lock(ctx->record_mtx);
+				output_file = ctx->pending_record_file;
+				selected_clip_ref = ctx->pending_record_clip_ref;
+			}
+			bool started = false;
+			if (!output_file.empty()) {
+				started = ctx->recorder.start_file(output_file, camera_width, camera_height, kRecordFpsLimit, camera_pixfmt);
+			} else {
+				std::string allocation_error;
+				auto clip_ref = ctx->event_processor
+				    ? ctx->event_processor->allocate_recording_clip(std::chrono::system_clock::now(), &allocation_error)
+				    : std::nullopt;
+				if (clip_ref) {
+					selected_clip_ref = *clip_ref;
+					output_file = ctx->record_dir + "/" + *clip_ref;
+					started = ctx->recorder.start_file(output_file, camera_width, camera_height, kRecordFpsLimit, camera_pixfmt);
+				} else {
+					std::fprintf(stderr, "[record] allocate daily clip failed error=%s\n", allocation_error.c_str());
+				}
+			}
             uint64_t start_end_ns = monotonic_time_ns();
             perf_log("record start wait_ms=%.3f start_ms=%.3f ok=%d w=%u h=%u fmt=%c%c%c%c\n",
                      wait_ms,
@@ -279,6 +369,14 @@ void recorder_worker(UiContext *ctx) {
             running_height = camera_height;
             last_written_ts_ns = 0;
             std::fprintf(stdout, "[record] start %s\n", ctx->recorder.last_file().c_str());
+            {
+                std::lock_guard<std::mutex> lock(ctx->record_mtx);
+                ctx->current_record_clip_ref = selected_clip_ref;
+                if (ctx->pending_record_clip_ref == selected_clip_ref) {
+                    ctx->pending_record_clip_ref.clear();
+                    ctx->pending_record_file.clear();
+                }
+            }
         }
 
         FramePacket frame;
@@ -531,11 +629,7 @@ void camera_timer_cb(lv_timer_t *timer) {
     }
     const uint64_t overlay_fetch_end_ns = monotonic_time_ns();
 
-    bool want_record = false;
-    if (last_person_ts_ns != 0 && frame_ts_ns != 0 && frame_ts_ns >= last_person_ts_ns) {
-        const uint64_t hold_ns = static_cast<uint64_t>(kRecordHoldMs) * 1000ULL * 1000ULL;
-        want_record = (frame_ts_ns - last_person_ts_ns) <= hold_ns;
-    }
+    const bool want_record = person_recording_active(last_person_ts_ns, frame_ts_ns);
     const uint64_t record_state_end_ns = monotonic_time_ns();
 
 	uint64_t draw_rectangle_begin_ns = monotonic_time_ns();
@@ -838,6 +932,25 @@ int main(int argc, char **argv) {
     std::filesystem::create_directories(ctx.record_dir);
     std::fprintf(stdout, "[record] output dir: %s\n", ctx.record_dir.c_str());
 
+    if (!provisioning.device_id().empty()) {
+        const char *api_base_env = std::getenv("DOORBELL_API_BASE_URL");
+        const std::string api_base = api_base_env && api_base_env[0] != '\0'
+            ? api_base_env
+            : "https://smartdoorbell.site/api";
+        ctx.event_processor = std::make_unique<DeviceEventProcessor>(
+            provisioning.device_id(),
+            provisioning.device_secret(),
+            api_base,
+            "/userdata/doorbell",
+            ctx.record_dir,
+            [&provisioning](const std::string &payload) { return provisioning.publish_event(payload); });
+        std::string event_error;
+        if (!ctx.event_processor->start(&event_error)) {
+            std::fprintf(stderr, "[event] processor disabled error=%s\n", event_error.c_str());
+            ctx.event_processor.reset();
+        }
+    }
+
     std::string yolo_model = select_model_path(model_arg);
     ctx.detector_ready = ctx.detector.load(yolo_model);
     if (!ctx.detector_ready) {
@@ -891,6 +1004,7 @@ int main(int argc, char **argv) {
     if (ctx.record_thread.joinable()) {
         ctx.record_thread.join();
     }
+    if (ctx.event_processor) ctx.event_processor->stop();
     close_perf_log_file();
     provisioning.stop();
     ctx.audio_capture.stop();

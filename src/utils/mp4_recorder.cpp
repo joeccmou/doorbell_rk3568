@@ -62,9 +62,18 @@ Mp4Recorder::~Mp4Recorder() {
 }
 
 bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t height, uint32_t fps, uint32_t pixfmt) {
+    std::time_t now = std::time(nullptr);
+    std::tm tm_now{};
+    localtime_r(&now, &tm_now);
+    char ts[32] = {0};
+    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_now);
+    return start_file(output_dir + "/person_" + ts + ".mp4", width, height, fps, pixfmt);
+}
+
+bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uint32_t height, uint32_t fps, uint32_t pixfmt) {
     uint64_t start_begin_ns = mono_time_ns();
-    rec_trace("start enter dir=%s w=%u h=%u fps=%u pixfmt=%c%c%c%c",
-              output_dir.c_str(),
+    rec_trace("start enter file=%s w=%u h=%u fps=%u pixfmt=%c%c%c%c",
+              output_file.c_str(),
               width,
               height,
               fps,
@@ -73,8 +82,9 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
               (pixfmt >> 16) & 0xFF,
               (pixfmt >> 24) & 0xFF);
     if (running()) return true;
-    if (output_dir.empty() || width == 0 || height == 0 || fps == 0) return false;
+    if (output_file.empty() || width == 0 || height == 0 || fps == 0) return false;
 
+    const std::string output_dir = std::filesystem::path(output_file).parent_path().string();
     std::error_code ec;
     std::filesystem::create_directories(output_dir, ec);
     if (ec) {
@@ -86,15 +96,7 @@ bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t 
         return false;
     }
 
-    std::time_t now = std::time(nullptr);
-    std::tm tm_now{};
-    localtime_r(&now, &tm_now);
-    char ts[32] = {0};
-    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_now);
-
-    std::ostringstream path;
-    path << output_dir << "/person_" << ts << ".mp4";
-    last_file_ = path.str();
+    last_file_ = output_file;
 
     ensure_gstreamer_initialized();
 

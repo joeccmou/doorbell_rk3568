@@ -27,6 +27,9 @@ public:
     void stop();
     void set_live_frame_provider(LiveWebRtcSession::FrameProvider provider);
     void set_live_audio_manager(AudioCaptureManager *manager);
+    const std::string &device_id() const { return identity_.device_id; }
+    const std::string &device_secret() const { return identity_.device_secret; }
+    bool publish_event(const std::string &payload);
 
 private:
     enum class Stage {

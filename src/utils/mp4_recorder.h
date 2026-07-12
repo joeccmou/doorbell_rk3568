@@ -18,6 +18,7 @@ public:
     void set_audio_dispatcher(AudioFrameDispatcher *dispatcher) { audio_dispatcher_ = dispatcher; }
 
     bool start(const std::string &output_dir, uint32_t width, uint32_t height, uint32_t fps, uint32_t pixfmt);
+    bool start_file(const std::string &output_file, uint32_t width, uint32_t height, uint32_t fps, uint32_t pixfmt);
     void stop();
     bool running() const { return pipeline_ != nullptr; }
 

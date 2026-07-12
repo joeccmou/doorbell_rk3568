@@ -117,8 +117,10 @@ list(APPEND PKG_CONFIG_INC ${GSTREAMER_INCLUDE_DIRS})
 pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 pkg_check_modules(GPIOD REQUIRED libgpiod)
 pkg_check_modules(NLOHMANN_JSON REQUIRED nlohmann_json)
-list(APPEND PKG_CONFIG_LIB ${MOSQUITTO_LIBRARIES} ${GPIOD_LIBRARIES})
-list(APPEND PKG_CONFIG_INC ${MOSQUITTO_INCLUDE_DIRS} ${GPIOD_INCLUDE_DIRS} ${NLOHMANN_JSON_INCLUDE_DIRS})
+pkg_check_modules(SQLITE3 REQUIRED sqlite3)
+pkg_check_modules(CURL REQUIRED libcurl)
+list(APPEND PKG_CONFIG_LIB ${MOSQUITTO_LIBRARIES} ${GPIOD_LIBRARIES} ${SQLITE3_LIBRARIES} ${CURL_LIBRARIES})
+list(APPEND PKG_CONFIG_INC ${MOSQUITTO_INCLUDE_DIRS} ${GPIOD_INCLUDE_DIRS} ${NLOHMANN_JSON_INCLUDE_DIRS} ${SQLITE3_INCLUDE_DIRS} ${CURL_INCLUDE_DIRS})
 
 if (CONFIG_LV_USE_LINUX_DRM)
 
@@ -143,6 +145,13 @@ add_executable(doorbell
     src/device/provisioning.cpp
     src/device/live_view_session.cpp
     src/device/live_webrtc_session.cpp
+    src/events/device_event_processor.cpp
+    src/events/event_paths.cpp
+    src/events/event_store.cpp
+    src/events/http_snapshot_uploader.cpp
+    src/events/person_event_gate.cpp
+    src/events/snapshot_candidate_selector.cpp
+    src/events/snapshot_service.cpp
 	src/ui/settings.cpp
     src/utils/file_utils.cpp
     src/utils/image_utils.cpp
@@ -305,6 +314,60 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/live_view_session_test.cp
         ${GSTREAMER_LIBRARIES}
     )
     add_test(NAME live_view_session_test COMMAND live_view_session_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/person_event_gate_test.cpp")
+    add_executable(person_event_gate_test
+        tests/person_event_gate_test.cpp
+        src/events/person_event_gate.cpp
+    )
+    target_include_directories(person_event_gate_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME person_event_gate_test COMMAND person_event_gate_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/event_paths_test.cpp")
+    add_executable(event_paths_test
+        tests/event_paths_test.cpp
+        src/events/event_paths.cpp
+    )
+    target_include_directories(event_paths_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME event_paths_test COMMAND event_paths_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/event_store_migration_test.cpp")
+    add_executable(event_store_migration_test
+        tests/event_store_migration_test.cpp
+        src/events/event_store.cpp
+        src/events/event_paths.cpp
+    )
+    target_include_directories(event_store_migration_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
+    target_link_libraries(event_store_migration_test PRIVATE ${SQLITE3_LIBRARIES})
+    add_test(NAME event_store_migration_test COMMAND event_store_migration_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/snapshot_candidate_selector_test.cpp")
+    add_executable(snapshot_candidate_selector_test
+        tests/snapshot_candidate_selector_test.cpp
+        src/events/snapshot_candidate_selector.cpp
+    )
+    target_include_directories(snapshot_candidate_selector_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME snapshot_candidate_selector_test COMMAND snapshot_candidate_selector_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/device_event_processor_api_test.cpp")
+    add_executable(device_event_processor_api_test
+        tests/device_event_processor_api_test.cpp
+    )
+    target_include_directories(device_event_processor_api_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME device_event_processor_api_test COMMAND device_event_processor_api_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/person_recording_policy_test.cpp")
+    add_executable(person_recording_policy_test
+        tests/person_recording_policy_test.cpp
+    )
+    target_include_directories(person_recording_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME person_recording_policy_test COMMAND person_recording_policy_test)
 endif()
 
 if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/audio_capture_manager_test.cpp")

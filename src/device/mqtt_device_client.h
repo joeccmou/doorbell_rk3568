@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 struct mosquitto;
 struct mosquitto_message;
@@ -42,6 +44,7 @@ public:
 
     bool publish_signal(const std::string &payload);
     bool publish_media_state(const std::string &payload);
+    bool publish_event(const std::string &payload);
     bool publish_command_ack(const std::string &trace_id,
                              const std::string &cmd_id,
                              bool ok,
@@ -50,6 +53,7 @@ public:
 private:
     static void mqtt_connect_callback(struct mosquitto *client, void *userdata, int rc);
     static void mqtt_message_callback(struct mosquitto *client, void *userdata, const struct mosquitto_message *msg);
+    static void mqtt_publish_callback(struct mosquitto *client, void *userdata, int message_id);
 
     void mqtt_loop();
     void handle_message(const struct mosquitto_message *msg);
@@ -62,6 +66,7 @@ private:
     std::string command_ack_topic() const;
     std::string signal_topic() const;
     std::string media_state_topic() const;
+    std::string event_topic() const;
 
     std::string device_id_;
     std::string device_secret_;
@@ -77,4 +82,8 @@ private:
     std::mutex mqtt_mtx_;
     mosquitto *mqtt_client_ = nullptr;
     std::thread mqtt_thread_;
+    std::mutex publish_mtx_;
+    std::condition_variable publish_cv_;
+    std::unordered_set<int> published_message_ids_;
+    std::unordered_set<int> nonblocking_message_ids_;
 };

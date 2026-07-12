@@ -250,6 +250,10 @@ bool MqttDeviceClient::publish_media_state(const std::string &payload) {
     return publish_payload(media_state_topic(), payload, 1, true);
 }
 
+bool MqttDeviceClient::publish_event(const std::string &payload) {
+    return publish_payload(event_topic(), payload, 1, false);
+}
+
 bool MqttDeviceClient::publish_command_ack(const std::string &trace_id,
                                            const std::string &cmd_id,
                                            bool ok,
@@ -315,6 +319,7 @@ void MqttDeviceClient::mqtt_loop() {
 
         mosquitto_connect_callback_set(client, &MqttDeviceClient::mqtt_connect_callback);
         mosquitto_message_callback_set(client, &MqttDeviceClient::mqtt_message_callback);
+        mosquitto_publish_callback_set(client, &MqttDeviceClient::mqtt_publish_callback);
 
         bool connected = false;
         bool ok = configure_mqtt_client(client,
@@ -468,20 +473,54 @@ void MqttDeviceClient::handle_message(const struct mosquitto_message *msg) {
 }
 
 bool MqttDeviceClient::publish_payload(const std::string &topic, const std::string &payload, int qos, bool retained) {
-    std::lock_guard<std::mutex> lock(mqtt_mtx_);
-    if (!mqtt_client_) return false;
-    int rc = mosquitto_publish(mqtt_client_,
-                               nullptr,
+    int message_id = 0;
+    int rc = MOSQ_ERR_NO_CONN;
+    {
+        std::lock_guard<std::mutex> lock(mqtt_mtx_);
+        if (!mqtt_client_) return false;
+        rc = mosquitto_publish(mqtt_client_,
+                               &message_id,
                                topic.c_str(),
                                static_cast<int>(payload.size()),
                                payload.data(),
                                qos,
                                retained);
+    }
     if (rc != MOSQ_ERR_SUCCESS) {
         std::fprintf(stderr, "[mqtt] publish failed topic=%s rc=%d error=%s\n", topic.c_str(), rc, mosquitto_strerror(rc));
         return false;
     }
+    if (qos == 0) return true;
+	if (mqtt_thread_.joinable() && std::this_thread::get_id() == mqtt_thread_.get_id()) {
+		// 当前就在 mosquitto_loop 回调中，不能同步等待由同一线程处理的 PUBACK。
+		std::lock_guard<std::mutex> delivery_lock(publish_mtx_);
+		nonblocking_message_ids_.insert(message_id);
+		return true;
+	}
+
+    std::unique_lock<std::mutex> delivery_lock(publish_mtx_);
+    const bool acknowledged = publish_cv_.wait_for(delivery_lock, std::chrono::seconds(5), [this, message_id] {
+        return published_message_ids_.find(message_id) != published_message_ids_.end() || stop_.load();
+    });
+    published_message_ids_.erase(message_id);
+    if (!acknowledged || stop_.load()) {
+        std::fprintf(stderr, "[mqtt] publish acknowledgement timeout topic=%s message_id=%d\n", topic.c_str(), message_id);
+        return false;
+    }
     return true;
+}
+
+void MqttDeviceClient::mqtt_publish_callback(struct mosquitto *, void *userdata, int message_id) {
+    auto *state = static_cast<ConnectState *>(userdata);
+    if (!state || !state->owner) return;
+    {
+        std::lock_guard<std::mutex> lock(state->owner->publish_mtx_);
+		if (state->owner->nonblocking_message_ids_.erase(message_id) > 0) {
+			return;
+		}
+        state->owner->published_message_ids_.insert(message_id);
+    }
+    state->owner->publish_cv_.notify_all();
 }
 
 bool MqttDeviceClient::wait_for_stop_or(std::chrono::milliseconds duration) const {
@@ -516,4 +555,8 @@ std::string MqttDeviceClient::signal_topic() const {
 
 std::string MqttDeviceClient::media_state_topic() const {
     return "doorbell/devices/" + device_id_ + "/media_state";
+}
+
+std::string MqttDeviceClient::event_topic() const {
+    return "doorbell/devices/" + device_id_ + "/event";
 }

@@ -408,6 +408,10 @@ DoorbellProvisioning::~DoorbellProvisioning() {
     stop();
 }
 
+bool DoorbellProvisioning::publish_event(const std::string &payload) {
+    return mqtt_client_ && mqtt_client_->publish_event(payload);
+}
+
 bool DoorbellProvisioning::start() {
     if (!ensure_dir(data_dir_)) {
         std::fprintf(stderr, "[provision] failed to create data dir: %s\n", data_dir_.c_str());
