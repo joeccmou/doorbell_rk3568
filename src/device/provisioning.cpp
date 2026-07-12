@@ -1,6 +1,10 @@
 #include "device/provisioning.h"
 #include "device/live_view_session.h"
 #include "device/mqtt_device_client.h"
+#include "device/device_settings_command.h"
+#include "device/sntp_client.h"
+#include "device/time_sync_service.h"
+#include "device/timezone_manager.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -24,6 +28,7 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -422,6 +427,20 @@ bool DoorbellProvisioning::start() {
         return false;
     }
 
+    timezone_manager_ = std::make_unique<TimezoneManager>();
+    sntp_client_ = std::make_unique<SntpClient>();
+    time_sync_service_ = std::make_unique<TimeSyncService>(
+        std::vector<std::string>{"ntp.aliyun.com", "ntp1.aliyun.com", "ntp2.aliyun.com"},
+        [this](const std::string &server) {
+            return sntp_client_->query(server);
+        },
+        &TimeSyncService::set_system_clock,
+        &TimeSyncService::system_now_ms,
+        [this](const DeviceTimeSyncStatus &status) {
+            publish_time_sync_status(status);
+        });
+    time_sync_service_->start();
+
     LiveViewSession::Publishers live_publishers;
     live_publishers.command_ack_publisher = [this](const std::string &trace_id,
                                                    const std::string &cmd_id,
@@ -445,9 +464,7 @@ bool DoorbellProvisioning::start() {
 
     MqttDeviceClient::Callbacks mqtt_callbacks;
     mqtt_callbacks.command_handler = [this](const std::string &payload) {
-        if (live_view_session_) {
-            live_view_session_->handle_command(payload);
-        }
+        handle_mqtt_command(payload);
     };
     mqtt_callbacks.signal_handler = [this](const std::string &payload) {
         if (live_view_session_) {
@@ -465,6 +482,7 @@ bool DoorbellProvisioning::start() {
     };
     mqtt_callbacks.on_online = [this]() {
         set_stage(Stage::Online);
+        if (time_sync_service_) time_sync_service_->notify_network_online();
     };
     mqtt_client_ = std::make_unique<MqttDeviceClient>(identity_.device_id,
                                                       identity_.device_secret,
@@ -496,12 +514,73 @@ void DoorbellProvisioning::stop() {
     stop_cv_.notify_all();
 
     stop_http_server();
+    if (time_sync_service_) time_sync_service_->stop();
     if (live_view_session_) live_view_session_->stop();
     if (provision_thread_.joinable()) provision_thread_.join();
     if (mqtt_client_) mqtt_client_->stop(true);
     stop_button();
     stop_led();
     stop_access_point();
+}
+
+void DoorbellProvisioning::handle_mqtt_command(const std::string &payload) {
+    const auto command = parse_device_settings_command(payload);
+    if (!command.is_apply_settings) {
+        if (live_view_session_) live_view_session_->handle_command(payload);
+        return;
+    }
+
+    if (!command.valid || !timezone_manager_) {
+        if (mqtt_client_ && !command.trace_id.empty() && !command.cmd_id.empty()) {
+            mqtt_client_->publish_command_ack(command.trace_id,
+                                              command.cmd_id,
+                                              false,
+                                              command.error_code.empty() ? "TIMEZONE_INVALID" : command.error_code);
+        }
+        return;
+    }
+
+    const auto applied = timezone_manager_->apply(command.timezone);
+    if (!applied.ok) {
+        if (mqtt_client_) {
+            mqtt_client_->publish_command_ack(command.trace_id,
+                                              command.cmd_id,
+                                              false,
+                                              applied.error_code);
+        }
+        return;
+    }
+
+    nlohmann::json data;
+    data["timezone"] = applied.timezone;
+    if (time_sync_service_) {
+        const auto sync = time_sync_service_->status();
+        data["time_sync"] = {
+            {"state", sync.state},
+            {"last_success_at", sync.last_success_at ? nlohmann::json(*sync.last_success_at) : nlohmann::json(nullptr)},
+            {"last_offset_ms", sync.last_offset_ms ? nlohmann::json(*sync.last_offset_ms) : nlohmann::json(nullptr)},
+        };
+    }
+    if (mqtt_client_) {
+        mqtt_client_->publish_command_ack(command.trace_id, command.cmd_id, true, "", data.dump());
+    }
+}
+
+void DoorbellProvisioning::publish_time_sync_status(const DeviceTimeSyncStatus &status) {
+    if (!mqtt_client_) return;
+    nlohmann::json payload;
+    payload["trace_id"] = "tr_time_sync_" + std::to_string(TimeSyncService::system_now_ms());
+    payload["device_id"] = identity_.device_id;
+    payload["status"] = "online";
+    payload["time_sync"] = {
+        {"state", status.state},
+        {"last_success_at", status.last_success_at ? nlohmann::json(*status.last_success_at) : nlohmann::json(nullptr)},
+        {"last_offset_ms", status.last_offset_ms ? nlohmann::json(*status.last_offset_ms) : nlohmann::json(nullptr)},
+    };
+    payload["ts"] = iso_utc_now();
+    if (!mqtt_client_->publish_status(payload.dump())) {
+        std::fprintf(stderr, "[time_sync] publish status failed state=%s\n", status.state.c_str());
+    }
 }
 
 bool DoorbellProvisioning::load_identity() {

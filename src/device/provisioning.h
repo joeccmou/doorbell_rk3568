@@ -14,6 +14,10 @@
 
 class LiveViewSession;
 class MqttDeviceClient;
+class SntpClient;
+class TimeSyncService;
+class TimezoneManager;
+struct DeviceTimeSyncStatus;
 
 class DoorbellProvisioning {
 public:
@@ -103,6 +107,8 @@ private:
     std::string stage_name(Stage stage) const;
 
     bool wait_for_stop_or(std::chrono::milliseconds duration) const;
+    void handle_mqtt_command(const std::string &payload);
+    void publish_time_sync_status(const DeviceTimeSyncStatus &status);
 
     std::string identity_path_;
     std::string data_dir_;
@@ -138,6 +144,9 @@ private:
 
     std::unique_ptr<MqttDeviceClient> mqtt_client_;
     std::unique_ptr<LiveViewSession> live_view_session_;
+    std::unique_ptr<SntpClient> sntp_client_;
+    std::unique_ptr<TimeSyncService> time_sync_service_;
+    std::unique_ptr<TimezoneManager> timezone_manager_;
 
     GpioLine button_gpio_;
 

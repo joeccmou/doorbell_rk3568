@@ -254,16 +254,28 @@ bool MqttDeviceClient::publish_event(const std::string &payload) {
     return publish_payload(event_topic(), payload, 1, false);
 }
 
+bool MqttDeviceClient::publish_status(const std::string &payload) {
+    return publish_payload(status_topic(), payload, 1, true);
+}
+
 bool MqttDeviceClient::publish_command_ack(const std::string &trace_id,
                                            const std::string &cmd_id,
                                            bool ok,
-                                           const std::string &error_code) {
+                                           const std::string &error_code,
+                                           const std::string &data_json) {
     nlohmann::json ack;
     ack["trace_id"] = trace_id;
     ack["cmd_id"] = cmd_id;
     ack["device_id"] = device_id_;
     ack["ok"] = ok;
     ack["error_code"] = error_code.empty() ? nlohmann::json(nullptr) : nlohmann::json(error_code);
+    if (!data_json.empty()) {
+        try {
+            ack["data"] = nlohmann::json::parse(data_json);
+        } catch (...) {
+            ack["data"] = nlohmann::json::object();
+        }
+    }
     ack["ts"] = iso_utc_now();
     return publish_payload(command_ack_topic(), ack.dump(), 1, false);
 }
@@ -357,45 +369,51 @@ void MqttDeviceClient::mqtt_loop() {
             connected = ok;
         }
         if (ok) {
-            int rc = mosquitto_publish(client,
-                                       nullptr,
-                                       status_topic().c_str(),
-                                       static_cast<int>(online.size()),
-                                       online.data(),
-                                       1,
-                                       true);
-            if (rc != MOSQ_ERR_SUCCESS) {
+            int sub_rc = mosquitto_subscribe(client, nullptr, command_topic().c_str(), 1);
+            if (sub_rc != MOSQ_ERR_SUCCESS) {
                 std::fprintf(stderr,
-                             "[mqtt] session publish online failed topic=%s rc=%d error=%s\n",
-                             status_topic().c_str(),
-                             rc,
-                             mosquitto_strerror(rc));
+                             "[mqtt] subscribe command failed topic=%s rc=%d error=%s\n",
+                             command_topic().c_str(),
+                             sub_rc,
+                             mosquitto_strerror(sub_rc));
                 ok = false;
             } else {
-                ok = flush_mqtt_loop(client, "session_publish", 2000);
-                int sub_rc = mosquitto_subscribe(client, nullptr, command_topic().c_str(), 1);
+                std::fprintf(stdout, "[mqtt] subscribed command topic=%s\n", command_topic().c_str());
+            }
+            if (ok) {
+                sub_rc = mosquitto_subscribe(client, nullptr, signal_topic().c_str(), 1);
                 if (sub_rc != MOSQ_ERR_SUCCESS) {
                     std::fprintf(stderr,
-                                 "[mqtt] subscribe command failed topic=%s rc=%d error=%s\n",
-                                 command_topic().c_str(),
+                                 "[mqtt] subscribe signal failed topic=%s rc=%d error=%s\n",
+                                 signal_topic().c_str(),
                                  sub_rc,
                                  mosquitto_strerror(sub_rc));
                     ok = false;
                 } else {
-                    std::fprintf(stdout, "[mqtt] subscribed command topic=%s\n", command_topic().c_str());
+                    std::fprintf(stdout, "[mqtt] subscribed signal topic=%s\n", signal_topic().c_str());
                 }
-                if (ok) {
-                    sub_rc = mosquitto_subscribe(client, nullptr, signal_topic().c_str(), 1);
-                    if (sub_rc != MOSQ_ERR_SUCCESS) {
-                        std::fprintf(stderr,
-                                     "[mqtt] subscribe signal failed topic=%s rc=%d error=%s\n",
-                                     signal_topic().c_str(),
-                                     sub_rc,
-                                     mosquitto_strerror(sub_rc));
-                        ok = false;
-                    } else {
-                        std::fprintf(stdout, "[mqtt] subscribed signal topic=%s\n", signal_topic().c_str());
-                    }
+            }
+            if (ok) {
+                // 先让 broker 确认订阅，再发布 online，避免上线重发设置早于 command 订阅。
+                ok = flush_mqtt_loop(client, "session_subscribe", 1000);
+            }
+            if (ok) {
+                int rc = mosquitto_publish(client,
+                                           nullptr,
+                                           status_topic().c_str(),
+                                           static_cast<int>(online.size()),
+                                           online.data(),
+                                           1,
+                                           true);
+                if (rc != MOSQ_ERR_SUCCESS) {
+                    std::fprintf(stderr,
+                                 "[mqtt] session publish online failed topic=%s rc=%d error=%s\n",
+                                 status_topic().c_str(),
+                                 rc,
+                                 mosquitto_strerror(rc));
+                    ok = false;
+                } else {
+                    ok = flush_mqtt_loop(client, "session_publish", 2000);
                 }
             }
         }

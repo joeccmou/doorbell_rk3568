@@ -143,6 +143,10 @@ add_executable(doorbell
     src/camera.cpp
     src/device/mqtt_device_client.cpp
     src/device/provisioning.cpp
+    src/device/device_settings_command.cpp
+    src/device/timezone_manager.cpp
+    src/device/sntp_client.cpp
+    src/device/time_sync_service.cpp
     src/device/live_view_session.cpp
     src/device/live_webrtc_session.cpp
     src/events/device_event_processor.cpp
@@ -314,6 +318,42 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/live_view_session_test.cp
         ${GSTREAMER_LIBRARIES}
     )
     add_test(NAME live_view_session_test COMMAND live_view_session_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/timezone_manager_test.cpp")
+    add_executable(timezone_manager_test
+        tests/timezone_manager_test.cpp
+        src/device/timezone_manager.cpp
+    )
+    target_include_directories(timezone_manager_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME timezone_manager_test COMMAND timezone_manager_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/sntp_client_test.cpp")
+    add_executable(sntp_client_test
+        tests/sntp_client_test.cpp
+        src/device/sntp_client.cpp
+    )
+    target_include_directories(sntp_client_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME sntp_client_test COMMAND sntp_client_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/time_sync_service_test.cpp")
+    add_executable(time_sync_service_test
+        tests/time_sync_service_test.cpp
+        src/device/time_sync_service.cpp
+    )
+    target_include_directories(time_sync_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME time_sync_service_test COMMAND time_sync_service_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/device_settings_command_test.cpp")
+    add_executable(device_settings_command_test
+        tests/device_settings_command_test.cpp
+        src/device/device_settings_command.cpp
+    )
+    target_include_directories(device_settings_command_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME device_settings_command_test COMMAND device_settings_command_test)
 endif()
 
 if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/person_event_gate_test.cpp")

@@ -45,10 +45,12 @@ public:
     bool publish_signal(const std::string &payload);
     bool publish_media_state(const std::string &payload);
     bool publish_event(const std::string &payload);
+    bool publish_status(const std::string &payload);
     bool publish_command_ack(const std::string &trace_id,
                              const std::string &cmd_id,
                              bool ok,
-                             const std::string &error_code = "");
+                             const std::string &error_code = "",
+                             const std::string &data_json = "");
 
 private:
     static void mqtt_connect_callback(struct mosquitto *client, void *userdata, int rc);
