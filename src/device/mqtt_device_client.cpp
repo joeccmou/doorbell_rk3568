@@ -1,4 +1,5 @@
 #include "device/mqtt_device_client.h"
+#include "device/mqtt_session_handshake.h"
 
 #include <cstdio>
 #include <ctime>
@@ -95,6 +96,7 @@ struct MqttDeviceClient::ConnectState {
     int rc = MOSQ_ERR_SUCCESS;
     const char *label = "";
     MqttDeviceClient *owner = nullptr;
+    MqttSessionHandshake handshake;
 };
 
 namespace {
@@ -124,6 +126,35 @@ bool wait_for_mqtt_connack(mosquitto *client, MqttDeviceClient::ConnectState *st
     return false;
 }
 
+template <typename Predicate>
+bool wait_for_mqtt_condition(mosquitto *client,
+                             MqttDeviceClient::ConnectState *state,
+                             Predicate predicate,
+                             const char *phase,
+                             int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (state && state->handshake.failed()) {
+            std::fprintf(stderr, "[mqtt] handshake rejected phase=%s\n", phase);
+            return false;
+        }
+        if (predicate()) return true;
+
+        const int rc = mosquitto_loop(client, 200, 1);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            std::fprintf(stderr,
+                         "[mqtt] loop while waiting acknowledgement failed phase=%s rc=%d error=%s\n",
+                         phase,
+                         rc,
+                         mosquitto_strerror(rc));
+            return false;
+        }
+    }
+
+    std::fprintf(stderr, "[mqtt] acknowledgement timeout phase=%s timeout_ms=%d\n", phase, timeout_ms);
+    return false;
+}
+
 } // namespace
 
 MqttDeviceClient::MqttDeviceClient(std::string device_id,
@@ -147,91 +178,29 @@ MqttDeviceClient::~MqttDeviceClient() {
     stop(false);
 }
 
-bool MqttDeviceClient::run_online_probe() {
-    mosquitto_lib_init();
-    ConnectState connect_state;
-    connect_state.label = "probe";
-    mosquitto *client = mosquitto_new((device_id_ + "-probe").c_str(), true, &connect_state);
-    if (!client) {
-        std::fprintf(stderr, "[mqtt] create probe client failed\n");
-        mosquitto_lib_cleanup();
-        return false;
-    }
-
-    const std::string online = R"({"status":"online"})";
-    const std::string offline = R"({"status":"offline"})";
-    mosquitto_connect_callback_set(client, &MqttDeviceClient::mqtt_connect_callback);
-    bool ok = configure_mqtt_client(client,
-                                    device_id_,
-                                    device_secret_,
-                                    status_topic(),
-                                    offline,
-                                    tls_,
-                                    tls_insecure_,
-                                    ca_dir_,
-                                    "probe");
-
-    if (ok) {
-        std::fprintf(stdout,
-                     "[mqtt] probe connecting host=%s port=%d tls=%d tls_insecure=%d topic=%s\n",
-                     host_.c_str(),
-                     port_,
-                     tls_ ? 1 : 0,
-                     tls_insecure_ ? 1 : 0,
-                     status_topic().c_str());
-        int rc = mosquitto_connect(client, host_.c_str(), port_, 60);
-        if (rc != MOSQ_ERR_SUCCESS) {
-            std::fprintf(stderr,
-                         "[mqtt] probe connect call failed host=%s port=%d rc=%d error=%s\n",
-                         host_.c_str(),
-                         port_,
-                         rc,
-                         mosquitto_strerror(rc));
-            ok = false;
-        }
-    }
-
-    if (ok) {
-        ok = wait_for_mqtt_connack(client, &connect_state, 8000);
-    }
-    if (ok) {
-        int mid = 0;
-        int rc = mosquitto_publish(client,
-                                   &mid,
-                                   status_topic().c_str(),
-                                   static_cast<int>(online.size()),
-                                   online.data(),
-                                   1,
-                                   true);
-        if (rc != MOSQ_ERR_SUCCESS) {
-            std::fprintf(stderr,
-                         "[mqtt] probe publish online failed topic=%s rc=%d error=%s\n",
-                         status_topic().c_str(),
-                         rc,
-                         mosquitto_strerror(rc));
-            ok = false;
-        } else {
-            ok = flush_mqtt_loop(client, "probe_publish", 2000);
-        }
-    }
-
-    mosquitto_disconnect(client);
-    mosquitto_destroy(client);
-    mosquitto_lib_cleanup();
-    return ok;
-}
-
 void MqttDeviceClient::start() {
     if (mqtt_thread_.joinable()) return;
     stop_.store(false);
     publish_offline_.store(false);
+    set_online(false);
     mqtt_thread_ = std::thread(&MqttDeviceClient::mqtt_loop, this);
+}
+
+bool MqttDeviceClient::wait_until_online(std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(online_mtx_);
+    while (!online_) {
+        if (should_stop() || std::chrono::steady_clock::now() >= deadline) return false;
+        online_cv_.wait_for(lock, std::chrono::milliseconds(200));
+    }
+    return true;
 }
 
 void MqttDeviceClient::stop(bool publish_offline) {
     if (!mqtt_thread_.joinable()) return;
     publish_offline_.store(publish_offline);
     stop_.store(true);
+    online_cv_.notify_all();
     if (!publish_offline) {
         std::lock_guard<std::mutex> lock(mqtt_mtx_);
         if (mqtt_client_) {
@@ -254,8 +223,12 @@ bool MqttDeviceClient::publish_event(const std::string &payload) {
     return publish_payload(event_topic(), payload, 1, false);
 }
 
-bool MqttDeviceClient::publish_status(const std::string &payload) {
-    return publish_payload(status_topic(), payload, 1, true);
+bool MqttDeviceClient::publish_time_sync(const std::string &payload) {
+    return publish_payload(time_sync_topic(), payload, 1, true);
+}
+
+bool MqttDeviceClient::publish_capabilities(const std::string &payload) {
+    return publish_payload(capabilities_topic(), payload, 1, true);
 }
 
 bool MqttDeviceClient::publish_command_ack(const std::string &trace_id,
@@ -298,6 +271,24 @@ void MqttDeviceClient::mqtt_connect_callback(struct mosquitto *, void *userdata,
     }
 }
 
+void MqttDeviceClient::mqtt_subscribe_callback(struct mosquitto *,
+                                               void *userdata,
+                                               int message_id,
+                                               int granted_qos_count,
+                                               const int *granted_qos) {
+    auto *state = static_cast<ConnectState *>(userdata);
+    if (!state) return;
+
+    bool accepted = granted_qos_count > 0 && granted_qos != nullptr;
+    for (int i = 0; accepted && i < granted_qos_count; ++i) {
+        if (granted_qos[i] == 0x80) accepted = false;
+    }
+    state->handshake.acknowledge_subscription(message_id, accepted);
+    if (!accepted) {
+        std::fprintf(stderr, "[mqtt] subscription rejected message_id=%d\n", message_id);
+    }
+}
+
 void MqttDeviceClient::mqtt_message_callback(struct mosquitto *, void *userdata, const struct mosquitto_message *msg) {
     auto *state = static_cast<ConnectState *>(userdata);
     if (!state || !state->owner || !msg) return;
@@ -311,6 +302,7 @@ void MqttDeviceClient::mqtt_loop() {
     const std::string offline = R"({"status":"offline"})";
 
     while (!should_stop()) {
+        set_online(false);
         if (callbacks_.on_connecting) callbacks_.on_connecting();
 
         ConnectState connect_state;
@@ -330,6 +322,7 @@ void MqttDeviceClient::mqtt_loop() {
         }
 
         mosquitto_connect_callback_set(client, &MqttDeviceClient::mqtt_connect_callback);
+        mosquitto_subscribe_callback_set(client, &MqttDeviceClient::mqtt_subscribe_callback);
         mosquitto_message_callback_set(client, &MqttDeviceClient::mqtt_message_callback);
         mosquitto_publish_callback_set(client, &MqttDeviceClient::mqtt_publish_callback);
 
@@ -369,7 +362,8 @@ void MqttDeviceClient::mqtt_loop() {
             connected = ok;
         }
         if (ok) {
-            int sub_rc = mosquitto_subscribe(client, nullptr, command_topic().c_str(), 1);
+            int command_subscription_id = 0;
+            int sub_rc = mosquitto_subscribe(client, &command_subscription_id, command_topic().c_str(), 1);
             if (sub_rc != MOSQ_ERR_SUCCESS) {
                 std::fprintf(stderr,
                              "[mqtt] subscribe command failed topic=%s rc=%d error=%s\n",
@@ -378,10 +372,11 @@ void MqttDeviceClient::mqtt_loop() {
                              mosquitto_strerror(sub_rc));
                 ok = false;
             } else {
-                std::fprintf(stdout, "[mqtt] subscribed command topic=%s\n", command_topic().c_str());
+                connect_state.handshake.expect_subscription(command_subscription_id);
             }
             if (ok) {
-                sub_rc = mosquitto_subscribe(client, nullptr, signal_topic().c_str(), 1);
+                int signal_subscription_id = 0;
+                sub_rc = mosquitto_subscribe(client, &signal_subscription_id, signal_topic().c_str(), 1);
                 if (sub_rc != MOSQ_ERR_SUCCESS) {
                     std::fprintf(stderr,
                                  "[mqtt] subscribe signal failed topic=%s rc=%d error=%s\n",
@@ -390,16 +385,27 @@ void MqttDeviceClient::mqtt_loop() {
                                  mosquitto_strerror(sub_rc));
                     ok = false;
                 } else {
-                    std::fprintf(stdout, "[mqtt] subscribed signal topic=%s\n", signal_topic().c_str());
+                    connect_state.handshake.expect_subscription(signal_subscription_id);
                 }
             }
             if (ok) {
-                // 先让 broker 确认订阅，再发布 online，避免上线重发设置早于 command 订阅。
-                ok = flush_mqtt_loop(client, "session_subscribe", 1000);
+                ok = wait_for_mqtt_condition(
+                    client,
+                    &connect_state,
+                    [&connect_state] { return connect_state.handshake.subscriptions_ready(); },
+                    "session_subscribe",
+                    5000);
+                if (ok) {
+                    std::fprintf(stdout,
+                                 "[mqtt] subscriptions acknowledged command=%s signal=%s\n",
+                                 command_topic().c_str(),
+                                 signal_topic().c_str());
+                }
             }
             if (ok) {
+                int online_message_id = 0;
                 int rc = mosquitto_publish(client,
-                                           nullptr,
+                                           &online_message_id,
                                            status_topic().c_str(),
                                            static_cast<int>(online.size()),
                                            online.data(),
@@ -413,13 +419,20 @@ void MqttDeviceClient::mqtt_loop() {
                                  mosquitto_strerror(rc));
                     ok = false;
                 } else {
-                    ok = flush_mqtt_loop(client, "session_publish", 2000);
+                    connect_state.handshake.expect_online_publish(online_message_id);
+                    ok = wait_for_mqtt_condition(
+                        client,
+                        &connect_state,
+                        [&connect_state] { return connect_state.handshake.online_ready(); },
+                        "session_online_publish",
+                        5000);
                 }
             }
         }
 
         if (ok) {
             if (callbacks_.on_online) callbacks_.on_online();
+            set_online(true);
             while (!should_stop()) {
                 int rc = mosquitto_loop(client, 1000, 1);
                 if (rc == MOSQ_ERR_SUCCESS) {
@@ -427,6 +440,7 @@ void MqttDeviceClient::mqtt_loop() {
                 }
 
                 connected = false;
+                set_online(false);
                 std::fprintf(stderr,
                              "[mqtt] session lost rc=%d error=%s; will rebuild client\n",
                              rc,
@@ -462,6 +476,7 @@ void MqttDeviceClient::mqtt_loop() {
             }
         }
         mosquitto_destroy(client);
+        set_online(false);
 
         if (!should_stop()) {
             std::fprintf(stdout, "[mqtt] reconnect scheduled after session loss\n");
@@ -473,6 +488,7 @@ void MqttDeviceClient::mqtt_loop() {
         std::lock_guard<std::mutex> lock(mqtt_mtx_);
         mqtt_client_ = nullptr;
     }
+    set_online(false);
     mosquitto_lib_cleanup();
 }
 
@@ -531,6 +547,7 @@ bool MqttDeviceClient::publish_payload(const std::string &topic, const std::stri
 void MqttDeviceClient::mqtt_publish_callback(struct mosquitto *, void *userdata, int message_id) {
     auto *state = static_cast<ConnectState *>(userdata);
     if (!state || !state->owner) return;
+    if (state->handshake.acknowledge_publish(message_id)) return;
     {
         std::lock_guard<std::mutex> lock(state->owner->publish_mtx_);
 		if (state->owner->nonblocking_message_ids_.erase(message_id) > 0) {
@@ -555,6 +572,14 @@ bool MqttDeviceClient::should_stop() const {
     return false;
 }
 
+void MqttDeviceClient::set_online(bool online) {
+    {
+        std::lock_guard<std::mutex> lock(online_mtx_);
+        online_ = online;
+    }
+    online_cv_.notify_all();
+}
+
 std::string MqttDeviceClient::status_topic() const {
     return "doorbell/devices/" + device_id_ + "/status";
 }
@@ -577,4 +602,12 @@ std::string MqttDeviceClient::media_state_topic() const {
 
 std::string MqttDeviceClient::event_topic() const {
     return "doorbell/devices/" + device_id_ + "/event";
+}
+
+std::string MqttDeviceClient::time_sync_topic() const {
+    return "doorbell/devices/" + device_id_ + "/time_sync";
+}
+
+std::string MqttDeviceClient::capabilities_topic() const {
+    return "doorbell/devices/" + device_id_ + "/capabilities";
 }

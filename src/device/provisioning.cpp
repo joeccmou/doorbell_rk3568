@@ -54,6 +54,24 @@ std::string env_or(const char *name, const char *fallback) {
     return (value && value[0] != '\0') ? std::string(value) : std::string(fallback);
 }
 
+nlohmann::json settings_state_json(const DeviceSettingsSnapshot &snapshot) {
+    return {
+        {"settings", {
+            {"person_detection", snapshot.settings.person_detection},
+            {"person_sensitivity", snapshot.settings.person_sensitivity},
+            {"status_led", snapshot.settings.status_led},
+            {"image_rotate180", snapshot.settings.image_rotate180},
+            {"timezone", snapshot.settings.timezone},
+        }},
+        {"runtime", {{"time_sync", {
+            {"state", snapshot.runtime.time_sync.state},
+            {"last_success_at", snapshot.runtime.time_sync.last_success_at ? nlohmann::json(*snapshot.runtime.time_sync.last_success_at) : nlohmann::json(nullptr)},
+            {"last_offset_ms", snapshot.runtime.time_sync.last_offset_ms ? nlohmann::json(*snapshot.runtime.time_sync.last_offset_ms) : nlohmann::json(nullptr)},
+        }}}},
+        {"updated_at", snapshot.updated_at},
+    };
+}
+
 int env_int_or(const char *name, int fallback) {
     const char *value = std::getenv(name);
     if (!value || value[0] == '\0') return fallback;
@@ -427,7 +445,24 @@ bool DoorbellProvisioning::start() {
         return false;
     }
 
+    settings_store_ = std::make_unique<DeviceSettingsStore>(data_dir_ + "/settings.json");
+    std::string settings_error;
+    if (!settings_store_->initialize(&settings_error)) {
+        std::fprintf(stderr, "[settings] initialize failed: %s\n", settings_error.c_str());
+        return false;
+    }
+    status_led_enabled_.store(settings_store_->snapshot().settings.status_led);
+
     timezone_manager_ = std::make_unique<TimezoneManager>();
+    const auto initial_timezone = settings_store_->snapshot().settings.timezone;
+    const auto initial_timezone_result = timezone_manager_->apply(initial_timezone);
+    if (!initial_timezone_result.ok) {
+        std::fprintf(stderr,
+                     "[settings] apply startup timezone failed timezone=%s error=%s\n",
+                     initial_timezone.c_str(),
+                     initial_timezone_result.error_code.c_str());
+        return false;
+    }
     sntp_client_ = std::make_unique<SntpClient>();
     time_sync_service_ = std::make_unique<TimeSyncService>(
         std::vector<std::string>{"ntp.aliyun.com", "ntp1.aliyun.com", "ntp2.aliyun.com"},
@@ -437,7 +472,17 @@ bool DoorbellProvisioning::start() {
         &TimeSyncService::set_system_clock,
         &TimeSyncService::system_now_ms,
         [this](const DeviceTimeSyncStatus &status) {
-            publish_time_sync_status(status);
+            if (settings_store_) {
+                DeviceTimeSyncRuntime runtime;
+                runtime.state = status.state;
+                runtime.last_success_at = status.last_success_at;
+                runtime.last_offset_ms = status.last_offset_ms;
+                std::string error;
+                if (!settings_store_->update_time_sync(runtime, &error)) {
+                    std::fprintf(stderr, "[settings] persist time_sync failed: %s\n", error.c_str());
+                }
+            }
+            publish_time_sync(status);
         });
     time_sync_service_->start();
 
@@ -482,6 +527,7 @@ bool DoorbellProvisioning::start() {
     };
     mqtt_callbacks.on_online = [this]() {
         set_stage(Stage::Online);
+        publish_capabilities();
         if (time_sync_service_) time_sync_service_->notify_network_online();
     };
     mqtt_client_ = std::make_unique<MqttDeviceClient>(identity_.device_id,
@@ -525,61 +571,243 @@ void DoorbellProvisioning::stop() {
 
 void DoorbellProvisioning::handle_mqtt_command(const std::string &payload) {
     const auto command = parse_device_settings_command(payload);
-    if (!command.is_apply_settings) {
+    if (command.type == DeviceSettingsCommandType::None) {
         if (live_view_session_) live_view_session_->handle_command(payload);
         return;
     }
 
-    if (!command.valid || !timezone_manager_) {
+    if (!command.valid || !settings_store_ || !timezone_manager_ ||
+        (!command.device_id.empty() && command.device_id != identity_.device_id)) {
         if (mqtt_client_ && !command.trace_id.empty() && !command.cmd_id.empty()) {
             mqtt_client_->publish_command_ack(command.trace_id,
                                               command.cmd_id,
                                               false,
-                                              command.error_code.empty() ? "TIMEZONE_INVALID" : command.error_code);
+                                              command.error_code.empty() ? "INVALID_DEVICE_SETTINGS" : command.error_code);
         }
         return;
     }
 
-    const auto applied = timezone_manager_->apply(command.timezone);
-    if (!applied.ok) {
+    if (command.type == DeviceSettingsCommandType::Query) {
         if (mqtt_client_) {
-            mqtt_client_->publish_command_ack(command.trace_id,
-                                              command.cmd_id,
-                                              false,
-                                              applied.error_code);
+            mqtt_client_->publish_command_ack(
+                command.trace_id, command.cmd_id, true, "",
+                settings_state_json(settings_store_->snapshot()).dump());
         }
         return;
     }
 
-    nlohmann::json data;
-    data["timezone"] = applied.timezone;
-    if (time_sync_service_) {
-        const auto sync = time_sync_service_->status();
-        data["time_sync"] = {
-            {"state", sync.state},
-            {"last_success_at", sync.last_success_at ? nlohmann::json(*sync.last_success_at) : nlohmann::json(nullptr)},
-            {"last_offset_ms", sync.last_offset_ms ? nlohmann::json(*sync.last_offset_ms) : nlohmann::json(nullptr)},
-        };
+    nlohmann::json fields = nlohmann::json::object();
+    int succeeded = 0;
+    int failed = 0;
+    auto current = settings_store_->snapshot().settings;
+    auto mark_unchanged = [&](const char *name) {
+        fields[name] = {{"state", "unchanged"}};
+        ++succeeded;
+    };
+    auto fail_store = [&](const DeviceSettingsValues &rollback,
+                          const std::function<void()> &rollback_runtime) {
+        rollback_runtime();
+        std::string ignored;
+        settings_store_->replace_settings(rollback, &ignored);
+        if (mqtt_client_) {
+            mqtt_client_->publish_command_ack(
+                command.trace_id, command.cmd_id, false, "SETTINGS_STORE_FAILED");
+        }
+    };
+
+    if (command.patch.person_detection) {
+        if (current.person_detection == *command.patch.person_detection) {
+            mark_unchanged("person_detection");
+        } else {
+            const auto before = current;
+            auto next = current;
+            next.person_detection = *command.patch.person_detection;
+            if (!apply_person_settings(next.person_detection, next.person_sensitivity)) {
+                fields["person_detection"] = {{"state", "failed"}, {"error_code", "PERSON_DETECTION_APPLY_FAILED"}};
+                ++failed;
+            } else {
+                std::string error;
+                if (!settings_store_->replace_settings(next, &error)) {
+                    fail_store(before, [this, before] { apply_person_settings(before.person_detection, before.person_sensitivity); });
+                    return;
+                }
+                current = next;
+                fields["person_detection"] = {{"state", "applied"}};
+                ++succeeded;
+            }
+        }
     }
+    if (command.patch.person_sensitivity) {
+        const std::string value = *command.patch.person_sensitivity;
+        if (value != "low" && value != "medium" && value != "high") {
+            fields["person_sensitivity"] = {{"state", "failed"}, {"error_code", "INVALID_DEVICE_SETTINGS"}};
+            ++failed;
+        } else if (current.person_sensitivity == value) {
+            mark_unchanged("person_sensitivity");
+        } else {
+            const auto before = current;
+            auto next = current;
+            next.person_sensitivity = value;
+            if (!apply_person_settings(next.person_detection, next.person_sensitivity)) {
+                fields["person_sensitivity"] = {{"state", "failed"}, {"error_code", "PERSON_SENSITIVITY_APPLY_FAILED"}};
+                ++failed;
+            } else {
+                std::string error;
+                if (!settings_store_->replace_settings(next, &error)) {
+                    fail_store(before, [this, before] { apply_person_settings(before.person_detection, before.person_sensitivity); });
+                    return;
+                }
+                current = next;
+                fields["person_sensitivity"] = {{"state", "applied"}};
+                ++succeeded;
+            }
+        }
+    }
+    if (command.patch.status_led) {
+        if (current.status_led == *command.patch.status_led) {
+            mark_unchanged("status_led");
+        } else {
+            const auto before = current;
+            auto next = current;
+            next.status_led = *command.patch.status_led;
+            status_led_enabled_.store(next.status_led);
+            if (!next.status_led) set_led(false);
+            std::string error;
+            if (!settings_store_->replace_settings(next, &error)) {
+                fail_store(before, [this, before] { status_led_enabled_.store(before.status_led); });
+                return;
+            }
+            current = next;
+            fields["status_led"] = {{"state", "applied"}};
+            ++succeeded;
+        }
+    }
+    if (command.patch.image_rotate180) {
+        if (current.image_rotate180 == *command.patch.image_rotate180) {
+            mark_unchanged("image_rotate180");
+        } else {
+            const auto before = current;
+            auto next = current;
+            next.image_rotate180 = *command.patch.image_rotate180;
+            if (!apply_image_rotate180(next.image_rotate180)) {
+                fields["image_rotate180"] = {{"state", "failed"}, {"error_code", "ROTATE_APPLY_FAILED"}};
+                ++failed;
+            } else {
+                std::string error;
+                if (!settings_store_->replace_settings(next, &error)) {
+                    fail_store(before, [this, before] { apply_image_rotate180(before.image_rotate180); });
+                    return;
+                }
+                current = next;
+                fields["image_rotate180"] = {{"state", "applied"}};
+                ++succeeded;
+            }
+        }
+    }
+    if (command.patch.timezone) {
+        if (current.timezone == *command.patch.timezone) {
+            mark_unchanged("timezone");
+        } else {
+            const auto before = current;
+            auto next = current;
+            next.timezone = *command.patch.timezone;
+            const auto applied = timezone_manager_->apply(next.timezone);
+            if (!applied.ok) {
+                fields["timezone"] = {{"state", "failed"}, {"error_code", applied.error_code}};
+                ++failed;
+            } else {
+                std::string error;
+                if (!settings_store_->replace_settings(next, &error)) {
+                    fail_store(before, [this, before] { timezone_manager_->apply(before.timezone); });
+                    return;
+                }
+                current = next;
+                fields["timezone"] = {{"state", "applied"}};
+                ++succeeded;
+            }
+        }
+    }
+
+    auto data = settings_state_json(settings_store_->snapshot());
+    const std::string state = failed == 0 ? "applied" : (succeeded == 0 ? "failed" : "partial_success");
+    data["apply_result"] = {{"state", state}, {"fields", fields}};
     if (mqtt_client_) {
         mqtt_client_->publish_command_ack(command.trace_id, command.cmd_id, true, "", data.dump());
     }
 }
 
-void DoorbellProvisioning::publish_time_sync_status(const DeviceTimeSyncStatus &status) {
+void DoorbellProvisioning::set_settings_apply_handlers(PersonSettingsHandler person_handler,
+                                                       ImageRotateHandler image_rotate_handler) {
+    {
+        std::lock_guard<std::mutex> lock(settings_handler_mtx_);
+        person_settings_handler_ = std::move(person_handler);
+        image_rotate_handler_ = std::move(image_rotate_handler);
+    }
+    if (!settings_store_) return;
+    const auto settings = settings_store_->snapshot().settings;
+    if (!apply_person_settings(settings.person_detection, settings.person_sensitivity)) {
+        std::fprintf(stderr, "[settings] apply startup person settings failed\n");
+    }
+    if (settings.image_rotate180 && !apply_image_rotate180(true)) {
+        std::fprintf(stderr, "[settings] apply startup image rotation failed\n");
+    }
+}
+
+DeviceSettingsValues DoorbellProvisioning::current_settings() const {
+    return settings_store_ ? settings_store_->snapshot().settings : DeviceSettingsValues{};
+}
+
+bool DoorbellProvisioning::apply_person_settings(bool enabled, const std::string &sensitivity) {
+    PersonSettingsHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(settings_handler_mtx_);
+        handler = person_settings_handler_;
+    }
+    return !handler || handler(enabled, sensitivity);
+}
+
+bool DoorbellProvisioning::apply_image_rotate180(bool enabled) {
+    ImageRotateHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(settings_handler_mtx_);
+        handler = image_rotate_handler_;
+    }
+    return handler && handler(enabled);
+}
+
+void DoorbellProvisioning::publish_capabilities() {
+    if (!mqtt_client_) return;
+    nlohmann::json payload = {
+        {"trace_id", "tr_capabilities_" + std::to_string(TimeSyncService::system_now_ms())},
+        {"device_id", identity_.device_id},
+        {"firmware_version", identity_.firmware_version},
+        {"capabilities", {
+            {"video_qualities", {"360p", "720p", "1080p", "1440p"}},
+            {"max_fps", 24},
+            {"audio", {{"codec", "opus"}, {"sample_rate", 48000}}},
+            {"person_detection", true},
+            {"image_rotate180", true},
+        }},
+        {"ts", iso_utc_now()},
+    };
+    if (!mqtt_client_->publish_capabilities(payload.dump())) {
+        std::fprintf(stderr, "[settings] publish capabilities failed\n");
+    }
+}
+
+void DoorbellProvisioning::publish_time_sync(const DeviceTimeSyncStatus &status) {
     if (!mqtt_client_) return;
     nlohmann::json payload;
     payload["trace_id"] = "tr_time_sync_" + std::to_string(TimeSyncService::system_now_ms());
     payload["device_id"] = identity_.device_id;
-    payload["status"] = "online";
     payload["time_sync"] = {
         {"state", status.state},
         {"last_success_at", status.last_success_at ? nlohmann::json(*status.last_success_at) : nlohmann::json(nullptr)},
         {"last_offset_ms", status.last_offset_ms ? nlohmann::json(*status.last_offset_ms) : nlohmann::json(nullptr)},
     };
     payload["ts"] = iso_utc_now();
-    if (!mqtt_client_->publish_status(payload.dump())) {
-        std::fprintf(stderr, "[time_sync] publish status failed state=%s\n", status.state.c_str());
+    if (!mqtt_client_->publish_time_sync(payload.dump())) {
+        std::fprintf(stderr, "[time_sync] publish failed state=%s\n", status.state.c_str());
     }
 }
 
@@ -589,6 +817,7 @@ bool DoorbellProvisioning::load_identity() {
         identity_.device_id = j.value("device_id", "");
         identity_.device_secret = j.value("device_secret", "");
         identity_.model = j.value("model", "");
+        identity_.firmware_version = j.value("firmware_version", env_or("DOORBELL_FIRMWARE_VERSION", "1.0.0"));
         identity_.ap_ssid = j.value("ap_ssid", "");
         identity_.ap_pass = j.value("ap_pass", "");
     } catch (const std::exception &e) {
@@ -923,7 +1152,7 @@ void DoorbellProvisioning::begin_provisioning(const WifiCredentials &wifi) {
 
 void DoorbellProvisioning::provisioning_worker(WifiCredentials wifi) {
     if (live_view_session_) live_view_session_->stop();
-    if (mqtt_client_) mqtt_client_->stop(false);
+    if (mqtt_client_) mqtt_client_->stop(true);
     set_stage(Stage::ConnectingWifi);
     if (!connect_sta(wifi)) {
         set_stage(Stage::WifiFailed, "WIFI_TIMEOUT");
@@ -933,14 +1162,18 @@ void DoorbellProvisioning::provisioning_worker(WifiCredentials wifi) {
 
     save_wifi(wifi);
     set_stage(Stage::ConnectingCloud);
-    if (!mqtt_client_ || !mqtt_client_->run_online_probe()) {
+    if (!mqtt_client_) {
         set_stage(Stage::CloudFailed, "CLOUD_CONNECT_FAILED");
         start_access_point();
         return;
     }
 
-    set_stage(Stage::Online);
-    if (mqtt_client_) mqtt_client_->start();
+    mqtt_client_->start();
+    if (!mqtt_client_->wait_until_online(std::chrono::seconds(20))) {
+        mqtt_client_->stop(false);
+        set_stage(Stage::CloudFailed, "CLOUD_CONNECT_FAILED");
+        start_access_point();
+    }
 }
 
 void DoorbellProvisioning::set_live_frame_provider(LiveWebRtcSession::FrameProvider provider) {
@@ -969,6 +1202,11 @@ void DoorbellProvisioning::stop_led() {
 
 void DoorbellProvisioning::led_loop() {
     while (!stop_.load()) {
+        if (!status_led_enabled_.load()) {
+            set_led(false);
+            wait_for_stop_or(std::chrono::milliseconds(200));
+            continue;
+        }
         Stage s = stage();
         if (s == Stage::Online) {
             set_led(true);

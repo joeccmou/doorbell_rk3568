@@ -28,6 +28,7 @@
 
 #include "camera.h"
 #include "device/provisioning.h"
+#include "device/person_detection_settings.h"
 #include "events/device_event_processor.h"
 #include "events/event_paths.h"
 #include "events/person_event_gate.h"
@@ -88,6 +89,8 @@ struct UiContext {
     lv_display_t *disp = nullptr;
     YoloPersonDetector detector;
     bool detector_ready = false;
+    std::atomic<bool> person_detection_enabled{true};
+    std::atomic<float> person_confidence_threshold{0.5F};
     uint64_t last_detect_ms = 0;
     uint64_t last_person_ts_ns = 0;
     uint64_t latest_boxes_ts_ns = 0;
@@ -164,7 +167,14 @@ void inference_worker(UiContext *ctx) {
 
         std::vector<YoloPersonDetector::PersonBox> boxes;
         uint64_t infer_start_ns = monotonic_time_ns();
-        bool has_person = ctx->detector.detect_person(frame.rgb.data(), frame.width, frame.height, boxes);
+        ctx->detector.detect_person(frame.rgb.data(), frame.width, frame.height, boxes);
+        const float threshold = ctx->person_confidence_threshold.load();
+        boxes.erase(
+            std::remove_if(boxes.begin(), boxes.end(), [threshold](const auto &box) {
+                return !person_score_exceeds_threshold(box.score, threshold);
+            }),
+            boxes.end());
+        const bool has_person = ctx->person_detection_enabled.load() && !boxes.empty();
         uint64_t infer_end_ns = monotonic_time_ns();
         double infer_ms = static_cast<double>(infer_end_ns - infer_start_ns) / 1000000.0;
         perf_log("infer ts_ns=%llu seq=%llu latency_ms=%.3f has_person=%d boxes=%zu\n",
@@ -595,7 +605,8 @@ void camera_timer_cb(lv_timer_t *timer) {
 
     copy_begin_ns = monotonic_time_ns();
     uint32_t now = lv_tick_get();
-    if (ctx->detector_ready && now - ctx->last_detect_ms >= kDetectIntervalMs) {
+    if (ctx->detector_ready && ctx->person_detection_enabled.load() &&
+        now - ctx->last_detect_ms >= kDetectIntervalMs) {
         ctx->last_detect_ms = now;
         {
             std::lock_guard<std::mutex> lock(ctx->infer_mtx);
@@ -738,9 +749,11 @@ bool restart_camera(void *user_ctx, uint32_t pixfmt, uint32_t w, uint32_t h) {
 
     std::lock_guard<std::mutex> camera_lock(ctx->camera_mtx);
     Camera *old = ctx->camera;
+    const bool rotate180 = old && old->rotate180();
     if (old) old->stop();
 
     Camera *cam = new Camera(new_cfg);
+    cam->set_rotate180(rotate180);
     if (!cam->start()) {
         std::fprintf(stderr, "[restart] camera start failed fmt=%c%c%c%c %ux%u\n",
                      pixfmt & 0xFF, (pixfmt >> 8) & 0xFF, (pixfmt >> 16) & 0xFF, (pixfmt >> 24) & 0xFF,
@@ -854,6 +867,7 @@ int main(int argc, char **argv) {
     // }
     std::memset(&ctx.image_dsc, 0, sizeof(ctx.image_dsc));
     ctx.camera = new Camera(ctx.cfg);
+    ctx.camera->set_rotate180(provisioning.current_settings().image_rotate180);
     if (!ctx.camera->start()) {
         std::fprintf(stderr, "Camera start failed on %s\n", cfg.device.c_str());
         return EXIT_FAILURE;
@@ -883,6 +897,23 @@ int main(int argc, char **argv) {
         return true;
     });
     std::fprintf(stdout, "[main] camera started\n");
+
+    provisioning.set_settings_apply_handlers(
+        [&ctx](bool enabled, const std::string &sensitivity) {
+            ctx.person_confidence_threshold.store(person_sensitivity_threshold(sensitivity));
+            ctx.person_detection_enabled.store(enabled);
+            if (!enabled) {
+                std::lock_guard<std::mutex> lock(ctx.detect_mtx);
+                ctx.latest_boxes.clear();
+                ctx.latest_boxes_ts_ns = 0;
+                ctx.last_person_ts_ns = 0;
+            }
+            return true;
+        },
+        [&ctx](bool enabled) {
+            std::lock_guard<std::mutex> lock(ctx.camera_mtx);
+            return ctx.camera && ctx.camera->set_rotate180(enabled);
+        });
 
     // Wait briefly for first frame; fallback to blank buffer
     for (int i = 0; i < 50 && !ctx.camera->ready(); ++i) {

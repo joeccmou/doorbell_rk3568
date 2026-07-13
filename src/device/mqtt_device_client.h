@@ -38,14 +38,15 @@ public:
     MqttDeviceClient(const MqttDeviceClient &) = delete;
     MqttDeviceClient &operator=(const MqttDeviceClient &) = delete;
 
-    bool run_online_probe();
     void start();
+    bool wait_until_online(std::chrono::milliseconds timeout);
     void stop(bool publish_offline);
 
     bool publish_signal(const std::string &payload);
     bool publish_media_state(const std::string &payload);
     bool publish_event(const std::string &payload);
-    bool publish_status(const std::string &payload);
+    bool publish_time_sync(const std::string &payload);
+    bool publish_capabilities(const std::string &payload);
     bool publish_command_ack(const std::string &trace_id,
                              const std::string &cmd_id,
                              bool ok,
@@ -54,6 +55,11 @@ public:
 
 private:
     static void mqtt_connect_callback(struct mosquitto *client, void *userdata, int rc);
+    static void mqtt_subscribe_callback(struct mosquitto *client,
+                                        void *userdata,
+                                        int message_id,
+                                        int granted_qos_count,
+                                        const int *granted_qos);
     static void mqtt_message_callback(struct mosquitto *client, void *userdata, const struct mosquitto_message *msg);
     static void mqtt_publish_callback(struct mosquitto *client, void *userdata, int message_id);
 
@@ -62,6 +68,7 @@ private:
     bool publish_payload(const std::string &topic, const std::string &payload, int qos, bool retained);
     bool wait_for_stop_or(std::chrono::milliseconds duration) const;
     bool should_stop() const;
+    void set_online(bool online);
 
     std::string status_topic() const;
     std::string command_topic() const;
@@ -69,6 +76,8 @@ private:
     std::string signal_topic() const;
     std::string media_state_topic() const;
     std::string event_topic() const;
+    std::string time_sync_topic() const;
+    std::string capabilities_topic() const;
 
     std::string device_id_;
     std::string device_secret_;
@@ -81,6 +90,9 @@ private:
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> publish_offline_{false};
+    std::mutex online_mtx_;
+    std::condition_variable online_cv_;
+    bool online_ = false;
     std::mutex mqtt_mtx_;
     mosquitto *mqtt_client_ = nullptr;
     std::thread mqtt_thread_;

@@ -43,12 +43,6 @@ size_t packed_raw_size(uint32_t pixfmt, uint32_t width, uint32_t height) {
 	}
 }
 
-int clamp8(int v) {
-	if (v < 0) return 0;
-	if (v > 255) return 255;
-	return v;
-}
-
 bool rga_enabled() {
 	static int enabled = [] {
 		const char *env = std::getenv("DOORBELL_RGA");
@@ -76,101 +70,91 @@ const char *select_dma_heap_path() {
 	return chosen;
 }
 
-bool try_rga_convert(Camera::PixelMode mode,
+constexpr int kRgaUnavailable = -10000;
+constexpr int kRgaInvalidBuffer = -10001;
+
+const char *pixel_mode_name(Camera::PixelMode mode) {
+	switch (mode) {
+		case Camera::PixelMode::UYVY: return "UYVY";
+		case Camera::PixelMode::NV12: return "NV12";
+		case Camera::PixelMode::NV21: return "NV21";
+	}
+	return "UNKNOWN";
+}
+
+const char *rga_error_text(int status) {
+	if (status == kRgaUnavailable) return "RGA disabled or unavailable";
+	if (status == kRgaInvalidBuffer) return "invalid DMA-BUF or stride";
+#if defined(DOORBELL_DISABLE_RGA)
+	(void)status;
+	return "RGA unavailable in this build";
+#else
+	return imStrError(static_cast<IM_STATUS>(status));
+#endif
+}
+
+void log_rga_failure(CameraRgaState &state,
+			     const char *operation,
+			     Camera::PixelMode mode,
+			     int status,
+			     uint32_t width,
+			     uint32_t height,
+			     uint32_t src_stride,
+			     uint32_t src_hstride,
+			     int src_fd,
+			     int dst_fd,
+			     int usage) {
+	if (!state.record_failure()) return;
+	const uint32_t failures = state.consecutive_failures();
+	const char *error = rga_error_text(status);
+	if (!error) error = "unknown RGA error";
+	std::fprintf(stderr,
+		"[rga] operation=%s failed count=%u status=%d error=%s src=%s %ux%u stride=%u hstride=%u src_fd=%d dst_fd=%d usage=0x%x\n",
+		operation,
+		failures,
+		status,
+		error,
+		pixel_mode_name(mode),
+		width,
+		height,
+		src_stride,
+		src_hstride,
+		src_fd,
+		dst_fd,
+		usage);
+	perf_logger_log(
+		"rga_failure operation=%s count=%u status=%d error=%s src=%s width=%u height=%u stride=%u hstride=%u src_fd=%d dst_fd=%d usage=0x%x\n",
+		operation,
+		failures,
+		status,
+		error,
+		pixel_mode_name(mode),
+		width,
+		height,
+		src_stride,
+		src_hstride,
+		src_fd,
+		dst_fd,
+		usage);
+}
+
+bool rga_convert_to_rgb(Camera::PixelMode mode,
 			uint32_t width,
 			uint32_t height,
 			uint32_t src_stride_bytes,
 			uint32_t src_hstride,
 			int src_fd,
-			const uint8_t *src_va,
-			uint8_t *dst_va) {
+			int dst_fd,
+			CameraRgaState &state) {
 #if defined(DOORBELL_DISABLE_RGA)
-	(void)mode;
-	(void)width;
-	(void)height;
-	(void)src_stride_bytes;
-	(void)src_hstride;
-	(void)src_fd;
-	(void)src_va;
-	(void)dst_va;
+	log_rga_failure(state, "nv12_to_rgb", mode, kRgaUnavailable, width, height,
+			 src_stride_bytes, src_hstride, src_fd, dst_fd, 0);
 	return false;
 #else
-	static bool rga_suppressed = false;
-	if (!rga_enabled() || !dst_va || rga_suppressed) 
-	{
-		std::fprintf(stdout, "[rga] RGA disabled or not usable, fallback to CPU, rga_enabled()=%d, dst_va=%p, rga_suppressed=%d\n",
-			rga_enabled(), dst_va, rga_suppressed);
-		return false;
-	}
-
-	int rga_fmt = 0;
-	uint32_t src_wstride_px = 0;
-	switch (mode) {
-		case Camera::PixelMode::UYVY:
-			rga_fmt = RK_FORMAT_UYVY_422;
-			src_wstride_px = src_stride_bytes / 2;
-			break;
-		case Camera::PixelMode::NV12:
-			rga_fmt = RK_FORMAT_YCbCr_420_SP;
-			src_wstride_px = src_stride_bytes;
-			break;
-		case Camera::PixelMode::NV21:
-			rga_fmt = RK_FORMAT_YCrCb_420_SP;
-			src_wstride_px = src_stride_bytes;
-			break;
-		default:
-			return false;
-	}
-
-	if (!src_wstride_px || !src_hstride) return false;
-
-	rga_buffer_t src_buf;
-	if (src_fd >= 0) {
-		src_buf = wrapbuffer_fd(src_fd, width, height, rga_fmt,
-				 static_cast<int>(src_wstride_px), static_cast<int>(src_hstride));
-	} else {
-		src_buf = wrapbuffer_virtualaddr(const_cast<uint8_t *>(src_va), width, height, rga_fmt,
-				 static_cast<int>(src_wstride_px), static_cast<int>(src_hstride));
-	}
-	rga_buffer_t dst_buf = wrapbuffer_virtualaddr(dst_va, width, height, RK_FORMAT_RGB_888,
-				static_cast<int>(width), static_cast<int>(height));
-
-	IM_STATUS st = imcvtcolor(src_buf, dst_buf, rga_fmt, RK_FORMAT_RGB_888, IM_YUV_TO_RGB_BT709_LIMIT, 1, nullptr);
-	static bool logged = false;
-	if (st != IM_STATUS_SUCCESS) {
-		if (!logged) {
-			std::fprintf(stderr, "[rga] imcvtcolor failed status=%d (fmt=%d), fallback to CPU\n", st, rga_fmt);
-			logged = true;
-		}
-		rga_suppressed = true;
-		return false;
-	}
-	return true;
-#endif
-}
-
-bool try_rga_convert_to_nv12(Camera::PixelMode mode,
-				 uint32_t width,
-				 uint32_t height,
-				 uint32_t src_stride_bytes,
-				 uint32_t src_hstride,
-				 int src_fd,
-				 const uint8_t *src_va,
-				 int dst_fd,
-				 uint8_t *dst_va) {
-#if defined(DOORBELL_DISABLE_RGA)
-	(void)mode;
-	(void)width;
-	(void)height;
-	(void)src_stride_bytes;
-	(void)src_hstride;
-	(void)src_fd;
-	(void)src_va;
-	(void)dst_fd;
-	(void)dst_va;
-	return false;
-#else
-	if (!rga_enabled() || (dst_fd < 0 && !dst_va)) {
+	if (!rga_enabled() || src_fd < 0 || dst_fd < 0 || !src_stride_bytes || !src_hstride) {
+		log_rga_failure(state, "nv12_to_rgb", mode,
+				 !rga_enabled() ? kRgaUnavailable : kRgaInvalidBuffer,
+				 width, height, src_stride_bytes, src_hstride, src_fd, dst_fd, 0);
 		return false;
 	}
 
@@ -189,43 +173,75 @@ bool try_rga_convert_to_nv12(Camera::PixelMode mode,
 			src_fmt = RK_FORMAT_YCrCb_420_SP;
 			src_wstride_px = src_stride_bytes;
 			break;
-		default:
-			return false;
-	}
-	if (!src_wstride_px || !src_hstride) return false;
-
-	rga_buffer_t src_buf;
-	if (src_fd >= 0) {
-		src_buf = wrapbuffer_fd(src_fd, width, height, src_fmt,
-				 static_cast<int>(src_wstride_px), static_cast<int>(src_hstride));
-	} else {
-		src_buf = wrapbuffer_virtualaddr(const_cast<uint8_t *>(src_va), width, height, src_fmt,
-				 static_cast<int>(src_wstride_px), static_cast<int>(src_hstride));
 	}
 
-	rga_buffer_t dst_buf;
-	if (dst_fd >= 0) {
-		dst_buf = wrapbuffer_fd(dst_fd, width, height, RK_FORMAT_YCbCr_420_SP,
-				 static_cast<int>(width), static_cast<int>(height));
-	} else {
-		dst_buf = wrapbuffer_virtualaddr(dst_va, width, height, RK_FORMAT_YCbCr_420_SP,
-				 static_cast<int>(width), static_cast<int>(height));
+	rga_buffer_t src_buf = wrapbuffer_fd(src_fd, width, height, src_fmt,
+					 static_cast<int>(src_wstride_px), static_cast<int>(src_hstride));
+	rga_buffer_t dst_buf = wrapbuffer_fd(dst_fd, width, height, RK_FORMAT_RGB_888,
+					 static_cast<int>(width), static_cast<int>(height));
+	IM_STATUS status = imcvtcolor(src_buf, dst_buf, src_fmt, RK_FORMAT_RGB_888,
+				       IM_YUV_TO_RGB_BT709_LIMIT, 1, nullptr);
+	if (status != IM_STATUS_SUCCESS) {
+		log_rga_failure(state, "nv12_to_rgb", mode, static_cast<int>(status), width, height,
+				 src_stride_bytes, src_hstride, src_fd, dst_fd, 0);
+		return false;
+	}
+	return true;
+#endif
+}
+
+bool rga_transform_to_nv12(Camera::PixelMode mode,
+			   uint32_t width,
+			   uint32_t height,
+			   uint32_t src_stride_bytes,
+			   uint32_t src_hstride,
+			   int src_fd,
+			   int dst_fd,
+			   bool rotate180,
+			   CameraRgaState &state) {
+#if defined(DOORBELL_DISABLE_RGA)
+	const int usage = rotate180 ? 2 : 0;
+	log_rga_failure(state, "capture_to_nv12", mode, kRgaUnavailable, width, height,
+			 src_stride_bytes, src_hstride, src_fd, dst_fd, usage);
+	return false;
+#else
+	const int usage = rotate180 ? IM_HAL_TRANSFORM_ROT_180 : 0;
+	if (!rga_enabled() || src_fd < 0 || dst_fd < 0 || !src_stride_bytes || !src_hstride) {
+		log_rga_failure(state, "capture_to_nv12", mode,
+				 !rga_enabled() ? kRgaUnavailable : kRgaInvalidBuffer,
+				 width, height, src_stride_bytes, src_hstride, src_fd, dst_fd, usage);
+		return false;
 	}
 
+	int src_fmt = 0;
+	uint32_t src_wstride_px = 0;
+	switch (mode) {
+		case Camera::PixelMode::UYVY:
+			src_fmt = RK_FORMAT_UYVY_422;
+			src_wstride_px = src_stride_bytes / 2;
+			break;
+		case Camera::PixelMode::NV12:
+			src_fmt = RK_FORMAT_YCbCr_420_SP;
+			src_wstride_px = src_stride_bytes;
+			break;
+		case Camera::PixelMode::NV21:
+			src_fmt = RK_FORMAT_YCrCb_420_SP;
+			src_wstride_px = src_stride_bytes;
+			break;
+	}
+
+	rga_buffer_t src_buf = wrapbuffer_fd(src_fd, width, height, src_fmt,
+					 static_cast<int>(src_wstride_px), static_cast<int>(src_hstride));
+	rga_buffer_t dst_buf = wrapbuffer_fd(dst_fd, width, height, RK_FORMAT_YCbCr_420_SP,
+					 static_cast<int>(width), static_cast<int>(height));
 	im_rect srect = {0, 0, static_cast<int>(width), static_cast<int>(height)};
 	im_rect drect = {0, 0, static_cast<int>(width), static_cast<int>(height)};
-	im_rect prect;
-	memset(&prect, 0, sizeof(prect));
-	rga_buffer_t pat;
-	memset(&pat, 0, sizeof(pat));
-
-	IM_STATUS st = improcess(src_buf, dst_buf, pat, srect, drect, prect, 0);
-	if (st != IM_STATUS_SUCCESS) {
-		static bool logged = false;
-		if (!logged) {
-			std::fprintf(stderr, "[rga] improcess to NV12 failed status=%d, fallback to CPU\n", st);
-			logged = true;
-		}
+	im_rect prect{};
+	rga_buffer_t pat{};
+	IM_STATUS status = improcess(src_buf, dst_buf, pat, srect, drect, prect, usage);
+	if (status != IM_STATUS_SUCCESS) {
+		log_rga_failure(state, "capture_to_nv12", mode, static_cast<int>(status), width, height,
+				 src_stride_bytes, src_hstride, src_fd, dst_fd, usage);
 		return false;
 	}
 	return true;
@@ -236,8 +252,6 @@ bool try_rga_convert_to_nv12(Camera::PixelMode mode,
 Camera::Camera(const Config &cfg) : cfg_(cfg) {
 	rgb_size_ = static_cast<size_t>(cfg_.width) * static_cast<size_t>(cfg_.height) * 3;
 	media_size_ = packed_raw_size(V4L2_PIX_FMT_NV12, cfg_.width, cfg_.height);
-	rgb_[0].resize(rgb_size_);
-	rgb_[1].resize(rgb_size_);
 }
 
 Camera::~Camera() {
@@ -249,8 +263,9 @@ bool Camera::start() {
 
 	if (!open_device()) return false;
 	if (!set_format()) return false;
-	if (!alloc_media_buffers()) return false;
+	if (!alloc_output_buffers()) return false;
 	if (!request_buffers()) return false;
+	if (!verify_rga_pipeline()) return false;
 	if (!start_stream()) return false;
 
 	std::fprintf(stdout, "[camera] started fmt=%c%c%c%c media=%c%c%c%c planes=%u %ux%u\n",
@@ -289,10 +304,19 @@ bool Camera::ready() const {
 	return latest_.load(std::memory_order_acquire) >= 0;
 }
 
+bool Camera::set_rotate180(bool enabled) {
+	rga_state_.set_rotate180(enabled);
+	return true;
+}
+
+bool Camera::rotate180() const {
+	return rga_state_.rotate180();
+}
+
 const uint8_t *Camera::frame_data() const {
 	int idx = latest_.load(std::memory_order_acquire);
-	if (idx < 0) return nullptr;
-	return rgb_[idx].data();
+	if (idx < 0 || !rgb_[idx].start) return nullptr;
+	return static_cast<const uint8_t *>(rgb_[idx].start);
 }
 
 bool Camera::copy_latest_frame(std::vector<uint8_t> &out_rgb, uint64_t &seq, uint64_t &ts_ns) const {
@@ -302,9 +326,9 @@ bool Camera::copy_latest_frame(std::vector<uint8_t> &out_rgb, uint64_t &seq, uin
 
 	for (int attempt = 0; attempt < 3; ++attempt) {
 		int idx = latest_.load(std::memory_order_acquire);
-		if (idx < 0) return false;
+		if (idx < 0 || !rgb_[idx].start) return false;
 
-		::memcpy(out_rgb.data(), rgb_[idx].data(), rgb_size_);
+		::memcpy(out_rgb.data(), rgb_[idx].start, rgb_size_);
 
 		int idx_after = latest_.load(std::memory_order_acquire);
 		if (idx == idx_after) {
@@ -328,10 +352,10 @@ bool Camera::copy_latest_frames(std::vector<uint8_t> &out_rgb,
 								uint32_t &pixfmt) const {
 	for (int attempt = 0; attempt < 3; ++attempt) {
 		int idx = latest_.load(std::memory_order_acquire);
-		if (idx < 0 || !media_[idx].start) return false;
+		if (idx < 0 || !media_[idx].start || !rgb_[idx].start) return false;
 
 		if (out_rgb.size() != rgb_size_) out_rgb.resize(rgb_size_);
-		::memcpy(out_rgb.data(), rgb_[idx].data(), rgb_size_);
+		::memcpy(out_rgb.data(), rgb_[idx].start, rgb_size_);
 
 		if (out_raw.size() != media_size_) out_raw.resize(media_size_);
 		::memcpy(out_raw.data(), media_[idx].start, media_size_);
@@ -427,12 +451,12 @@ int Camera::alloc_dma_buf(size_t length) {
 	return static_cast<int>(data.fd);
 }
 
-bool Camera::alloc_media_buffers() {
-	if (media_size_ == 0) {
+bool Camera::alloc_output_buffers() {
+	if (media_size_ == 0 || rgb_size_ == 0) {
 		return false;
 	}
 
-	for (auto &buffer : media_) {
+	auto release_buffer = [](MediaBuffer &buffer) {
 		if (buffer.start && buffer.length) {
 			munmap(buffer.start, buffer.length);
 			buffer.start = nullptr;
@@ -442,24 +466,66 @@ bool Camera::alloc_media_buffers() {
 			buffer.fd = -1;
 		}
 		buffer.length = 0;
-		buffer.stride_y = cfg_.width;
-		buffer.stride_uv = cfg_.width;
+	};
 
-		buffer.fd = alloc_dma_buf(media_size_);
-		if (buffer.fd < 0) {
-			return false;
-		}
-		buffer.length = media_size_;
+	auto allocate_buffer = [this, &release_buffer](MediaBuffer &buffer,
+							  size_t length,
+							  const char *name) {
+		release_buffer(buffer);
+		buffer.fd = alloc_dma_buf(length);
+		if (buffer.fd < 0) return false;
+		buffer.length = length;
 		buffer.start = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED, buffer.fd, 0);
 		if (buffer.start == MAP_FAILED) {
-			std::perror("mmap media dma-buf failed");
+			std::fprintf(stderr, "mmap %s dma-buf failed: %s\n", name, strerror(errno));
 			close(buffer.fd);
 			buffer.fd = -1;
 			buffer.start = nullptr;
+			buffer.length = 0;
 			return false;
 		}
 		memset(buffer.start, 0, buffer.length);
+		return true;
+	};
+
+	for (auto &buffer : media_) {
+		if (!allocate_buffer(buffer, media_size_, "media")) return false;
+		buffer.stride_y = cfg_.width;
+		buffer.stride_uv = cfg_.width;
 	}
+	for (auto &buffer : rgb_) {
+		if (!allocate_buffer(buffer, rgb_size_, "rgb")) return false;
+		buffer.stride_y = cfg_.width * 3;
+		buffer.stride_uv = 0;
+	}
+	return true;
+}
+
+bool Camera::verify_rga_pipeline() {
+	if (media_[0].fd < 0 || media_[1].fd < 0 || rgb_[0].fd < 0) {
+		log_rga_failure(rga_state_, "startup_self_test", PixelMode::NV12,
+				 kRgaInvalidBuffer, cfg_.width, cfg_.height, cfg_.width,
+				 cfg_.height, media_[0].fd, media_[1].fd, 0);
+		return false;
+	}
+
+	if (!rga_transform_to_nv12(PixelMode::NV12, cfg_.width, cfg_.height,
+				     cfg_.width, cfg_.height, media_[0].fd, media_[1].fd,
+				     false, rga_state_) ||
+		!rga_transform_to_nv12(PixelMode::NV12, cfg_.width, cfg_.height,
+				     cfg_.width, cfg_.height, media_[0].fd, media_[1].fd,
+				     true, rga_state_) ||
+		!rga_convert_to_rgb(PixelMode::NV12, cfg_.width, cfg_.height,
+				    cfg_.width, cfg_.height, media_[1].fd, rgb_[0].fd,
+				    rga_state_)) {
+		std::fprintf(stderr, "[rga] startup self-test failed; camera will not start\n");
+		perf_logger_log("rga_startup_self_test result=failed\n");
+		return false;
+	}
+
+	rga_state_.record_success();
+	std::fprintf(stdout, "[rga] startup self-test passed: NV12 copy/rotate180 and NV12->RGB888\n");
+	perf_logger_log("rga_startup_self_test result=passed\n");
 	return true;
 }
 
@@ -504,8 +570,6 @@ bool Camera::set_format() {
 	cfg_.width = fmt.fmt.pix_mp.width;
 	cfg_.height = fmt.fmt.pix_mp.height;
 	rgb_size_ = static_cast<size_t>(cfg_.width) * static_cast<size_t>(cfg_.height) * 3;
-	rgb_[0].assign(rgb_size_, 0);
-	rgb_[1].assign(rgb_size_, 0);
 	media_size_ = packed_raw_size(V4L2_PIX_FMT_NV12, cfg_.width, cfg_.height);
 	is_mplane_ = true;
 	num_planes_ = fmt.fmt.pix_mp.num_planes ? fmt.fmt.pix_mp.num_planes : 1;
@@ -517,7 +581,19 @@ bool Camera::set_format() {
 		case V4L2_PIX_FMT_UYVY: pix_mode_ = PixelMode::UYVY; break;
 		case V4L2_PIX_FMT_NV21: pix_mode_ = PixelMode::NV21; break;
 		case V4L2_PIX_FMT_NV12: pix_mode_ = PixelMode::NV12; break;
-		default: pix_mode_ = PixelMode::UYVY; break;
+		default:
+			std::fprintf(stderr, "[camera] RGA-only pipeline does not support capture format %c%c%c%c\n",
+				cfg_.pixelformat & 0xFF,
+				(cfg_.pixelformat >> 8) & 0xFF,
+				(cfg_.pixelformat >> 16) & 0xFF,
+				(cfg_.pixelformat >> 24) & 0xFF);
+			return false;
+	}
+	if (num_planes_ != 1) {
+		std::fprintf(stderr,
+			"[camera] RGA-only pipeline requires one DMA-BUF plane, driver returned %u planes\n",
+			num_planes_);
+		return false;
 	}
 
 	struct v4l2_streamparm parm;
@@ -628,6 +704,13 @@ bool Camera::request_buffers() {
 						buffers_[i].planes[p].fd = -1;
 					}
 				}
+			}
+			if (buffers_[i].planes[p].fd < 0) {
+				std::fprintf(stderr,
+					"[camera] RGA-only pipeline requires an exported DMA-BUF fd for buffer=%u plane=%u\n",
+					i,
+					p);
+				return false;
 			}
 		}
 	}
@@ -745,11 +828,9 @@ bool Camera::dequeue_and_convert(int write_index) {
 		return false;
 	}
 
-	uint8_t *plane_base[VIDEO_MAX_PLANES] = {nullptr};
 	uint32_t plane_stride[VIDEO_MAX_PLANES] = {0};
 	uint32_t plane_rows[VIDEO_MAX_PLANES] = {0};
 	for (uint32_t p = 0; p < num_planes_ && p < VIDEO_MAX_PLANES; ++p) {
-		plane_base[p] = static_cast<uint8_t *>(buffers_[buf.index].planes[p].start) + planes[p].data_offset;
 		uint32_t stride = plane_stride_[p];
 		if (!stride && planes[p].bytesused) {
 			uint32_t denom = cfg_.height;
@@ -790,92 +871,36 @@ bool Camera::dequeue_and_convert(int write_index) {
 	bool media_ok = false;
 	switch (pix_mode_) {
 		case PixelMode::UYVY: {
-			const uint8_t *base = plane_base[0];
 			uint32_t stride = plane_stride[0] ? plane_stride[0] : cfg_.width * 2;
 			uint32_t rows = plane_rows[0] ? plane_rows[0] : cfg_.height;
-			media_ok = fill_media_buffer_from_uyvy(write_index,
-			                                      base,
-			                                      stride,
-			                                      rows,
-			                                      buffers_[buf.index].planes[0].fd);
+			media_ok = rows == cfg_.height &&
+				fill_media_buffer_with_rga(write_index,
+							   PixelMode::UYVY,
+							   stride,
+							   cfg_.height,
+							   buffers_[buf.index].planes[0].fd);
 			break;
 		}
 		case PixelMode::NV12: {
-			const uint8_t *y_base = plane_base[0];
-			const uint8_t *uv_base = nullptr;
-			uint32_t y_stride = plane_stride[0] ? plane_stride[0] : cfg_.width;
-			uint32_t uv_stride = 0;
-			size_t len0 = buffers_[buf.index].planes[0].length;
-			size_t used0 = planes[0].bytesused ? planes[0].bytesused : len0;
-			size_t len_uv_avail = 0;
-			size_t uv_offset = static_cast<size_t>(y_stride) * cfg_.height;
-			size_t uv_span = static_cast<size_t>(y_stride) * (cfg_.height / 2);
-			size_t padded_h = 0;
-			if (y_stride) {
-				padded_h = static_cast<size_t>((len0 * 2) / (3 * y_stride));
-			}
-			size_t uv_offset_padded = padded_h ? padded_h * y_stride : uv_offset;
-			if (buffers_[buf.index].planes.size() > 1) {
-				uv_base = plane_base[1];
-				uv_stride = plane_stride[1] ? plane_stride[1] : cfg_.width;
-				len_uv_avail = planes[1].bytesused ? planes[1].bytesused : buffers_[buf.index].planes[1].length;
-			} else {
-				if (uv_offset_padded >= uv_offset && uv_offset_padded + uv_span <= len0) {
-					uv_offset = uv_offset_padded;
-				} else if (used0 > uv_span) {
-					uv_offset = used0 - uv_span;
-				}
-				if (uv_offset > len0) uv_offset = len0;
-				uv_base = y_base + uv_offset;
-				uv_stride = y_stride;
-				len_uv_avail = (uv_offset < len0) ? (len0 - uv_offset) : 0;
-			}
-			uint32_t rows_y = plane_rows[0] ? plane_rows[0] : std::min<uint32_t>(cfg_.height, static_cast<uint32_t>(used0 / y_stride));
-			uint32_t rows_uv = plane_rows[1] ? plane_rows[1] : (cfg_.height / 2);
-			if (uv_stride) {
-				rows_uv = std::min<uint32_t>(rows_uv, static_cast<uint32_t>(len_uv_avail / uv_stride));
-			}
-			rows_uv = std::min<uint32_t>(rows_uv, rows_y / 2);
-			media_ok = fill_media_buffer_from_nv12(write_index, y_base, uv_base, y_stride, uv_stride, rows_y, rows_uv);
+			uint32_t stride = plane_stride[0] ? plane_stride[0] : cfg_.width;
+			uint32_t rows = plane_rows[0] ? plane_rows[0] : cfg_.height;
+			media_ok = rows == cfg_.height &&
+				fill_media_buffer_with_rga(write_index,
+							   PixelMode::NV12,
+							   stride,
+							   cfg_.height,
+							   buffers_[buf.index].planes[0].fd);
 			break;
 		}
 		case PixelMode::NV21: {
-			const uint8_t *y_base = plane_base[0];
-			const uint8_t *vu_base = nullptr;
-			uint32_t y_stride = plane_stride[0] ? plane_stride[0] : cfg_.width;
-			uint32_t vu_stride = 0;
-			size_t len0 = buffers_[buf.index].planes[0].length;
-			size_t used0 = planes[0].bytesused ? planes[0].bytesused : len0;
-			size_t len_vu_avail = 0;
-			size_t vu_offset = static_cast<size_t>(y_stride) * cfg_.height;
-			size_t vu_span = static_cast<size_t>(y_stride) * (cfg_.height / 2);
-			size_t padded_h = 0;
-			if (y_stride) {
-				padded_h = static_cast<size_t>((len0 * 2) / (3 * y_stride));
-			}
-			size_t vu_offset_padded = padded_h ? padded_h * y_stride : vu_offset;
-			if (buffers_[buf.index].planes.size() > 1) {
-				vu_base = plane_base[1];
-				vu_stride = plane_stride[1] ? plane_stride[1] : cfg_.width;
-				len_vu_avail = planes[1].bytesused ? planes[1].bytesused : buffers_[buf.index].planes[1].length;
-			} else {
-				if (vu_offset_padded >= vu_offset && vu_offset_padded + vu_span <= len0) {
-					vu_offset = vu_offset_padded;
-				} else if (used0 > vu_span) {
-					vu_offset = used0 - vu_span;
-				}
-				if (vu_offset > len0) vu_offset = len0;
-				vu_base = y_base + vu_offset;
-				vu_stride = y_stride;
-				len_vu_avail = (vu_offset < len0) ? (len0 - vu_offset) : 0;
-			}
-			uint32_t rows_y = plane_rows[0] ? plane_rows[0] : std::min<uint32_t>(cfg_.height, static_cast<uint32_t>(used0 / y_stride));
-			uint32_t rows_vu = plane_rows[1] ? plane_rows[1] : (cfg_.height / 2);
-			if (vu_stride) {
-				rows_vu = std::min<uint32_t>(rows_vu, static_cast<uint32_t>(len_vu_avail / vu_stride));
-			}
-			rows_vu = std::min<uint32_t>(rows_vu, rows_y / 2);
-			media_ok = fill_media_buffer_from_nv21(write_index, y_base, vu_base, y_stride, vu_stride, rows_y, rows_vu);
+			uint32_t stride = plane_stride[0] ? plane_stride[0] : cfg_.width;
+			uint32_t rows = plane_rows[0] ? plane_rows[0] : cfg_.height;
+			media_ok = rows == cfg_.height &&
+				fill_media_buffer_with_rga(write_index,
+							   PixelMode::NV21,
+							   stride,
+							   cfg_.height,
+							   buffers_[buf.index].planes[0].fd);
 			break;
 		}
 	}
@@ -883,8 +908,8 @@ bool Camera::dequeue_and_convert(int write_index) {
 	if (media_ok) {
 		media_ok = media_to_rgb(write_index);
 	}
-	if (!media_ok) {
-		memset(rgb_[write_index].data(), 0, rgb_size_);
+	if (media_ok) {
+		rga_state_.record_success();
 	}
 
 	if (xioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
@@ -897,6 +922,17 @@ bool Camera::dequeue_and_convert(int write_index) {
 
 void Camera::cleanup_buffers() {
 	for (auto &buffer : media_) {
+		if (buffer.start && buffer.length) {
+			munmap(buffer.start, buffer.length);
+			buffer.start = nullptr;
+		}
+		if (buffer.fd >= 0) {
+			close(buffer.fd);
+			buffer.fd = -1;
+		}
+		buffer.length = 0;
+	}
+	for (auto &buffer : rgb_) {
 		if (buffer.start && buffer.length) {
 			munmap(buffer.start, buffer.length);
 			buffer.start = nullptr;
@@ -934,192 +970,34 @@ int Camera::xioctl(int fd, unsigned long request, void *arg) {
 	return r;
 }
 
-// Fixed-point fast YUV->RGB (full-range). Coeffs are Q14 approximations of the float path.
-inline void Camera::yuv_to_rgb_pair(int y0, int y1, int u, int v, uint8_t *dst) {
-	// Convert limited-range YUV to RGB with BT.601 coefficients (full-range tends閺?閸嬪繗澹?.
-	// Y in [16,235], U/V in [16,240]; clamp after applying offsets.
-	y0 = std::max(16, std::min(235, y0));
-	y1 = std::max(16, std::min(235, y1));
-
-	int r_add = (v * 22970) >> 14;              // 1.402 * 16384
-	int g_add = (-v * 11698 - u * 5638) >> 14;  // -0.713 * V -0.344 * U
-	int b_add = (u * 29032) >> 14;              // 1.772 * U
-
-	int r0 = clamp8((y0 - 16) + r_add);
-	int g0 = clamp8((y0 - 16) + g_add);
-	int b0 = clamp8((y0 - 16) + b_add);
-
-	int r1 = clamp8((y1 - 16) + r_add);
-	int g1 = clamp8((y1 - 16) + g_add);
-	int b1 = clamp8((y1 - 16) + b_add);
-
-	dst[0] = static_cast<uint8_t>(r0);
-	dst[1] = static_cast<uint8_t>(g0);
-	dst[2] = static_cast<uint8_t>(b0);
-	dst[3] = static_cast<uint8_t>(r1);
-	dst[4] = static_cast<uint8_t>(g1);
-	dst[5] = static_cast<uint8_t>(b1);
-}
-
-void Camera::yuyv_to_rgb888(const uint8_t *src, uint8_t *dst, uint32_t pixel_count) {
-	for (uint32_t i = 0; i + 1 < pixel_count; i += 2) {
-		int y0 = src[0];
-		int u = src[1] - 128;
-		int y1 = src[2];
-		int v = src[3] - 128;
-		src += 4;
-		yuv_to_rgb_pair(y0, y1, u, v, dst);
-		dst += 6;
-	}
-}
-
-void Camera::nv12_to_rgb888(const uint8_t *y, const uint8_t *uv, uint8_t *dst,
-					uint32_t width, uint32_t height) {
-	for (uint32_t j = 0; j < height; ++j) {
-		const uint8_t *y_row = y + j * width;
-		const uint8_t *uv_row = uv + (j / 2) * width;
-		uint8_t *out = dst + j * width * 3;
-		for (uint32_t i = 0; i < width; i += 2) {
-			int Y0 = y_row[i];
-			int Y1 = y_row[i + 1];
-			int U = uv_row[i & ~1] - 128;
-			int V = uv_row[(i & ~1) + 1] - 128;
-			yuv_to_rgb_pair(Y0, Y1, U, V, out + i * 3);
-		}
-	}
-}
-
-void Camera::uyvy_to_nv12(const uint8_t *src,
-				 uint32_t src_stride,
-				 uint8_t *dst_y,
-				 uint8_t *dst_uv,
-				 uint32_t width,
-				 uint32_t height) {
-	for (uint32_t row = 0; row < height; ++row) {
-		const uint8_t *src_row = src + static_cast<size_t>(row) * src_stride;
-		uint8_t *dst_row = dst_y + static_cast<size_t>(row) * width;
-		for (uint32_t col = 0; col + 1 < width; col += 2) {
-			dst_row[col] = src_row[1];
-			dst_row[col + 1] = src_row[3];
-			src_row += 4;
-		}
-	}
-
-	for (uint32_t row = 0; row < height; row += 2) {
-		const uint8_t *src_row0 = src + static_cast<size_t>(row) * src_stride;
-		const uint8_t *src_row1 = src + static_cast<size_t>(std::min<uint32_t>(row + 1, height - 1)) * src_stride;
-		uint8_t *dst_row = dst_uv + static_cast<size_t>(row / 2) * width;
-		for (uint32_t col = 0; col + 1 < width; col += 2) {
-			const size_t off = static_cast<size_t>(col) * 2;
-			dst_row[col] = static_cast<uint8_t>((static_cast<uint32_t>(src_row0[off + 0]) + static_cast<uint32_t>(src_row1[off + 0]) + 1U) / 2U);
-			dst_row[col + 1] = static_cast<uint8_t>((static_cast<uint32_t>(src_row0[off + 2]) + static_cast<uint32_t>(src_row1[off + 2]) + 1U) / 2U);
-		}
-	}
-}
-
-void Camera::nv21_to_nv12(uint8_t *dst_uv, const uint8_t *src_vu, uint32_t width, uint32_t chroma_rows) {
-	for (uint32_t row = 0; row < chroma_rows; ++row) {
-		const uint8_t *src_row = src_vu + static_cast<size_t>(row) * width;
-		uint8_t *dst_row = dst_uv + static_cast<size_t>(row) * width;
-		for (uint32_t col = 0; col + 1 < width; col += 2) {
-			dst_row[col] = src_row[col + 1];
-			dst_row[col + 1] = src_row[col];
-		}
-	}
-}
-
-bool Camera::fill_media_buffer_from_uyvy(int write_index,
-					     const uint8_t *src,
-					     uint32_t src_stride,
-					     uint32_t src_rows,
-					     int src_fd) {
-	if (!media_[write_index].start) return false;
-	uint8_t *dst = static_cast<uint8_t *>(media_[write_index].start);
-	memset(dst, 0, media_size_);
-	const uint32_t rows = std::min(src_rows, cfg_.height);
-	if (rows == cfg_.height &&
-		try_rga_convert_to_nv12(PixelMode::UYVY,
-				       cfg_.width,
-				       cfg_.height,
-				       src_stride,
-				       rows,
-				       src_fd,
-				       src,
-				       media_[write_index].fd,
-				       dst)) {
-		return true;
-	}
-	uyvy_to_nv12(src, src_stride, dst, dst + static_cast<size_t>(cfg_.width) * cfg_.height, cfg_.width, rows);
-	return rows == cfg_.height;
-}
-
-bool Camera::fill_media_buffer_from_nv12(int write_index,
-					     const uint8_t *y_base,
-					     const uint8_t *uv_base,
-					     uint32_t y_stride,
-					     uint32_t uv_stride,
-					     uint32_t rows_y,
-					     uint32_t rows_uv) {
-	if (!media_[write_index].start || !y_base || !uv_base) return false;
-	uint8_t *dst = static_cast<uint8_t *>(media_[write_index].start);
-	uint8_t *dst_uv = dst + static_cast<size_t>(cfg_.width) * cfg_.height;
-	memset(dst, 0, media_size_);
-	rows_y = std::min(rows_y, cfg_.height);
-	rows_uv = std::min(rows_uv, cfg_.height / 2);
-	for (uint32_t row = 0; row < rows_y; ++row) {
-		::memcpy(dst + static_cast<size_t>(row) * cfg_.width,
-				 y_base + static_cast<size_t>(row) * y_stride,
-				 cfg_.width);
-	}
-	for (uint32_t row = 0; row < rows_uv; ++row) {
-		::memcpy(dst_uv + static_cast<size_t>(row) * cfg_.width,
-				 uv_base + static_cast<size_t>(row) * uv_stride,
-				 cfg_.width);
-	}
-	return rows_y == cfg_.height && rows_uv == (cfg_.height / 2);
-}
-
-bool Camera::fill_media_buffer_from_nv21(int write_index,
-					     const uint8_t *y_base,
-					     const uint8_t *vu_base,
-					     uint32_t y_stride,
-					     uint32_t vu_stride,
-					     uint32_t rows_y,
-					     uint32_t rows_vu) {
-	if (!media_[write_index].start || !y_base || !vu_base) return false;
-	uint8_t *dst = static_cast<uint8_t *>(media_[write_index].start);
-	uint8_t *dst_uv = dst + static_cast<size_t>(cfg_.width) * cfg_.height;
-	memset(dst, 0, media_size_);
-	rows_y = std::min(rows_y, cfg_.height);
-	rows_vu = std::min(rows_vu, cfg_.height / 2);
-	for (uint32_t row = 0; row < rows_y; ++row) {
-		::memcpy(dst + static_cast<size_t>(row) * cfg_.width,
-				 y_base + static_cast<size_t>(row) * y_stride,
-				 cfg_.width);
-	}
-	for (uint32_t row = 0; row < rows_vu; ++row) {
-		nv21_to_nv12(dst_uv + static_cast<size_t>(row) * cfg_.width,
-				     vu_base + static_cast<size_t>(row) * vu_stride,
+bool Camera::fill_media_buffer_with_rga(int write_index,
+					PixelMode mode,
+					uint32_t src_stride,
+					uint32_t src_hstride,
+					int src_fd) {
+	if (write_index < 0 || write_index >= 2 || media_[write_index].fd < 0) return false;
+	return rga_transform_to_nv12(mode,
 				     cfg_.width,
-				     1);
-	}
-	return rows_y == cfg_.height && rows_vu == (cfg_.height / 2);
+				     cfg_.height,
+				     src_stride,
+				     src_hstride,
+				     src_fd,
+				     media_[write_index].fd,
+				     rga_state_.rotate180(),
+				     rga_state_);
 }
 
 bool Camera::media_to_rgb(int write_index) {
-	if (!media_[write_index].start) return false;
-	const uint8_t *y = static_cast<const uint8_t *>(media_[write_index].start);
-	const uint8_t *uv = y + static_cast<size_t>(cfg_.width) * cfg_.height;
-	if (try_rga_convert(PixelMode::NV12,
-				    cfg_.width,
-				    cfg_.height,
-				    cfg_.width,
-				    cfg_.height,
-				    media_[write_index].fd,
-				    y,
-				    rgb_[write_index].data())) {
-		return true;
+	if (write_index < 0 || write_index >= 2 ||
+		media_[write_index].fd < 0 || rgb_[write_index].fd < 0) {
+		return false;
 	}
-	nv12_to_rgb888(y, uv, rgb_[write_index].data(), cfg_.width, cfg_.height);
-	return true;
+	return rga_convert_to_rgb(PixelMode::NV12,
+				  cfg_.width,
+				  cfg_.height,
+				  cfg_.width,
+				  cfg_.height,
+				  media_[write_index].fd,
+				  rgb_[write_index].fd,
+				  rga_state_);
 }

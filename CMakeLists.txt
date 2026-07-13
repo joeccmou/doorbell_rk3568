@@ -141,9 +141,12 @@ endif()
 add_executable(doorbell
     src/main.cpp
     src/camera.cpp
+    src/camera_rga_state.cpp
     src/device/mqtt_device_client.cpp
     src/device/provisioning.cpp
     src/device/device_settings_command.cpp
+    src/device/device_settings_store.cpp
+    src/device/person_detection_settings.cpp
     src/device/timezone_manager.cpp
     src/device/sntp_client.cpp
     src/device/time_sync_service.cpp
@@ -189,38 +192,21 @@ if (CONFIG_LV_USE_LINUX_DRM_GBM_BUFFERS OR CONFIG_LV_LINUX_DRM_USE_EGL)
 
 endif()
 
-# RGA (optional, accelerates YUV->ARGB)
-# Prefer the sysroot-provided librga (e.g., 2.1.0) instead of the bundled prebuilt.
+# 设备端图像转换、缩放与旋转统一依赖 RGA。
+# 优先使用 sysroot 提供的 librga（例如 2.1.0），避免链接随 SDK 附带的旧预编译库。
 set(DOORBELL_TARGET_ARCH OFF)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR CMAKE_CROSSCOMPILING)
     set(DOORBELL_TARGET_ARCH ON)
 endif()
 
-set(RGA_SYSROOT "${DOORBELL_SDK_ROOT}/debian/sysroots/debian11-aarch64")
-set(RGA_HINT_PATH "${RGA_SYSROOT}/usr/lib/aarch64-linux-gnu")
 if (DOORBELL_TARGET_ARCH)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(RGA REQUIRED librga)
-
-    if (RGA_FOUND)
-        list(APPEND PKG_CONFIG_LIB ${RGA_LIBRARIES})
-        list(APPEND PKG_CONFIG_INC ${RGA_INCLUDE_DIRS})
-    else()
-        find_path(RGA_INCLUDE_DIR NAMES im2d.h RgaApi.h
-            PATHS
-            ${RGA_SYSROOT}/usr/include/rga
-        )
-        find_library(RGA_LIB NAMES rga librga
-            PATHS
-            ${RGA_HINT_PATH}
-        )
-        if (TARGET doorbell AND RGA_INCLUDE_DIR)
-            target_include_directories(doorbell PRIVATE ${RGA_INCLUDE_DIR})
-        endif()
-    endif()
+    list(APPEND PKG_CONFIG_LIB ${RGA_LIBRARIES})
+    list(APPEND PKG_CONFIG_INC ${RGA_INCLUDE_DIRS})
 else()
     target_compile_definitions(doorbell PRIVATE DOORBELL_DISABLE_RGA DISABLE_RGA)
-    message(STATUS "RGA disabled on non-aarch64 host build")
+    message(STATUS "RGA disabled on non-aarch64 host build; camera and image preprocessing cannot run")
 endif()
                                                 
 set(RKNN_RUNTIME_ROOT ${DOORBELL_SDK_ROOT}/external/rknpu2/runtime/RK356X/Linux/librknn_api)
@@ -267,12 +253,6 @@ if (DOORBELL_USE_RKNN_YOLO)
 else()
     message(STATUS "RKNN YOLO disabled on non-aarch64 host build")
 endif()
-if (DOORBELL_TARGET_ARCH AND TARGET doorbell AND RGA_LIB)
-    target_link_libraries(doorbell PRIVATE ${RGA_LIB})
-elseif(DOORBELL_TARGET_ARCH AND NOT RGA_FOUND)
-    message(WARNING "librga not found; build will fall back to CPU conversion")
-endif()
-
 # 3) 渚濊禆搴擄細鏍规嵁浣犻€夌殑鍚庣娣诲姞
 target_link_libraries(doorbell
     PRIVATE
@@ -320,6 +300,15 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/live_view_session_test.cp
     add_test(NAME live_view_session_test COMMAND live_view_session_test)
 endif()
 
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/camera_rga_state_test.cpp")
+    add_executable(camera_rga_state_test
+        tests/camera_rga_state_test.cpp
+        src/camera_rga_state.cpp
+    )
+    target_include_directories(camera_rga_state_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME camera_rga_state_test COMMAND camera_rga_state_test)
+endif()
+
 if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/timezone_manager_test.cpp")
     add_executable(timezone_manager_test
         tests/timezone_manager_test.cpp
@@ -344,6 +333,7 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/time_sync_service_test.cp
         src/device/time_sync_service.cpp
     )
     target_include_directories(time_sync_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(time_sync_service_test PRIVATE pthread)
     add_test(NAME time_sync_service_test COMMAND time_sync_service_test)
 endif()
 
@@ -352,8 +342,34 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/device_settings_command_t
         tests/device_settings_command_test.cpp
         src/device/device_settings_command.cpp
     )
-    target_include_directories(device_settings_command_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(device_settings_command_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${NLOHMANN_JSON_INCLUDE_DIRS})
     add_test(NAME device_settings_command_test COMMAND device_settings_command_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/device_settings_store_test.cpp")
+    add_executable(device_settings_store_test
+        tests/device_settings_store_test.cpp
+        src/device/device_settings_store.cpp
+    )
+    target_include_directories(device_settings_store_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${NLOHMANN_JSON_INCLUDE_DIRS})
+    add_test(NAME device_settings_store_test COMMAND device_settings_store_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/person_detection_settings_test.cpp")
+    add_executable(person_detection_settings_test
+        tests/person_detection_settings_test.cpp
+        src/device/person_detection_settings.cpp
+    )
+    target_include_directories(person_detection_settings_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME person_detection_settings_test COMMAND person_detection_settings_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/mqtt_session_handshake_test.cpp")
+    add_executable(mqtt_session_handshake_test
+        tests/mqtt_session_handshake_test.cpp
+    )
+    target_include_directories(mqtt_session_handshake_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME mqtt_session_handshake_test COMMAND mqtt_session_handshake_test)
 endif()
 
 if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/person_event_gate_test.cpp")

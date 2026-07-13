@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -10,6 +11,7 @@
 #include <gpiod.h>
 
 #include "device/live_webrtc_session.h"
+#include "device/device_settings_store.h"
 #include "utils/audio_capture_manager.h"
 
 class LiveViewSession;
@@ -34,6 +36,11 @@ public:
     const std::string &device_id() const { return identity_.device_id; }
     const std::string &device_secret() const { return identity_.device_secret; }
     bool publish_event(const std::string &payload);
+    using PersonSettingsHandler = std::function<bool(bool, const std::string &)>;
+    using ImageRotateHandler = std::function<bool(bool)>;
+    void set_settings_apply_handlers(PersonSettingsHandler person_handler,
+                                     ImageRotateHandler image_rotate_handler);
+    DeviceSettingsValues current_settings() const;
 
 private:
     enum class Stage {
@@ -50,6 +57,7 @@ private:
         std::string device_id;
         std::string device_secret;
         std::string model;
+        std::string firmware_version;
         std::string ap_ssid;
         std::string ap_pass;
     };
@@ -108,7 +116,10 @@ private:
 
     bool wait_for_stop_or(std::chrono::milliseconds duration) const;
     void handle_mqtt_command(const std::string &payload);
-    void publish_time_sync_status(const DeviceTimeSyncStatus &status);
+    void publish_time_sync(const DeviceTimeSyncStatus &status);
+    void publish_capabilities();
+    bool apply_person_settings(bool enabled, const std::string &sensitivity);
+    bool apply_image_rotate180(bool enabled);
 
     std::string identity_path_;
     std::string data_dir_;
@@ -147,6 +158,12 @@ private:
     std::unique_ptr<SntpClient> sntp_client_;
     std::unique_ptr<TimeSyncService> time_sync_service_;
     std::unique_ptr<TimezoneManager> timezone_manager_;
+    std::unique_ptr<DeviceSettingsStore> settings_store_;
+
+    mutable std::mutex settings_handler_mtx_;
+    PersonSettingsHandler person_settings_handler_;
+    ImageRotateHandler image_rotate_handler_;
+    std::atomic<bool> status_led_enabled_{true};
 
     GpioLine button_gpio_;
 
