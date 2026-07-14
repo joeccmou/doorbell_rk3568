@@ -372,6 +372,14 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/mqtt_session_handshake_te
     add_test(NAME mqtt_session_handshake_test COMMAND mqtt_session_handshake_test)
 endif()
 
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/provisioning_recovery_policy_test.cpp")
+    add_executable(provisioning_recovery_policy_test
+        tests/provisioning_recovery_policy_test.cpp
+    )
+    target_include_directories(provisioning_recovery_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME provisioning_recovery_policy_test COMMAND provisioning_recovery_policy_test)
+endif()
+
 if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/person_event_gate_test.cpp")
     add_executable(person_event_gate_test
         tests/person_event_gate_test.cpp

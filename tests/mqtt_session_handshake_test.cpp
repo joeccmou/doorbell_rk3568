@@ -13,12 +13,12 @@ int main() {
     handshake.acknowledge_subscription(12, true);
     assert(handshake.subscriptions_ready());
 
-    handshake.expect_online_publish(21);
-    assert(!handshake.online_ready());
-    assert(!handshake.acknowledge_publish(20));
-    assert(!handshake.online_ready());
-    assert(handshake.acknowledge_publish(21));
-    assert(handshake.online_ready());
+	handshake.expect_ready_publish(21);
+	assert(!handshake.ready_publish_acknowledged());
+	assert(!handshake.acknowledge_publish(20));
+	assert(!handshake.ready_publish_acknowledged());
+	assert(handshake.acknowledge_publish(21));
+	assert(handshake.ready_publish_acknowledged());
     assert(handshake.ready());
 
     MqttSessionHandshake rejected;

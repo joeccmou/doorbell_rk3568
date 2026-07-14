@@ -89,7 +89,6 @@ private:
     Callbacks callbacks_;
 
     std::atomic<bool> stop_{false};
-    std::atomic<bool> publish_offline_{false};
     std::mutex online_mtx_;
     std::condition_variable online_cv_;
     bool online_ = false;

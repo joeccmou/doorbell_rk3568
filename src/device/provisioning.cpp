@@ -1,4 +1,5 @@
 #include "device/provisioning.h"
+#include "device/provisioning_recovery_policy.h"
 #include "device/live_view_session.h"
 #include "device/mqtt_device_client.h"
 #include "device/device_settings_command.h"
@@ -1160,20 +1161,23 @@ void DoorbellProvisioning::provisioning_worker(WifiCredentials wifi) {
         return;
     }
 
-    save_wifi(wifi);
-    set_stage(Stage::ConnectingCloud);
-    if (!mqtt_client_) {
-        set_stage(Stage::CloudFailed, "CLOUD_CONNECT_FAILED");
-        start_access_point();
-        return;
-    }
+	save_wifi(wifi);
+	// Wi-Fi 已验证并保存后退出配网 AP；后续云端故障只在 STA 上持续恢复。
+	stop_access_point();
+	set_stage(Stage::ConnectingCloud);
+	if (!mqtt_client_) {
+		set_stage(Stage::CloudFailed, "CLOUD_CONNECT_FAILED");
+		return;
+	}
 
     mqtt_client_->start();
-    if (!mqtt_client_->wait_until_online(std::chrono::seconds(20))) {
-        mqtt_client_->stop(false);
-        set_stage(Stage::CloudFailed, "CLOUD_CONNECT_FAILED");
-        start_access_point();
-    }
+	if (!mqtt_client_->wait_until_online(std::chrono::seconds(20))) {
+		set_stage(Stage::CloudFailed, "CLOUD_CONNECT_FAILED");
+		if (recovery_after_cloud_failure_with_valid_wifi() ==
+			ProvisioningRecoveryAction::KeepStaAndRetryCloud) {
+			std::fprintf(stdout, "[provision] cloud not ready yet; MQTT background reconnect continues\n");
+		}
+	}
 }
 
 void DoorbellProvisioning::set_live_frame_provider(LiveWebRtcSession::FrameProvider provider) {
