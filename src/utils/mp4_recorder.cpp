@@ -1,16 +1,16 @@
 #include "mp4_recorder.h"
 #include "perf_logger.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
-#include <ctime>
 #include <cstdlib>
 #include <linux/videodev2.h>
 #include <unistd.h>
 #include <filesystem>
-#include <sstream>
 #include <system_error>
+#include <utility>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
@@ -61,19 +61,15 @@ Mp4Recorder::~Mp4Recorder() {
     stop();
 }
 
-bool Mp4Recorder::start(const std::string &output_dir, uint32_t width, uint32_t height, uint32_t fps, uint32_t pixfmt) {
-    std::time_t now = std::time(nullptr);
-    std::tm tm_now{};
-    localtime_r(&now, &tm_now);
-    char ts[32] = {0};
-    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_now);
-    return start_file(output_dir + "/person_" + ts + ".mp4", width, height, fps, pixfmt);
-}
-
-bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uint32_t height, uint32_t fps, uint32_t pixfmt) {
+bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  uint32_t fps,
+                                  uint32_t pixfmt,
+                                  SegmentClosedCallback segment_closed_callback) {
     uint64_t start_begin_ns = mono_time_ns();
-    rec_trace("start enter file=%s w=%u h=%u fps=%u pixfmt=%c%c%c%c",
-              output_file.c_str(),
+    rec_trace("start enter pattern=%s w=%u h=%u fps=%u pixfmt=%c%c%c%c",
+              temporary_file_pattern.c_str(),
               width,
               height,
               fps,
@@ -82,9 +78,9 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
               (pixfmt >> 16) & 0xFF,
               (pixfmt >> 24) & 0xFF);
     if (running()) return true;
-    if (output_file.empty() || width == 0 || height == 0 || fps == 0) return false;
+    if (temporary_file_pattern.empty() || width == 0 || height == 0 || fps == 0) return false;
 
-    const std::string output_dir = std::filesystem::path(output_file).parent_path().string();
+    const std::string output_dir = std::filesystem::path(temporary_file_pattern).parent_path().string();
     std::error_code ec;
     std::filesystem::create_directories(output_dir, ec);
     if (ec) {
@@ -96,7 +92,8 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
         return false;
     }
 
-    last_file_ = output_file;
+    last_file_ = temporary_file_pattern;
+    segment_closed_callback_ = std::move(segment_closed_callback);
 
     ensure_gstreamer_initialized();
 
@@ -113,6 +110,8 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
                        (pixfmt >> 8) & 0xFF,
                        (pixfmt >> 16) & 0xFF,
                        (pixfmt >> 24) & 0xFF);
+            last_file_.clear();
+            segment_closed_callback_ = {};
             return false;
     }
 
@@ -125,20 +124,20 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
         pipeline_desc = g_strdup_printf(
             "appsrc name=vsrc is-live=true block=false format=time do-timestamp=true "
             "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "            "! queue leaky=downstream max-size-buffers=2 "
-            "! mpph264enc ! h264parse ! queue ! mux. "
+            "! mpph264enc ! h264parse config-interval=-1 ! queue ! mux.video "
             "appsrc name=asrc is-live=true block=false format=time do-timestamp=false "
             "caps=audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1 "
             "! queue leaky=downstream max-size-buffers=16 ! audioconvert ! audioresample "
-            "! voaacenc bitrate=128000 ! aacparse ! queue ! mux. "
-            "mp4mux name=mux faststart=true ! filesink location=%s sync=false async=false",
-            gst_format, width, height, fps, last_file_.c_str());
+            "! voaacenc bitrate=128000 ! aacparse ! queue ! mux.audio_0 "
+            "splitmuxsink name=mux",
+            gst_format, width, height, fps);
     } else {
         pipeline_desc = g_strdup_printf(
             "appsrc name=vsrc is-live=true block=false format=time do-timestamp=true "
             "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "            "! queue leaky=downstream max-size-buffers=2 "
-            "! mpph264enc ! h264parse ! mp4mux faststart=true "
-            "! filesink location=%s sync=false async=false",
-            gst_format, width, height, fps, last_file_.c_str());
+            "! mpph264enc ! h264parse config-interval=-1 ! queue ! mux.video "
+            "splitmuxsink name=mux",
+            gst_format, width, height, fps);
     }
 
     GError *error = nullptr;
@@ -153,6 +152,7 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
             g_error_free(error);
         }
         last_file_.clear();
+        segment_closed_callback_ = {};
         return false;
     }
 
@@ -162,8 +162,37 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
         gst_object_unref(pipeline_);
         pipeline_ = nullptr;
         last_file_.clear();
+        segment_closed_callback_ = {};
         return false;
     }
+
+    splitmuxsink_ = gst_bin_get_by_name(GST_BIN(pipeline_), "mux");
+    if (!splitmuxsink_) {
+        g_printerr("[recorder] splitmuxsink not found in pipeline\n");
+        gst_object_unref(appsrc_);
+        appsrc_ = nullptr;
+        gst_object_unref(pipeline_);
+        pipeline_ = nullptr;
+        last_file_.clear();
+        segment_closed_callback_ = {};
+        return false;
+    }
+
+    GstStructure *muxer_properties = gst_structure_new(
+        "properties",
+        "faststart", G_TYPE_BOOLEAN, TRUE,
+        nullptr);
+    g_object_set(
+        G_OBJECT(splitmuxsink_),
+        "location", last_file_.c_str(),
+        "max-size-time", static_cast<guint64>(60 * GST_SECOND),
+        "max-size-bytes", static_cast<guint64>(0),
+        "send-keyframe-requests", TRUE,
+        "async-finalize", TRUE,
+        "muxer-factory", "mp4mux",
+        "muxer-properties", muxer_properties,
+        nullptr);
+    gst_structure_free(muxer_properties);
 
     if (enable_audio) {
         audio_appsrc_ = gst_bin_get_by_name(GST_BIN(pipeline_), "asrc");
@@ -171,9 +200,12 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
             g_printerr("[recorder] audio appsrc not found in pipeline\n");
             gst_object_unref(appsrc_);
             appsrc_ = nullptr;
+            gst_object_unref(splitmuxsink_);
+            splitmuxsink_ = nullptr;
             gst_object_unref(pipeline_);
             pipeline_ = nullptr;
             last_file_.clear();
+            segment_closed_callback_ = {};
             return false;
         }
         gst_app_src_set_stream_type(GST_APP_SRC(audio_appsrc_), GST_APP_STREAM_TYPE_STREAM);
@@ -194,9 +226,12 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
         }
         gst_object_unref(appsrc_);
         appsrc_ = nullptr;
+        gst_object_unref(splitmuxsink_);
+        splitmuxsink_ = nullptr;
         gst_object_unref(pipeline_);
         pipeline_ = nullptr;
         last_file_.clear();
+        segment_closed_callback_ = {};
         return false;
     }
 
@@ -208,6 +243,10 @@ bool Mp4Recorder::start_file(const std::string &output_file, uint32_t width, uin
     first_frame_ts_ns_ = 0;
     last_pts_ns_ = 0;
     has_first_frame_ts_ = false;
+    next_fragment_index_ = 0;
+    last_fragment_end_running_time_ns_ = 0;
+    fragment_started_running_time_ns_.clear();
+    fragment_indexes_.clear();
 
     if (enable_audio) {
         {
@@ -250,12 +289,6 @@ void Mp4Recorder::stop() {
         perf_logger_log("record stop appsrc_eos_sent=0\n");
     }
 
-    bool pipeline_eos_sent = false;
-    if (pipeline_) {
-        pipeline_eos_sent = gst_element_send_event(pipeline_, gst_event_new_eos());
-    }
-    perf_logger_log("record stop pipeline_eos_sent=%d\n", pipeline_eos_sent ? 1 : 0);
-
     bool eos_received = false;
     uint64_t eos_wait_begin_ns = mono_time_ns();
     bool bus_ok = process_bus_messages(true, &eos_received);
@@ -269,6 +302,10 @@ void Mp4Recorder::stop() {
     if (appsrc_) {
         gst_object_unref(appsrc_);
         appsrc_ = nullptr;
+    }
+    if (splitmuxsink_) {
+        gst_object_unref(splitmuxsink_);
+        splitmuxsink_ = nullptr;
     }
     if (audio_appsrc) {
         gst_object_unref(audio_appsrc);
@@ -289,6 +326,11 @@ void Mp4Recorder::stop() {
     first_frame_ts_ns_ = 0;
     last_pts_ns_ = 0;
     has_first_frame_ts_ = false;
+    next_fragment_index_ = 0;
+    last_fragment_end_running_time_ns_ = 0;
+    fragment_started_running_time_ns_.clear();
+    fragment_indexes_.clear();
+    segment_closed_callback_ = {};
 }
 
 bool Mp4Recorder::write_frame(const uint8_t *data, size_t size, uint64_t frame_ts_ns) {
@@ -379,81 +421,142 @@ bool Mp4Recorder::process_bus_messages(bool wait_eos, bool *received_eos) {
         *received_eos = false;
     }
 
-    bool eos_seen = false;
-    constexpr GstClockTime kStopWaitEosTimeout = 2000 * GST_MSECOND;
+    constexpr GstClockTime kStopWaitEosTimeout = 30 * GST_SECOND;
+    const GstMessageType message_types = static_cast<GstMessageType>(
+        GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_WARNING | GST_MESSAGE_ELEMENT);
 
     if (wait_eos) {
-        GstMessage *msg = gst_bus_timed_pop_filtered(
-            bus_,
-            kStopWaitEosTimeout,
-            static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
-        if (msg) {
-            if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS) {
-                eos_seen = true;
-            } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
-                GError *err = nullptr;
-                gchar *debug = nullptr;
-                gst_message_parse_error(msg, &err, &debug);
-                g_printerr("[recorder] pipeline error on stop: %s (%s)\n",
-                           err ? err->message : "unknown",
-                           debug ? debug : "no debug");
-                if (err) g_error_free(err);
-                if (debug) g_free(debug);
-            }
-            gst_message_unref(msg);
-        } else {
+        const GstClockTime deadline = gst_util_get_timestamp() + kStopWaitEosTimeout;
+        while (!received_eos || !*received_eos) {
+            const GstClockTime now = gst_util_get_timestamp();
+            if (now >= deadline) break;
+            GstMessage *message = gst_bus_timed_pop_filtered(bus_, deadline - now, message_types);
+            if (!message) break;
+            const bool ok = process_bus_message(message, received_eos);
+            gst_message_unref(message);
+            if (!ok) return false;
+        }
+        if (!received_eos || !*received_eos) {
             perf_logger_log("record stop eos_wait timeout_ms=%u eos_received=0\n",
                             static_cast<unsigned>(kStopWaitEosTimeout / GST_MSECOND));
         }
     }
 
     while (true) {
-        GstMessage *msg = gst_bus_pop_filtered(
-            bus_,
-            static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_WARNING));
-        if (!msg) break;
-
-        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
-            GError *err = nullptr;
-            gchar *debug = nullptr;
-            gst_message_parse_error(msg, &err, &debug);
-            g_printerr("[recorder] pipeline error: %s (%s)\n",
-                       err ? err->message : "unknown",
-                       debug ? debug : "no debug");
-            if (err) g_error_free(err);
-            if (debug) g_free(debug);
-            gst_message_unref(msg);
-            return false;
-        }
-
-        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS) {
-            eos_seen = true;
-        }
-
-        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_WARNING) {
-            GError *warn = nullptr;
-            gchar *debug = nullptr;
-            gst_message_parse_warning(msg, &warn, &debug);
-            g_printerr("[recorder] pipeline warning: %s (%s)\n",
-                       warn ? warn->message : "unknown",
-                       debug ? debug : "no debug");
-            if (warn) g_error_free(warn);
-            if (debug) g_free(debug);
-        }
-
-        gst_message_unref(msg);
-    }
-
-    if (received_eos) {
-        *received_eos = eos_seen;
+        GstMessage *message = gst_bus_pop_filtered(bus_, message_types);
+        if (!message) break;
+        const bool ok = process_bus_message(message, received_eos);
+        gst_message_unref(message);
+        if (!ok) return false;
     }
 
     if (wait_eos) {
         perf_logger_log("record stop eos_wait timeout_ms=%u eos_received=%d\n",
                         static_cast<unsigned>(kStopWaitEosTimeout / GST_MSECOND),
-                        eos_seen ? 1 : 0);
+                        received_eos && *received_eos ? 1 : 0);
     }
 
+    return true;
+}
+
+bool Mp4Recorder::process_bus_message(GstMessage *message, bool *received_eos) {
+    if (!message) return true;
+
+    if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+        GError *error = nullptr;
+        gchar *debug = nullptr;
+        gst_message_parse_error(message, &error, &debug);
+        g_printerr("[recorder] pipeline error: %s (%s)\n",
+                   error ? error->message : "unknown",
+                   debug ? debug : "no debug");
+        if (error) g_error_free(error);
+        if (debug) g_free(debug);
+        return false;
+    }
+
+    if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_WARNING) {
+        GError *warning = nullptr;
+        gchar *debug = nullptr;
+        gst_message_parse_warning(message, &warning, &debug);
+        g_printerr("[recorder] pipeline warning: %s (%s)\n",
+                   warning ? warning->message : "unknown",
+                   debug ? debug : "no debug");
+        if (warning) g_error_free(warning);
+        if (debug) g_free(debug);
+        return true;
+    }
+
+    if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS) {
+        if (received_eos) *received_eos = true;
+        return true;
+    }
+
+    if (GST_MESSAGE_TYPE(message) != GST_MESSAGE_ELEMENT) return true;
+    const GstStructure *structure = gst_message_get_structure(message);
+    if (!structure) return true;
+
+    const bool fragment_opened =
+        gst_structure_has_name(structure, "splitmuxsink-fragment-opened");
+    const bool fragment_closed =
+        gst_structure_has_name(structure, "splitmuxsink-fragment-closed");
+    if (!fragment_opened && !fragment_closed) return true;
+
+    const gchar *location_value = gst_structure_get_string(structure, "location");
+    if (!location_value || location_value[0] == '\0') return true;
+    const std::string location(location_value);
+    guint64 running_time_ns = 0;
+    if (!gst_structure_get_clock_time(structure, "running-time", &running_time_ns)) {
+        running_time_ns = fragment_closed
+            ? last_fragment_end_running_time_ns_
+            : 0;
+    }
+
+    if (fragment_opened) {
+        fragment_started_running_time_ns_[location] = running_time_ns;
+        fragment_indexes_[location] = next_fragment_index_++;
+        rec_trace("fragment opened index=%u running_time_ns=%llu file=%s",
+                  fragment_indexes_[location],
+                  static_cast<unsigned long long>(running_time_ns),
+                  location.c_str());
+        return true;
+    }
+
+    const auto started = fragment_started_running_time_ns_.find(location);
+    const auto index = fragment_indexes_.find(location);
+    ClosedSegment segment;
+    segment.fragment_index = index != fragment_indexes_.end()
+        ? index->second
+        : next_fragment_index_++;
+    segment.temporary_file = location;
+    const uint64_t reported_started_running_time_ns = started != fragment_started_running_time_ns_.end()
+        ? started->second
+        : last_fragment_end_running_time_ns_;
+    segment.started_running_time_ns = segment.fragment_index == 0
+        ? reported_started_running_time_ns
+        : last_fragment_end_running_time_ns_;
+    segment.ended_running_time_ns = std::max<uint64_t>(
+        segment.started_running_time_ns,
+        running_time_ns);
+    last_fragment_end_running_time_ns_ = segment.ended_running_time_ns;
+    fragment_started_running_time_ns_.erase(location);
+    fragment_indexes_.erase(location);
+
+    rec_trace("fragment closed index=%u start_ns=%llu end_ns=%llu file=%s",
+              segment.fragment_index,
+              static_cast<unsigned long long>(segment.started_running_time_ns),
+              static_cast<unsigned long long>(segment.ended_running_time_ns),
+              location.c_str());
+    if (segment_closed_callback_) {
+        try {
+            segment_closed_callback_(segment);
+        } catch (const std::exception &exception) {
+            g_printerr("[recorder] segment callback failed: %s\n", exception.what());
+            return false;
+        } catch (...) {
+            g_printerr("[recorder] segment callback failed: unknown error\n");
+            return false;
+        }
+    }
     return true;
 }
 

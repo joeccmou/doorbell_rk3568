@@ -11,10 +11,13 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 class DeviceEventProcessor {
@@ -50,20 +53,25 @@ public:
         std::chrono::system_clock::time_point started_at,
         std::string *error = nullptr);
 
-    bool complete_recording(
-        const std::string &recording_id,
-        const std::string &clip_ref,
-        std::chrono::system_clock::time_point started_at,
-        std::chrono::system_clock::time_point ended_at,
-        int64_t media_duration_ms,
-        int64_t size_bytes,
-        const std::string &sha256,
-        const std::string &status,
-        std::string *error = nullptr);
-
-    // 每次真正新建物理 MP4 时调用；返回设备媒体根目录下的相对路径。
+    // 保留旧调用方的路径分配接口；新的分钟分片录制主路径不再依赖它。
     std::optional<std::string> allocate_recording_clip(
         std::chrono::system_clock::time_point at,
+        std::string *error = nullptr);
+
+    // 分片完成封装后只投递后台任务，避免哈希和 SQLite 写入阻塞录制线程。
+    void submit_completed_recording_segment(
+        const std::string &recording_id,
+        int segment_index,
+        const std::string &temporary_file,
+        const std::string &clip_ref,
+        std::chrono::system_clock::time_point started_at,
+        std::chrono::system_clock::time_point ended_at);
+
+    // 等待此前分片按序落库，再把父 recording 收敛到不可变终态。
+    bool finalize_recording(
+        const std::string &recording_id,
+        std::chrono::system_clock::time_point ended_at,
+        const std::string &status,
         std::string *error = nullptr);
 
     // 选帧窗口结束后，把最佳完整画面交给后台线程保存、上传并上报。
@@ -82,6 +90,8 @@ private:
         enum class Kind {
             ReportEvent,
             SaveSnapshot,
+            PersistRecordingSegment,
+            FinalizeRecording,
         };
 
         Kind kind = Kind::ReportEvent;
@@ -89,6 +99,14 @@ private:
         std::vector<uint8_t> rgb;
         uint32_t width = 0;
         uint32_t height = 0;
+        std::string recording_id;
+        int segment_index = 0;
+        std::string temporary_file;
+        std::string clip_ref;
+        std::chrono::system_clock::time_point started_at{};
+        std::chrono::system_clock::time_point ended_at{};
+        std::string recording_status;
+        std::shared_ptr<std::promise<bool>> completion;
     };
 
     void worker_loop();
@@ -104,10 +122,11 @@ private:
     HttpSnapshotUploader uploader_;
     HttpClipUploader clip_uploader_;
     bool media_available_ = false;
-
     std::atomic<bool> stop_{false};
     std::mutex mutex_;
     std::condition_variable cv_;
+    std::deque<Job> recording_jobs_;
     std::deque<Job> jobs_;
+    std::unordered_set<std::string> failed_recordings_;
     std::thread worker_;
 };

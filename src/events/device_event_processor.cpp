@@ -95,35 +95,15 @@ std::optional<EventRecord> DeviceEventProcessor::begin_person_event(
 std::optional<std::string> DeviceEventProcessor::register_started_recording(
     std::chrono::system_clock::time_point started_at,
     std::string *error) {
+    if (!media_available_) {
+        if (error) *error = "SD media root is not writable";
+        return std::nullopt;
+    }
     const int64_t started_at_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(started_at.time_since_epoch()).count();
     const std::string recording_id = device_id_ + "-" + std::to_string(started_at_ms);
     if (!store_.begin_recording(recording_id, started_at, error)) return std::nullopt;
     return recording_id;
-}
-
-bool DeviceEventProcessor::complete_recording(
-    const std::string &recording_id,
-    const std::string &clip_ref,
-    std::chrono::system_clock::time_point started_at,
-    std::chrono::system_clock::time_point ended_at,
-    int64_t media_duration_ms,
-    int64_t size_bytes,
-    const std::string &sha256,
-    const std::string &status,
-    std::string *error) {
-    return store_.complete_recording(
-        recording_id,
-        recording_id + "-000001",
-        1,
-        clip_ref,
-        started_at,
-        ended_at,
-        media_duration_ms,
-        size_bytes,
-        sha256,
-        status,
-        error);
 }
 
 std::optional<std::string> DeviceEventProcessor::allocate_recording_clip(
@@ -134,6 +114,57 @@ std::optional<std::string> DeviceEventProcessor::allocate_recording_clip(
         return std::nullopt;
     }
     return store_.allocate_clip_ref(at, media_root_, error);
+}
+
+void DeviceEventProcessor::submit_completed_recording_segment(
+    const std::string &recording_id,
+    int segment_index,
+    const std::string &temporary_file,
+    const std::string &clip_ref,
+    std::chrono::system_clock::time_point started_at,
+    std::chrono::system_clock::time_point ended_at) {
+    Job job;
+    job.kind = Job::Kind::PersistRecordingSegment;
+    job.recording_id = recording_id;
+    job.segment_index = segment_index;
+    job.temporary_file = temporary_file;
+    job.clip_ref = clip_ref;
+    job.started_at = started_at;
+    job.ended_at = ended_at;
+    enqueue(std::move(job));
+}
+
+bool DeviceEventProcessor::finalize_recording(
+    const std::string &recording_id,
+    std::chrono::system_clock::time_point ended_at,
+    const std::string &status,
+    std::string *error) {
+    if (status != "finalized" && status != "interrupted" && status != "failed") {
+        if (error) *error = "invalid terminal recording status";
+        return false;
+    }
+    if (!worker_.joinable()) {
+        if (error) *error = "event processor worker is not running";
+        return false;
+    }
+    auto completion = std::make_shared<std::promise<bool>>();
+    auto result = completion->get_future();
+    Job job;
+    job.kind = Job::Kind::FinalizeRecording;
+    job.recording_id = recording_id;
+    job.ended_at = ended_at;
+    job.recording_status = status;
+    job.completion = std::move(completion);
+    enqueue(std::move(job));
+    if (result.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+        if (error) *error = "timed out waiting for recording finalization";
+        return false;
+    }
+    const bool ok = result.get();
+    if (!ok && error && error->empty()) {
+        *error = "recording finalization failed";
+    }
+    return ok;
 }
 
 void DeviceEventProcessor::submit_person_snapshot(EventRecord event,
@@ -152,7 +183,12 @@ void DeviceEventProcessor::submit_person_snapshot(EventRecord event,
 void DeviceEventProcessor::enqueue(Job job) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        jobs_.push_back(std::move(job));
+        if (job.kind == Job::Kind::PersistRecordingSegment ||
+            job.kind == Job::Kind::FinalizeRecording) {
+            recording_jobs_.push_back(std::move(job));
+        } else {
+            jobs_.push_back(std::move(job));
+        }
     }
     cv_.notify_one();
 }
@@ -162,14 +198,23 @@ void DeviceEventProcessor::worker_loop() {
         Job job;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return stop_.load() || !jobs_.empty(); });
+            cv_.wait(lock, [this] {
+                return stop_.load() || !recording_jobs_.empty() || !jobs_.empty();
+            });
             if (stop_.load()) break;
-            job = std::move(jobs_.front());
-            jobs_.pop_front();
+            if (!recording_jobs_.empty()) {
+                job = std::move(recording_jobs_.front());
+                recording_jobs_.pop_front();
+            } else {
+                job = std::move(jobs_.front());
+                jobs_.pop_front();
+            }
         }
         if (!process(&job) && !stop_.load()) {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::seconds(5), [this] { return stop_.load(); });
+            cv_.wait_for(lock, std::chrono::seconds(5), [this] {
+                return stop_.load() || !recording_jobs_.empty();
+            });
             lock.unlock();
             if (!stop_.load()) enqueue(std::move(job));
         }
@@ -178,6 +223,103 @@ void DeviceEventProcessor::worker_loop() {
 
 bool DeviceEventProcessor::process(Job *job) {
     if (!job) return false;
+    if (job->kind == Job::Kind::PersistRecordingSegment) {
+        auto fail_segment = [this, job](const std::string &message) {
+            failed_recordings_.insert(job->recording_id);
+            std::fprintf(stderr,
+                         "[record] persist segment failed recording_id=%s segment_index=%d error=%s\n",
+                         job->recording_id.c_str(),
+                         job->segment_index,
+                         message.c_str());
+            return true;
+        };
+        if (job->recording_id.empty() || job->segment_index <= 0 ||
+            job->temporary_file.empty() || !is_canonical_clip_ref(job->clip_ref)) {
+            return fail_segment("invalid completed segment metadata");
+        }
+
+        const std::filesystem::path temporary_file(job->temporary_file);
+        const std::filesystem::path final_file = std::filesystem::path(media_root_) / job->clip_ref;
+        if (temporary_file.parent_path().lexically_normal() !=
+            final_file.parent_path().lexically_normal()) {
+            return fail_segment("temporary and final segment paths must share one directory");
+        }
+        std::error_code file_error;
+        const bool final_file_exists = std::filesystem::exists(final_file, file_error);
+        if (file_error) return fail_segment(file_error.message());
+        if (final_file_exists) return fail_segment("final segment path already exists");
+        std::filesystem::rename(temporary_file, final_file, file_error);
+        if (file_error) {
+            return fail_segment(std::string("publish completed MP4 failed: ") + file_error.message());
+        }
+        const int64_t size_bytes = static_cast<int64_t>(
+            std::filesystem::file_size(final_file, file_error));
+        if (file_error) return fail_segment(file_error.message());
+        std::string sha256;
+        std::string error;
+        if (!file_sha256(final_file.string(), &sha256, &error)) {
+            return fail_segment(error);
+        }
+        const int64_t media_duration_ms = std::max<int64_t>(
+            0,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                job->ended_at - job->started_at).count());
+        std::ostringstream segment_id;
+        segment_id << job->recording_id << '-'
+                   << std::setw(6) << std::setfill('0') << job->segment_index;
+        if (!store_.append_recording_segment(
+                job->recording_id,
+                segment_id.str(),
+                job->segment_index,
+                job->clip_ref,
+                job->started_at,
+                job->ended_at,
+                media_duration_ms,
+                size_bytes,
+                sha256,
+                &error)) {
+            return fail_segment(error);
+        }
+        std::fprintf(stdout,
+                     "[record] segment committed recording_id=%s segment_index=%d duration_ms=%lld bytes=%lld\n",
+                     job->recording_id.c_str(),
+                     job->segment_index,
+                     static_cast<long long>(media_duration_ms),
+                     static_cast<long long>(size_bytes));
+        return true;
+    }
+
+    if (job->kind == Job::Kind::FinalizeRecording) {
+        std::string status = job->recording_status;
+        std::string error;
+        const auto recording = store_.find_recording(job->recording_id, &error);
+        if (!recording) {
+            std::fprintf(stderr,
+                         "[record] read recording before finalization failed recording_id=%s error=%s\n",
+                         job->recording_id.c_str(),
+                         error.c_str());
+            return false;
+        }
+        if (recording->segment_count == 0 || failed_recordings_.count(job->recording_id) != 0) {
+            status = "failed";
+        }
+        if (!store_.finalize_recording(job->recording_id, job->ended_at, status, &error)) {
+            std::fprintf(stderr,
+                         "[record] finalize recording failed recording_id=%s error=%s\n",
+                         job->recording_id.c_str(),
+                         error.c_str());
+            return false;
+        }
+        failed_recordings_.erase(job->recording_id);
+        std::fprintf(stdout,
+                     "[record] recording finalized recording_id=%s status=%s segments=%d\n",
+                     job->recording_id.c_str(),
+                     status.c_str(),
+                     recording->segment_count);
+        if (job->completion) job->completion->set_value(true);
+        return true;
+    }
+
     if (job->kind == Job::Kind::SaveSnapshot) {
         const std::string snapshot_file = media_root_ + "/" + job->event.snapshot_path;
         if (!std::filesystem::exists(snapshot_file) && !job->rgb.empty()) {

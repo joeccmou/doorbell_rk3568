@@ -39,7 +39,6 @@
 #include "utils/mp4_recorder.h"
 #include "utils/audio_capture_manager.h"
 #include "utils/perf_logger.h"
-#include "utils/file_sha256.h"
 #include "utils/image_utils.h"
 #include "utils/image_drawing.h"
 
@@ -121,9 +120,8 @@ struct UiContext {
     Mp4Recorder recorder;
     AudioCaptureManager audio_capture;
     std::string record_dir;
-    std::string current_record_clip_ref;
     std::string current_recording_id;
-    std::chrono::system_clock::time_point current_recording_started_at{};
+    std::chrono::system_clock::time_point current_recording_last_segment_ended_at{};
     // SDL_Window *sdl_window = nullptr;
 };
 
@@ -286,48 +284,21 @@ void recorder_worker(UiContext *ctx) {
 
     auto finalize_recording = [ctx](const std::string &status) {
         std::string recording_id;
-        std::string clip_ref;
-        std::chrono::system_clock::time_point started_at;
+        std::chrono::system_clock::time_point ended_at;
         {
             std::lock_guard<std::mutex> lock(ctx->record_mtx);
             recording_id = ctx->current_recording_id;
-            clip_ref = ctx->current_record_clip_ref;
-            started_at = ctx->current_recording_started_at;
+            ended_at = ctx->current_recording_last_segment_ended_at;
             ctx->current_recording_id.clear();
-            ctx->current_record_clip_ref.clear();
-            ctx->current_recording_started_at = {};
+            ctx->current_recording_last_segment_ended_at = {};
         }
         ctx->record_cv.notify_all();
-        if (recording_id.empty() || clip_ref.empty() || !ctx->event_processor) return;
-        const auto ended_at = std::chrono::system_clock::now();
-        const int64_t duration_ms = std::max<int64_t>(
-            0,
-            std::chrono::duration_cast<std::chrono::milliseconds>(ended_at - started_at).count());
-        std::error_code ec;
-        const int64_t size_bytes = static_cast<int64_t>(
-            std::filesystem::file_size(std::filesystem::path(ctx->record_dir) / clip_ref, ec));
-        std::string error;
-        std::string sha256;
-        if (ec || !file_sha256(
-                      (std::filesystem::path(ctx->record_dir) / clip_ref).string(),
-                      &sha256,
-                      &error)) {
-            std::fprintf(stderr,
-                         "[record] calculate sha256 failed recording_id=%s error=%s\n",
-                         recording_id.c_str(),
-                         error.c_str());
-            return;
+        if (recording_id.empty() || !ctx->event_processor) return;
+        if (ended_at.time_since_epoch().count() == 0) {
+            ended_at = std::chrono::system_clock::now();
         }
-        if (!ctx->event_processor->complete_recording(
-                recording_id,
-                clip_ref,
-                started_at,
-                ended_at,
-                duration_ms,
-                size_bytes,
-                sha256,
-                status,
-                &error)) {
+        std::string error;
+        if (!ctx->event_processor->finalize_recording(recording_id, ended_at, status, &error)) {
             std::fprintf(stderr,
                          "[record] persist completion failed recording_id=%s error=%s\n",
                          recording_id.c_str(),
@@ -401,23 +372,62 @@ void recorder_worker(UiContext *ctx) {
                          static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
             }
             uint64_t start_begin_ns = monotonic_time_ns();
-			std::string output_file;
-			std::string selected_clip_ref;
-			bool started = false;
-            std::string allocation_error;
-            auto clip_ref = ctx->event_processor
-                ? ctx->event_processor->allocate_recording_clip(
-                      std::chrono::system_clock::now(), &allocation_error)
+            const auto recording_started_at = std::chrono::system_clock::now();
+            std::string recording_error;
+            auto recording_id = ctx->event_processor
+                ? ctx->event_processor->register_started_recording(
+                      recording_started_at, &recording_error)
                 : std::nullopt;
-            if (clip_ref) {
-                selected_clip_ref = *clip_ref;
-                output_file = ctx->record_dir + "/" + *clip_ref;
-                started = ctx->recorder.start_file(
-                    output_file, camera_width, camera_height, kRecordFpsLimit, camera_pixfmt);
-            } else {
-                std::fprintf(stderr,
-                             "[record] allocate daily clip failed error=%s\n",
-                             allocation_error.c_str());
+            bool started = false;
+            if (recording_id) {
+                const std::string temporary_pattern_ref =
+                    clip_directory_relative_path(recording_started_at) + "/." +
+                    *recording_id + "-%06d.mp4.part";
+                const std::string temporary_pattern =
+                    (std::filesystem::path(ctx->record_dir) / temporary_pattern_ref).string();
+                started = ctx->recorder.start_segmented(
+                    temporary_pattern,
+                    camera_width,
+                    camera_height,
+                    kRecordFpsLimit,
+                    camera_pixfmt,
+                    [ctx, recording_id = *recording_id, recording_started_at](
+                        const Mp4Recorder::ClosedSegment &segment) {
+                        const int segment_index = static_cast<int>(segment.fragment_index) + 1;
+                        const std::string clip_ref = recording_segment_relative_path(
+                            recording_started_at,
+                            static_cast<uint32_t>(segment_index));
+                        const auto segment_started_at = recording_started_at +
+                            std::chrono::nanoseconds(segment.started_running_time_ns);
+                        const auto segment_ended_at = recording_started_at +
+                            std::chrono::nanoseconds(segment.ended_running_time_ns);
+                        ctx->event_processor->submit_completed_recording_segment(
+                            recording_id,
+                            segment_index,
+                            segment.temporary_file,
+                            clip_ref,
+                            segment_started_at,
+                            segment_ended_at);
+                        {
+                            std::lock_guard<std::mutex> lock(ctx->record_mtx);
+                            if (ctx->current_recording_id == recording_id) {
+                                ctx->current_recording_last_segment_ended_at = segment_ended_at;
+                            }
+                        }
+                    });
+                if (!started) {
+                    std::string finalize_error;
+                    if (!ctx->event_processor->finalize_recording(
+                            *recording_id,
+                            recording_started_at,
+                            "failed",
+                            &finalize_error)) {
+                        std::fprintf(stderr,
+                                     "[record] persist failed startup state failed recording_id=%s error=%s\n",
+                                     recording_id->c_str(),
+                                     finalize_error.c_str());
+                    }
+                }
             }
             uint64_t start_end_ns = monotonic_time_ns();
             perf_log("record start wait_ms=%.3f start_ms=%.3f ok=%d w=%u h=%u fmt=%c%c%c%c\n",
@@ -431,19 +441,8 @@ void recorder_worker(UiContext *ctx) {
                      (camera_pixfmt >> 16) & 0xFF,
                      (camera_pixfmt >> 24) & 0xFF);
             if (!started) {
-                std::fprintf(stderr, "[record] failed to start recorder\n");
-                continue;
-            }
-            const auto recording_started_at = std::chrono::system_clock::now();
-            std::string recording_error;
-            auto recording_id = ctx->event_processor
-                ? ctx->event_processor->register_started_recording(
-                      recording_started_at, &recording_error)
-                : std::nullopt;
-            if (!recording_id) {
-                ctx->recorder.stop();
                 std::fprintf(stderr,
-                             "[record] SQLite recording insert failed; recorder stopped error=%s\n",
+                             "[record] failed to start recorder error=%s\n",
                              recording_error.c_str());
                 continue;
             }
@@ -453,9 +452,8 @@ void recorder_worker(UiContext *ctx) {
             std::fprintf(stdout, "[record] start %s\n", ctx->recorder.last_file().c_str());
             {
                 std::lock_guard<std::mutex> lock(ctx->record_mtx);
-                ctx->current_record_clip_ref = selected_clip_ref;
                 ctx->current_recording_id = *recording_id;
-                ctx->current_recording_started_at = recording_started_at;
+                ctx->current_recording_last_segment_ended_at = {};
             }
             ctx->record_cv.notify_all();
         }

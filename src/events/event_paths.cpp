@@ -137,6 +137,15 @@ std::string clip_relative_path(std::chrono::system_clock::time_point at, uint64_
     return "clips/" + parts.date + "/" + name.str();
 }
 
+std::string recording_segment_relative_path(
+    std::chrono::system_clock::time_point recording_started_at,
+    uint32_t segment_index) {
+    std::ostringstream name;
+    name << timestamp_name(recording_started_at) << '-'
+         << std::setw(6) << std::setfill('0') << segment_index << ".mp4";
+    return clip_directory_relative_path(recording_started_at) + "/" + name.str();
+}
+
 bool is_canonical_clip_ref(const std::string &value) {
     static const std::regex pattern(R"(^clips/[0-9]{8}/[^/\\]+\.mp4$)");
     if (!std::regex_match(value, pattern)) return false;

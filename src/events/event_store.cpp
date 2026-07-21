@@ -368,6 +368,116 @@ WHERE recording_id=? AND status='recording'
     return true;
 }
 
+bool EventStore::append_recording_segment(
+    const std::string &recording_id,
+    const std::string &segment_id,
+    int segment_index,
+    const std::string &clip_ref,
+    std::chrono::system_clock::time_point started_at,
+    std::chrono::system_clock::time_point ended_at,
+    int64_t media_duration_ms,
+    int64_t size_bytes,
+    const std::string &sha256,
+    std::string *error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_ || !exec_sql(db_, "BEGIN IMMEDIATE", error)) return false;
+    bool committed = false;
+    auto rollback = [&] {
+        if (!committed) sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    };
+    const int64_t started_at_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(started_at.time_since_epoch()).count();
+    const int64_t ended_at_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(ended_at.time_since_epoch()).count();
+
+    sqlite3_stmt *segment = nullptr;
+    const char *segment_sql = R"SQL(
+INSERT INTO recording_segments(
+    segment_id, recording_id, segment_index, clip_ref, started_at_ms, ended_at_ms,
+    media_duration_ms, size_bytes, sha256)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+)SQL";
+    if (sqlite3_prepare_v2(db_, segment_sql, -1, &segment, nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare recording segment insert failed");
+        rollback();
+        return false;
+    }
+    sqlite3_bind_text(segment, 1, segment_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(segment, 2, recording_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(segment, 3, segment_index);
+    sqlite3_bind_text(segment, 4, clip_ref.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(segment, 5, started_at_ms);
+    sqlite3_bind_int64(segment, 6, ended_at_ms);
+    sqlite3_bind_int64(segment, 7, media_duration_ms);
+    sqlite3_bind_int64(segment, 8, size_bytes);
+    sqlite3_bind_text(segment, 9, sha256.c_str(), -1, SQLITE_TRANSIENT);
+    const bool segment_ok = sqlite3_step(segment) == SQLITE_DONE;
+    sqlite3_finalize(segment);
+    if (!segment_ok) {
+        set_error(error, db_, "insert recording segment failed");
+        rollback();
+        return false;
+    }
+
+    sqlite3_stmt *recording = nullptr;
+    const char *recording_sql = R"SQL(
+UPDATE recordings
+SET segment_count=segment_count+1,
+    total_media_duration_ms=total_media_duration_ms+?
+WHERE recording_id=? AND status='recording'
+)SQL";
+    if (sqlite3_prepare_v2(db_, recording_sql, -1, &recording, nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare recording segment accounting failed");
+        rollback();
+        return false;
+    }
+    sqlite3_bind_int64(recording, 1, media_duration_ms);
+    sqlite3_bind_text(recording, 2, recording_id.c_str(), -1, SQLITE_TRANSIENT);
+    const bool recording_ok = sqlite3_step(recording) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    sqlite3_finalize(recording);
+    if (!recording_ok || !exec_sql(db_, "COMMIT", error)) {
+        if (recording_ok) set_error(error, db_, "commit recording segment failed");
+        rollback();
+        return false;
+    }
+    committed = true;
+    return true;
+}
+
+bool EventStore::finalize_recording(
+    const std::string &recording_id,
+    std::chrono::system_clock::time_point ended_at,
+    const std::string &status,
+    std::string *error) {
+    if (status != "finalized" && status != "interrupted" && status != "failed") {
+        if (error) *error = "invalid terminal recording status";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) {
+        if (error) *error = "event database is not open";
+        return false;
+    }
+    const int64_t ended_at_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(ended_at.time_since_epoch()).count();
+    sqlite3_stmt *recording = nullptr;
+    const char *sql = R"SQL(
+UPDATE recordings SET status=?, ended_at_ms=?
+WHERE recording_id=? AND status='recording'
+)SQL";
+    if (sqlite3_prepare_v2(db_, sql, -1, &recording, nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare recording finalization failed");
+        return false;
+    }
+    sqlite3_bind_text(recording, 1, status.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(recording, 2, ended_at_ms);
+    sqlite3_bind_text(recording, 3, recording_id.c_str(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(recording) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    if (!ok) set_error(error, db_, "finalize recording failed");
+    sqlite3_finalize(recording);
+    return ok;
+}
+
 std::optional<std::string> EventStore::allocate_clip_ref(
     std::chrono::system_clock::time_point at,
     const std::string &media_root,

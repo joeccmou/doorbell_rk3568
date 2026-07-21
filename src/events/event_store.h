@@ -34,6 +34,24 @@ public:
         std::chrono::system_clock::time_point started_at,
         std::string *error = nullptr);
 
+    bool append_recording_segment(
+        const std::string &recording_id,
+        const std::string &segment_id,
+        int segment_index,
+        const std::string &clip_ref,
+        std::chrono::system_clock::time_point started_at,
+        std::chrono::system_clock::time_point ended_at,
+        int64_t media_duration_ms,
+        int64_t size_bytes,
+        const std::string &sha256,
+        std::string *error = nullptr);
+
+    bool finalize_recording(
+        const std::string &recording_id,
+        std::chrono::system_clock::time_point ended_at,
+        const std::string &status,
+        std::string *error = nullptr);
+
     bool complete_recording(
         const std::string &recording_id,
         const std::string &segment_id,
