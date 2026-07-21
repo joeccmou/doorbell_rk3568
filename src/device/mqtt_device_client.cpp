@@ -346,6 +346,21 @@ void MqttDeviceClient::mqtt_loop() {
                 }
             }
             if (ok) {
+                int report_ack_subscription_id = 0;
+                sub_rc = mosquitto_subscribe(
+                    client, &report_ack_subscription_id, report_ack_topic().c_str(), 1);
+                if (sub_rc != MOSQ_ERR_SUCCESS) {
+                    std::fprintf(stderr,
+                                 "[mqtt] subscribe report_ack failed topic=%s rc=%d error=%s\n",
+                                 report_ack_topic().c_str(),
+                                 sub_rc,
+                                 mosquitto_strerror(sub_rc));
+                    ok = false;
+                } else {
+                    connect_state.handshake.expect_subscription(report_ack_subscription_id);
+                }
+            }
+            if (ok) {
                 ok = wait_for_mqtt_condition(
                     client,
                     &connect_state,
@@ -354,9 +369,10 @@ void MqttDeviceClient::mqtt_loop() {
                     5000);
                 if (ok) {
                     std::fprintf(stdout,
-                                 "[mqtt] subscriptions acknowledged command=%s signal=%s\n",
+                                 "[mqtt] subscriptions acknowledged command=%s signal=%s report_ack=%s\n",
                                  command_topic().c_str(),
-                                 signal_topic().c_str());
+                                 signal_topic().c_str(),
+                                 report_ack_topic().c_str());
                 }
             }
             if (ok) {
@@ -440,6 +456,10 @@ void MqttDeviceClient::handle_message(const struct mosquitto_message *msg) {
     }
     if (topic == command_topic()) {
         if (callbacks_.command_handler) callbacks_.command_handler(body);
+        return;
+    }
+    if (topic == report_ack_topic()) {
+        if (callbacks_.report_ack_handler) callbacks_.report_ack_handler(body);
     }
 }
 
@@ -539,6 +559,10 @@ std::string MqttDeviceClient::media_state_topic() const {
 
 std::string MqttDeviceClient::event_topic() const {
     return "doorbell/devices/" + device_id_ + "/event";
+}
+
+std::string MqttDeviceClient::report_ack_topic() const {
+    return "doorbell/devices/" + device_id_ + "/report_ack";
 }
 
 std::string MqttDeviceClient::time_sync_topic() const {

@@ -11,6 +11,7 @@ int main() {
     using BeginSignature = std::optional<EventRecord> (DeviceEventProcessor::*)(
         double,
         std::chrono::system_clock::time_point,
+        const std::string &,
         std::string *);
     using SubmitSignature = void (DeviceEventProcessor::*)(
         EventRecord,
@@ -20,10 +21,8 @@ int main() {
     using AllocateSignature = std::optional<std::string> (DeviceEventProcessor::*)(
         std::chrono::system_clock::time_point,
         std::string *);
-    using BeginWithClipSignature = std::optional<EventRecord> (DeviceEventProcessor::*)(
-        double,
+    using RegisterRecordingSignature = std::optional<std::string> (DeviceEventProcessor::*)(
         std::chrono::system_clock::time_point,
-        const std::string &,
         std::string *);
 
     static_assert(std::is_same_v<
@@ -36,7 +35,7 @@ int main() {
                   decltype(&DeviceEventProcessor::allocate_recording_clip),
                   AllocateSignature>);
     static_assert(std::is_same_v<
-                  decltype(&DeviceEventProcessor::begin_person_event_with_clip),
-                  BeginWithClipSignature>);
+                  decltype(&DeviceEventProcessor::register_started_recording),
+                  RegisterRecordingSignature>);
     return 0;
 }

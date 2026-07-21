@@ -1,32 +1,34 @@
 #include "events/person_event_gate.h"
 
-PersonEventGate::PersonEventGate(std::chrono::steady_clock::duration cooldown)
-    : cooldown_(cooldown) {}
+PersonEventGate::PersonEventGate(std::chrono::steady_clock::duration absence_rearm_duration)
+    : absence_rearm_duration_(absence_rearm_duration) {}
 
 bool PersonEventGate::update(bool has_person, std::chrono::steady_clock::time_point now) {
+    if (!has_active_appearance_) {
+        if (!has_person) return false;
+
+        has_active_appearance_ = true;
+        absence_pending_ = false;
+        return true;
+    }
+
     if (!has_person) {
-        person_present_ = false;
-        appearance_pending_ = false;
+        if (!absence_pending_) {
+            absence_started_at_ = now;
+            absence_pending_ = true;
+        }
         return false;
     }
 
-    if (!person_present_) {
-        person_present_ = true;
-        appearance_pending_ = true;
-    }
+    if (!absence_pending_) return false;
 
-    if (!appearance_pending_) return false;
-    if (has_last_event_ && now - last_event_at_ < cooldown_) return false;
-
-    last_event_at_ = now;
-    has_last_event_ = true;
-    appearance_pending_ = false;
-    return true;
+    const bool absence_confirmed = now - absence_started_at_ >= absence_rearm_duration_;
+    absence_pending_ = false;
+    return absence_confirmed;
 }
 
 void PersonEventGate::reset() {
-    last_event_at_ = {};
-    has_last_event_ = false;
-    person_present_ = false;
-    appearance_pending_ = false;
+    absence_started_at_ = {};
+    has_active_appearance_ = false;
+    absence_pending_ = false;
 }

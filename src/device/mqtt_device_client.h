@@ -17,6 +17,7 @@ public:
     struct Callbacks {
         std::function<void(const std::string &payload)> command_handler;
         std::function<void(const std::string &payload)> signal_handler;
+        std::function<void(const std::string &payload)> report_ack_handler;
         std::function<bool(std::chrono::milliseconds duration)> wait_for_stop;
         std::function<bool()> should_stop;
         std::function<void()> on_connecting;
@@ -76,6 +77,7 @@ private:
     std::string signal_topic() const;
     std::string media_state_topic() const;
     std::string event_topic() const;
+    std::string report_ack_topic() const;
     std::string time_sync_topic() const;
     std::string capabilities_topic() const;
 

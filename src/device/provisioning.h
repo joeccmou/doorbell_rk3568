@@ -36,6 +36,15 @@ public:
     const std::string &device_id() const { return identity_.device_id; }
     const std::string &device_secret() const { return identity_.device_secret; }
     bool publish_event(const std::string &payload);
+    bool publish_command_ack(const std::string &trace_id,
+                             const std::string &cmd_id,
+                             bool ok,
+                             const std::string &error_code,
+                             const std::string &data_json);
+    using EventReportAckHandler = std::function<void(const std::string &)>;
+    void set_event_report_ack_handler(EventReportAckHandler handler);
+    using EventMediaCommandHandler = std::function<bool(const std::string &)>;
+    void set_event_media_command_handler(EventMediaCommandHandler handler);
     using PersonSettingsHandler = std::function<bool(bool, const std::string &)>;
     using ImageRotateHandler = std::function<bool(bool)>;
     void set_settings_apply_handlers(PersonSettingsHandler person_handler,
@@ -164,6 +173,9 @@ private:
     PersonSettingsHandler person_settings_handler_;
     ImageRotateHandler image_rotate_handler_;
     std::atomic<bool> status_led_enabled_{true};
+    mutable std::mutex event_handler_mtx_;
+    EventReportAckHandler event_report_ack_handler_;
+    EventMediaCommandHandler event_media_command_handler_;
 
     GpioLine button_gpio_;
 

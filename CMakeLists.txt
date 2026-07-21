@@ -156,11 +156,13 @@ add_executable(doorbell
     src/events/event_paths.cpp
     src/events/event_store.cpp
     src/events/http_snapshot_uploader.cpp
+    src/events/http_clip_uploader.cpp
     src/events/person_event_gate.cpp
     src/events/snapshot_candidate_selector.cpp
     src/events/snapshot_service.cpp
 	src/ui/settings.cpp
     src/utils/file_utils.cpp
+    src/utils/file_sha256.cpp
     src/utils/image_utils.cpp
     src/utils/audio_capture_manager.cpp
     src/utils/image_drawing.c

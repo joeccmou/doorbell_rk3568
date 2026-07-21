@@ -39,6 +39,7 @@
 #include "utils/mp4_recorder.h"
 #include "utils/audio_capture_manager.h"
 #include "utils/perf_logger.h"
+#include "utils/file_sha256.h"
 #include "utils/image_utils.h"
 #include "utils/image_drawing.h"
 
@@ -120,9 +121,9 @@ struct UiContext {
     Mp4Recorder recorder;
     AudioCaptureManager audio_capture;
     std::string record_dir;
-    std::string pending_record_file;
-    std::string pending_record_clip_ref;
     std::string current_record_clip_ref;
+    std::string current_recording_id;
+    std::chrono::system_clock::time_point current_recording_started_at{};
     // SDL_Window *sdl_window = nullptr;
 };
 
@@ -185,31 +186,46 @@ void inference_worker(UiContext *ctx) {
                  boxes.size());
         const auto selection_now = std::chrono::steady_clock::now();
         const bool create_event = ctx->person_event_gate.update(has_person, selection_now);
+        if (has_person) {
+            {
+                std::lock_guard<std::mutex> guard(ctx->detect_mtx);
+                ctx->last_person_ts_ns = frame.ts_ns;
+            }
+            {
+                std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
+                ++ctx->record_frame_gen;
+            }
+            ctx->record_cv.notify_all();
+        }
         if (create_event && ctx->event_processor) {
             double confidence = 0.0;
             for (const auto &box : boxes) confidence = std::max(confidence, static_cast<double>(box.score));
-            std::string existing_clip_ref;
+            std::string recording_id;
             {
-                std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
-                existing_clip_ref = !ctx->current_record_clip_ref.empty()
-                    ? ctx->current_record_clip_ref
-                    : ctx->pending_record_clip_ref;
+                std::unique_lock<std::mutex> record_lock(ctx->record_mtx);
+                ctx->record_cv.wait_for(
+                    record_lock,
+                    std::chrono::seconds(3),
+                    [ctx] { return !ctx->current_recording_id.empty() || g_stop.load(); });
+                recording_id = ctx->current_recording_id;
             }
-            std::string error;
-            auto event = ctx->event_processor->begin_person_event_with_clip(
-                confidence, std::chrono::system_clock::now(), existing_clip_ref, &error);
-            if (!event) {
-                std::fprintf(stderr, "[event] persist person event failed error=%s\n", error.c_str());
+            if (recording_id.empty()) {
+                std::fprintf(stderr, "[event] skip person event because recorder did not start\n");
+                ctx->person_event_gate.reset();
             } else {
-                std::fprintf(stdout, "[event] created person event_id=%s\n", event->event_id.c_str());
-                ctx->pending_person_event = *event;
-                ctx->snapshot_candidate_selector.start(selection_now);
-                if (!event->clip_ref.empty()) {
-                    std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
-                    if (ctx->current_record_clip_ref.empty() && ctx->pending_record_clip_ref.empty()) {
-                        ctx->pending_record_clip_ref = event->clip_ref;
-                        ctx->pending_record_file = ctx->record_dir + "/" + event->clip_ref;
-                    }
+                std::string error;
+                auto event = ctx->event_processor->begin_person_event(
+                    confidence, std::chrono::system_clock::now(), recording_id, &error);
+                if (!event) {
+                    std::fprintf(stderr, "[event] persist person event failed error=%s\n", error.c_str());
+                    ctx->person_event_gate.reset();
+                } else {
+                    std::fprintf(stdout,
+                                 "[event] created person event_id=%s recording_id=%s\n",
+                                 event->event_id.c_str(),
+                                 event->recording_id.c_str());
+                    ctx->pending_person_event = *event;
+                    ctx->snapshot_candidate_selector.start(selection_now);
                 }
             }
         }
@@ -243,7 +259,6 @@ void inference_worker(UiContext *ctx) {
             if (has_person) {
                 ctx->latest_boxes = std::move(boxes);
                 ctx->latest_boxes_ts_ns = frame.ts_ns;
-                ctx->last_person_ts_ns = frame.ts_ns;
             } else {
                 ctx->latest_boxes.clear();
                 ctx->latest_boxes_ts_ns = 0;
@@ -268,6 +283,57 @@ void recorder_worker(UiContext *ctx) {
         std::lock_guard<std::mutex> lock(ctx->record_mtx);
         consumed_frame_gen = ctx->record_frame_gen;
     }
+
+    auto finalize_recording = [ctx](const std::string &status) {
+        std::string recording_id;
+        std::string clip_ref;
+        std::chrono::system_clock::time_point started_at;
+        {
+            std::lock_guard<std::mutex> lock(ctx->record_mtx);
+            recording_id = ctx->current_recording_id;
+            clip_ref = ctx->current_record_clip_ref;
+            started_at = ctx->current_recording_started_at;
+            ctx->current_recording_id.clear();
+            ctx->current_record_clip_ref.clear();
+            ctx->current_recording_started_at = {};
+        }
+        ctx->record_cv.notify_all();
+        if (recording_id.empty() || clip_ref.empty() || !ctx->event_processor) return;
+        const auto ended_at = std::chrono::system_clock::now();
+        const int64_t duration_ms = std::max<int64_t>(
+            0,
+            std::chrono::duration_cast<std::chrono::milliseconds>(ended_at - started_at).count());
+        std::error_code ec;
+        const int64_t size_bytes = static_cast<int64_t>(
+            std::filesystem::file_size(std::filesystem::path(ctx->record_dir) / clip_ref, ec));
+        std::string error;
+        std::string sha256;
+        if (ec || !file_sha256(
+                      (std::filesystem::path(ctx->record_dir) / clip_ref).string(),
+                      &sha256,
+                      &error)) {
+            std::fprintf(stderr,
+                         "[record] calculate sha256 failed recording_id=%s error=%s\n",
+                         recording_id.c_str(),
+                         error.c_str());
+            return;
+        }
+        if (!ctx->event_processor->complete_recording(
+                recording_id,
+                clip_ref,
+                started_at,
+                ended_at,
+                duration_ms,
+                size_bytes,
+                sha256,
+                status,
+                &error)) {
+            std::fprintf(stderr,
+                         "[record] persist completion failed recording_id=%s error=%s\n",
+                         recording_id.c_str(),
+                         error.c_str());
+        }
+    };
 
     while (!g_stop.load()) {
         uint64_t wait_begin_ns = monotonic_time_ns();
@@ -298,6 +364,7 @@ void recorder_worker(UiContext *ctx) {
                 std::fprintf(stdout, "[record] stop %s\n", ctx->recorder.last_file().c_str());
                 uint64_t stop_begin_ns = monotonic_time_ns();
                 ctx->recorder.stop();
+                finalize_recording("finalized");
                 uint64_t stop_end_ns = monotonic_time_ns();
                 perf_log("record stop ts_ns=%llu stop_ms=%.3f reason=no_want\n",
                          static_cast<unsigned long long>(stop_end_ns),
@@ -305,8 +372,6 @@ void recorder_worker(UiContext *ctx) {
                 running_width = 0;
                 running_height = 0;
                 last_written_ts_ns = 0;
-                std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
-                ctx->current_record_clip_ref.clear();
             }
             continue;
         }
@@ -329,37 +394,31 @@ void recorder_worker(UiContext *ctx) {
                 std::fprintf(stdout, "[record] restart on resolution change\n");
                 uint64_t stop_begin_ns = monotonic_time_ns();
                 ctx->recorder.stop();
+                finalize_recording("interrupted");
                 uint64_t stop_end_ns = monotonic_time_ns();
                 perf_log("record stop ts_ns=%llu stop_ms=%.3f reason=resolution_change\n",
                          static_cast<unsigned long long>(stop_end_ns),
                          static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
-                std::lock_guard<std::mutex> record_lock(ctx->record_mtx);
-                ctx->current_record_clip_ref.clear();
             }
             uint64_t start_begin_ns = monotonic_time_ns();
 			std::string output_file;
 			std::string selected_clip_ref;
-			{
-				std::lock_guard<std::mutex> lock(ctx->record_mtx);
-				output_file = ctx->pending_record_file;
-				selected_clip_ref = ctx->pending_record_clip_ref;
-			}
 			bool started = false;
-			if (!output_file.empty()) {
-				started = ctx->recorder.start_file(output_file, camera_width, camera_height, kRecordFpsLimit, camera_pixfmt);
-			} else {
-				std::string allocation_error;
-				auto clip_ref = ctx->event_processor
-				    ? ctx->event_processor->allocate_recording_clip(std::chrono::system_clock::now(), &allocation_error)
-				    : std::nullopt;
-				if (clip_ref) {
-					selected_clip_ref = *clip_ref;
-					output_file = ctx->record_dir + "/" + *clip_ref;
-					started = ctx->recorder.start_file(output_file, camera_width, camera_height, kRecordFpsLimit, camera_pixfmt);
-				} else {
-					std::fprintf(stderr, "[record] allocate daily clip failed error=%s\n", allocation_error.c_str());
-				}
-			}
+            std::string allocation_error;
+            auto clip_ref = ctx->event_processor
+                ? ctx->event_processor->allocate_recording_clip(
+                      std::chrono::system_clock::now(), &allocation_error)
+                : std::nullopt;
+            if (clip_ref) {
+                selected_clip_ref = *clip_ref;
+                output_file = ctx->record_dir + "/" + *clip_ref;
+                started = ctx->recorder.start_file(
+                    output_file, camera_width, camera_height, kRecordFpsLimit, camera_pixfmt);
+            } else {
+                std::fprintf(stderr,
+                             "[record] allocate daily clip failed error=%s\n",
+                             allocation_error.c_str());
+            }
             uint64_t start_end_ns = monotonic_time_ns();
             perf_log("record start wait_ms=%.3f start_ms=%.3f ok=%d w=%u h=%u fmt=%c%c%c%c\n",
                      wait_ms,
@@ -375,6 +434,19 @@ void recorder_worker(UiContext *ctx) {
                 std::fprintf(stderr, "[record] failed to start recorder\n");
                 continue;
             }
+            const auto recording_started_at = std::chrono::system_clock::now();
+            std::string recording_error;
+            auto recording_id = ctx->event_processor
+                ? ctx->event_processor->register_started_recording(
+                      recording_started_at, &recording_error)
+                : std::nullopt;
+            if (!recording_id) {
+                ctx->recorder.stop();
+                std::fprintf(stderr,
+                             "[record] SQLite recording insert failed; recorder stopped error=%s\n",
+                             recording_error.c_str());
+                continue;
+            }
             running_width = camera_width;
             running_height = camera_height;
             last_written_ts_ns = 0;
@@ -382,11 +454,10 @@ void recorder_worker(UiContext *ctx) {
             {
                 std::lock_guard<std::mutex> lock(ctx->record_mtx);
                 ctx->current_record_clip_ref = selected_clip_ref;
-                if (ctx->pending_record_clip_ref == selected_clip_ref) {
-                    ctx->pending_record_clip_ref.clear();
-                    ctx->pending_record_file.clear();
-                }
+                ctx->current_recording_id = *recording_id;
+                ctx->current_recording_started_at = recording_started_at;
             }
+            ctx->record_cv.notify_all();
         }
 
         FramePacket frame;
@@ -470,6 +541,7 @@ void recorder_worker(UiContext *ctx) {
             std::fprintf(stderr, "[record] write_frame failed, stopping recorder\n");
             uint64_t stop_begin_ns = monotonic_time_ns();
             ctx->recorder.stop();
+            finalize_recording("interrupted");
             uint64_t stop_end_ns = monotonic_time_ns();
             perf_log("record stop ts_ns=%llu stop_ms=%.3f reason=write_fail\n",
                      static_cast<unsigned long long>(stop_end_ns),
@@ -483,6 +555,7 @@ void recorder_worker(UiContext *ctx) {
         std::fprintf(stdout, "[record] stop %s\n", ctx->recorder.last_file().c_str());
         uint64_t stop_begin_ns = monotonic_time_ns();
         ctx->recorder.stop();
+        finalize_recording("interrupted");
         uint64_t stop_end_ns = monotonic_time_ns();
         perf_log("record stop ts_ns=%llu stop_ms=%.3f reason=thread_exit\n",
                  static_cast<unsigned long long>(stop_end_ns),
@@ -979,6 +1052,25 @@ int main(int argc, char **argv) {
         if (!ctx.event_processor->start(&event_error)) {
             std::fprintf(stderr, "[event] processor disabled error=%s\n", event_error.c_str());
             ctx.event_processor.reset();
+        } else {
+            provisioning.set_event_report_ack_handler([&ctx](const std::string &payload) {
+                if (ctx.event_processor) ctx.event_processor->handle_report_ack(payload);
+            });
+            provisioning.set_event_media_command_handler(
+                [&ctx, &provisioning](const std::string &payload) {
+                    if (!ctx.event_processor) return false;
+                    return ctx.event_processor->handle_media_command(
+                        payload,
+                        [&provisioning](
+                            const std::string &trace_id,
+                            const std::string &cmd_id,
+                            bool ok,
+                            const std::string &error_code,
+                            const std::string &data_json) {
+                            return provisioning.publish_command_ack(
+                                trace_id, cmd_id, ok, error_code, data_json);
+                        });
+                });
         }
     }
 
@@ -1035,6 +1127,8 @@ int main(int argc, char **argv) {
     if (ctx.record_thread.joinable()) {
         ctx.record_thread.join();
     }
+    provisioning.set_event_report_ack_handler({});
+    provisioning.set_event_media_command_handler({});
     if (ctx.event_processor) ctx.event_processor->stop();
     close_perf_log_file();
     provisioning.stop();

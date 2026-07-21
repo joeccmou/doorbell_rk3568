@@ -436,6 +436,25 @@ bool DoorbellProvisioning::publish_event(const std::string &payload) {
     return mqtt_client_ && mqtt_client_->publish_event(payload);
 }
 
+bool DoorbellProvisioning::publish_command_ack(const std::string &trace_id,
+                                               const std::string &cmd_id,
+                                               bool ok,
+                                               const std::string &error_code,
+                                               const std::string &data_json) {
+    return mqtt_client_ &&
+           mqtt_client_->publish_command_ack(trace_id, cmd_id, ok, error_code, data_json);
+}
+
+void DoorbellProvisioning::set_event_report_ack_handler(EventReportAckHandler handler) {
+    std::lock_guard<std::mutex> lock(event_handler_mtx_);
+    event_report_ack_handler_ = std::move(handler);
+}
+
+void DoorbellProvisioning::set_event_media_command_handler(EventMediaCommandHandler handler) {
+    std::lock_guard<std::mutex> lock(event_handler_mtx_);
+    event_media_command_handler_ = std::move(handler);
+}
+
 bool DoorbellProvisioning::start() {
     if (!ensure_dir(data_dir_)) {
         std::fprintf(stderr, "[provision] failed to create data dir: %s\n", data_dir_.c_str());
@@ -517,6 +536,14 @@ bool DoorbellProvisioning::start() {
             live_view_session_->handle_signal(payload);
         }
     };
+    mqtt_callbacks.report_ack_handler = [this](const std::string &payload) {
+        EventReportAckHandler handler;
+        {
+            std::lock_guard<std::mutex> lock(event_handler_mtx_);
+            handler = event_report_ack_handler_;
+        }
+        if (handler) handler(payload);
+    };
     mqtt_callbacks.wait_for_stop = [this](std::chrono::milliseconds duration) {
         return wait_for_stop_or(duration);
     };
@@ -571,6 +598,13 @@ void DoorbellProvisioning::stop() {
 }
 
 void DoorbellProvisioning::handle_mqtt_command(const std::string &payload) {
+    EventMediaCommandHandler media_handler;
+    {
+        std::lock_guard<std::mutex> lock(event_handler_mtx_);
+        media_handler = event_media_command_handler_;
+    }
+    if (media_handler && media_handler(payload)) return;
+
     const auto command = parse_device_settings_command(payload);
     if (command.type == DeviceSettingsCommandType::None) {
         if (live_view_session_) live_view_session_->handle_command(payload);
