@@ -185,6 +185,10 @@ bool MqttDeviceClient::publish_event(const std::string &payload) {
     return publish_payload(event_topic(), payload, 1, false);
 }
 
+bool MqttDeviceClient::publish_ring_press(const std::string &payload) {
+    return publish_payload(ring_press_topic(), payload, 1, false);
+}
+
 bool MqttDeviceClient::publish_time_sync(const std::string &payload) {
     return publish_payload(time_sync_topic(), payload, 1, true);
 }
@@ -559,6 +563,10 @@ std::string MqttDeviceClient::media_state_topic() const {
 
 std::string MqttDeviceClient::event_topic() const {
     return "doorbell/devices/" + device_id_ + "/event";
+}
+
+std::string MqttDeviceClient::ring_press_topic() const {
+    return "doorbell/devices/" + device_id_ + "/ring_press";
 }
 
 std::string MqttDeviceClient::report_ack_topic() const {

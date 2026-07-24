@@ -46,6 +46,7 @@ public:
     bool publish_signal(const std::string &payload);
     bool publish_media_state(const std::string &payload);
     bool publish_event(const std::string &payload);
+    bool publish_ring_press(const std::string &payload);
     bool publish_time_sync(const std::string &payload);
     bool publish_capabilities(const std::string &payload);
     bool publish_command_ack(const std::string &trace_id,
@@ -77,6 +78,7 @@ private:
     std::string signal_topic() const;
     std::string media_state_topic() const;
     std::string event_topic() const;
+    std::string ring_press_topic() const;
     std::string report_ack_topic() const;
     std::string time_sync_topic() const;
     std::string capabilities_topic() const;

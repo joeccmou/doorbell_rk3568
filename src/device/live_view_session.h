@@ -59,6 +59,7 @@ private:
                                                                const nlohmann::json &command);
 
     std::string device_id_;
+    std::string current_mode_ = "live_view";
     Publishers publishers_;
     std::unique_ptr<RtcBackend> backend_;
 };

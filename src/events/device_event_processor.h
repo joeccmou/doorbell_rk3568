@@ -23,6 +23,10 @@
 class DeviceEventProcessor {
 public:
     using Publisher = std::function<bool(const std::string &payload)>;
+    using RingPublisher = std::function<bool(const std::string &payload)>;
+    using RingLifecycleHandler = std::function<void(
+        const std::string &event_id,
+        const std::string &state)>;
     using CommandAckPublisher = std::function<bool(
         const std::string &trace_id,
         const std::string &cmd_id,
@@ -40,6 +44,13 @@ public:
 
     bool start(std::string *error = nullptr);
     void stop();
+    void set_ring_publisher(RingPublisher publisher);
+    void set_ring_lifecycle_handler(RingLifecycleHandler handler);
+
+    std::optional<RingPressRecord> begin_ring_press(
+        std::chrono::system_clock::time_point at,
+        const std::string &recording_id,
+        std::string *error = nullptr);
 
     // 首次检测时先同步落 SQLite，事件时间不受后续选帧窗口影响。
     std::optional<EventRecord> begin_person_event(
@@ -50,6 +61,9 @@ public:
 
     // 录像管线启动成功后调用；生成不可变 recording_id 并写本地 SQLite。
     std::optional<std::string> register_started_recording(
+        std::chrono::system_clock::time_point started_at,
+        std::string *error = nullptr);
+    std::optional<std::string> register_failed_ring_recording(
         std::chrono::system_clock::time_point started_at,
         std::string *error = nullptr);
 
@@ -89,6 +103,7 @@ private:
     struct Job {
         enum class Kind {
             ReportEvent,
+            ReportRingPress,
             SaveSnapshot,
             PersistRecordingSegment,
             FinalizeRecording,
@@ -96,6 +111,7 @@ private:
 
         Kind kind = Kind::ReportEvent;
         EventRecord event;
+        RingPressRecord ring_press;
         std::vector<uint8_t> rgb;
         uint32_t width = 0;
         uint32_t height = 0;
@@ -112,11 +128,14 @@ private:
     void worker_loop();
     bool process(Job *job);
     void enqueue(Job job);
+    void expire_ring_if_needed(std::chrono::system_clock::time_point at);
 
     std::string device_id_;
     std::string data_dir_;
     std::string media_root_;
     Publisher publisher_;
+    RingPublisher ring_publisher_;
+    RingLifecycleHandler ring_lifecycle_handler_;
     EventStore store_;
     SnapshotService snapshots_;
     HttpSnapshotUploader uploader_;

@@ -411,6 +411,22 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/event_store_migration_tes
     add_test(NAME event_store_migration_test COMMAND event_store_migration_test)
 endif()
 
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/ring_restart_recovery_test.cpp")
+    add_executable(ring_restart_recovery_test
+        tests/ring_restart_recovery_test.cpp
+        src/events/event_store.cpp
+        src/events/event_paths.cpp
+    )
+    target_include_directories(
+        ring_restart_recovery_test
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${SQLITE3_INCLUDE_DIRS}
+    )
+    target_link_libraries(ring_restart_recovery_test PRIVATE ${SQLITE3_LIBRARIES})
+    add_test(NAME ring_restart_recovery_test COMMAND ring_restart_recovery_test)
+endif()
+
 if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/snapshot_candidate_selector_test.cpp")
     add_executable(snapshot_candidate_selector_test
         tests/snapshot_candidate_selector_test.cpp

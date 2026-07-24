@@ -53,6 +53,18 @@ DeviceEventProcessor::~DeviceEventProcessor() {
 bool DeviceEventProcessor::start(std::string *error) {
     if (worker_.joinable()) return true;
     if (!store_.open(data_dir_ + "/doorbell.db", error)) return false;
+    std::string recovered_ring_event_id;
+    if (!store_.recover_stale_accepted_ring(&recovered_ring_event_id, error)) {
+        store_.close();
+        return false;
+    }
+    if (!recovered_ring_event_id.empty()) {
+        std::fprintf(
+            stdout,
+            "[ring] startup recovered stale accepted event_id=%s state=ended "
+            "end_reason=media_failed recovery_reason=process_restart\n",
+            recovered_ring_event_id.c_str());
+    }
     std::error_code ec;
     std::filesystem::create_directories(media_root_ + "/snapshots", ec);
     std::filesystem::create_directories(media_root_ + "/clips", ec);
@@ -65,8 +77,52 @@ bool DeviceEventProcessor::start(std::string *error) {
         job.event = std::move(event);
         enqueue(std::move(job));
     }
+    for (auto &press : store_.pending_ring_presses(error)) {
+        Job job;
+        job.kind = Job::Kind::ReportRingPress;
+        job.ring_press = std::move(press);
+        enqueue(std::move(job));
+    }
     worker_ = std::thread(&DeviceEventProcessor::worker_loop, this);
     return true;
+}
+
+void DeviceEventProcessor::set_ring_publisher(RingPublisher publisher) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ring_publisher_ = std::move(publisher);
+}
+
+void DeviceEventProcessor::set_ring_lifecycle_handler(RingLifecycleHandler handler) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ring_lifecycle_handler_ = std::move(handler);
+}
+
+std::optional<RingPressRecord> DeviceEventProcessor::begin_ring_press(
+    std::chrono::system_clock::time_point at,
+    const std::string &recording_id,
+    std::string *error) {
+    expire_ring_if_needed(at);
+    auto press = store_.record_ring_press(
+        device_id_, recording_id, at, snapshot_relative_path(at), error);
+    if (!press) return std::nullopt;
+
+    Job job;
+    if (press->initial) {
+        job.kind = Job::Kind::ReportEvent;
+        job.event = press->event;
+    } else {
+        job.kind = Job::Kind::ReportRingPress;
+        job.ring_press = *press;
+    }
+    enqueue(std::move(job));
+
+    RingLifecycleHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        handler = ring_lifecycle_handler_;
+    }
+    if (handler) handler(press->event.event_id, press->ring_state);
+    return press;
 }
 
 void DeviceEventProcessor::stop() {
@@ -103,6 +159,20 @@ std::optional<std::string> DeviceEventProcessor::register_started_recording(
         std::chrono::duration_cast<std::chrono::milliseconds>(started_at.time_since_epoch()).count();
     const std::string recording_id = device_id_ + "-" + std::to_string(started_at_ms);
     if (!store_.begin_recording(recording_id, started_at, error)) return std::nullopt;
+    return recording_id;
+}
+
+std::optional<std::string> DeviceEventProcessor::register_failed_ring_recording(
+    std::chrono::system_clock::time_point started_at,
+    std::string *error) {
+    const int64_t started_at_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            started_at.time_since_epoch()).count();
+    const std::string recording_id = device_id_ + "-" + std::to_string(started_at_ms);
+    if (!store_.begin_recording(recording_id, started_at, error)) return std::nullopt;
+    if (!store_.finalize_recording(recording_id, started_at, "failed", error)) {
+        return std::nullopt;
+    }
     return recording_id;
 }
 
@@ -195,13 +265,15 @@ void DeviceEventProcessor::enqueue(Job job) {
 
 void DeviceEventProcessor::worker_loop() {
     while (!stop_.load()) {
+        expire_ring_if_needed(std::chrono::system_clock::now());
         Job job;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] {
+            cv_.wait_for(lock, std::chrono::seconds(1), [this] {
                 return stop_.load() || !recording_jobs_.empty() || !jobs_.empty();
             });
             if (stop_.load()) break;
+            if (recording_jobs_.empty() && jobs_.empty()) continue;
             if (!recording_jobs_.empty()) {
                 job = std::move(recording_jobs_.front());
                 recording_jobs_.pop_front();
@@ -219,6 +291,27 @@ void DeviceEventProcessor::worker_loop() {
             if (!stop_.load()) enqueue(std::move(job));
         }
     }
+}
+
+void DeviceEventProcessor::expire_ring_if_needed(
+    std::chrono::system_clock::time_point at) {
+    std::string error;
+    const auto event_id = store_.expire_open_ring(at, &error);
+    if (!event_id) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[ring] local expiry check failed error=%s\n", error.c_str());
+        }
+        return;
+    }
+    RingLifecycleHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        handler = ring_lifecycle_handler_;
+    }
+    if (handler) handler(*event_id, "ended");
+    std::fprintf(stdout,
+                 "[ring] local deadline ended event_id=%s\n",
+                 event_id->c_str());
 }
 
 bool DeviceEventProcessor::process(Job *job) {
@@ -341,6 +434,43 @@ bool DeviceEventProcessor::process(Job *job) {
         return true;
     }
 
+    if (job->kind == Job::Kind::ReportRingPress) {
+        RingPublisher publisher;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            publisher = ring_publisher_;
+        }
+        const nlohmann::json payload{
+            {"trace_id", "tr_ring_" + job->ring_press.event.event_id + "_" +
+                             std::to_string(job->ring_press.press_seq)},
+            {"device_id", job->ring_press.event.device_id},
+            {"event_id", job->ring_press.event.event_id},
+            {"press_seq", job->ring_press.press_seq},
+            {"pressed_at", iso_utc_millis(job->ring_press.pressed_at_ms)},
+            {"ts", iso_utc_millis(
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch()).count())},
+        };
+        if (!publisher || !publisher(payload.dump())) return false;
+        std::string error;
+        if (!store_.mark_ring_press_reported(
+                job->ring_press.event.event_id,
+                job->ring_press.press_seq,
+                &error)) {
+            std::fprintf(stderr,
+                         "[ring] persist ring_press PUBACK failed event_id=%s press_seq=%d error=%s\n",
+                         job->ring_press.event.event_id.c_str(),
+                         job->ring_press.press_seq,
+                         error.c_str());
+            return false;
+        }
+        std::fprintf(stdout,
+                     "[ring] published ring_press event_id=%s press_seq=%d\n",
+                     job->ring_press.event.event_id.c_str(),
+                     job->ring_press.press_seq);
+        return true;
+    }
+
     std::string state_error;
     const auto state = store_.report_state(job->event.event_id, &state_error);
     if (!state) {
@@ -423,6 +553,63 @@ bool DeviceEventProcessor::handle_media_command(
     try {
         const auto command = nlohmann::json::parse(payload);
         const std::string action = command.value("action", "");
+        if (action == "respond_ring" || action == "close_ring") {
+            const std::string trace_id = command.value("trace_id", "");
+            const std::string cmd_id = command.value("cmd_id", "");
+            const std::string call_id = command.value("call_id", "");
+            const auto params = command.value("params", nlohmann::json::object());
+            const std::string ring_event_id = params.value("ring_event_id", "");
+            const std::string event_id = params.value("event_id", "");
+            if (trace_id.empty() || cmd_id.empty() || event_id.empty() || !ack_publisher) {
+                std::fprintf(stderr,
+                             "[ring] invalid command action=%s trace_id=%s cmd_id=%s "
+                             "call_id=%s ring_event_id=%s event_id=%s error_code=INVALID_COMMAND\n",
+                             action.c_str(),
+                             trace_id.c_str(),
+                             cmd_id.c_str(),
+                             call_id.c_str(),
+                             ring_event_id.c_str(),
+                             event_id.c_str());
+                return true;
+            }
+            std::string state = "ringing";
+            if (action == "close_ring") {
+                state = "ended";
+            } else if (params.value("decision", "") == "answer") {
+                state = "accepted";
+            }
+            std::string error;
+            if (!store_.update_ring_state(event_id, state, &error)) {
+                ack_publisher(trace_id, cmd_id, false, "RING_STATE_STORE_FAILED", "{}");
+                std::fprintf(stderr,
+                             "[ring] update local state failed event_id=%s state=%s error=%s\n",
+                             event_id.c_str(),
+                             state.c_str(),
+                             error.c_str());
+                return true;
+            }
+            RingLifecycleHandler handler;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                handler = ring_lifecycle_handler_;
+            }
+            if (handler) handler(event_id, state);
+            ack_publisher(trace_id, cmd_id, true, "", "{}");
+            std::fprintf(stdout,
+                         "[ring] command applied action=%s trace_id=%s call_id=%s "
+                         "ring_event_id=%s event_id=%s decision=%s state=%s "
+                         "result=%s end_reason=%s\n",
+                         action.c_str(),
+                         trace_id.c_str(),
+                         call_id.c_str(),
+                         ring_event_id.c_str(),
+                         event_id.c_str(),
+                         params.value("decision", "").c_str(),
+                         state.c_str(),
+                         params.value("result", "").c_str(),
+                         params.value("end_reason", "").c_str());
+            return true;
+        }
         if (action != "query_snapshot" &&
             action != "query_recording_manifest" &&
             action != "prepare_recording_segment") {

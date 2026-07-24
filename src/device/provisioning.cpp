@@ -436,6 +436,10 @@ bool DoorbellProvisioning::publish_event(const std::string &payload) {
     return mqtt_client_ && mqtt_client_->publish_event(payload);
 }
 
+bool DoorbellProvisioning::publish_ring_press(const std::string &payload) {
+    return mqtt_client_ && mqtt_client_->publish_ring_press(payload);
+}
+
 bool DoorbellProvisioning::publish_command_ack(const std::string &trace_id,
                                                const std::string &cmd_id,
                                                bool ok,
@@ -453,6 +457,11 @@ void DoorbellProvisioning::set_event_report_ack_handler(EventReportAckHandler ha
 void DoorbellProvisioning::set_event_media_command_handler(EventMediaCommandHandler handler) {
     std::lock_guard<std::mutex> lock(event_handler_mtx_);
     event_media_command_handler_ = std::move(handler);
+}
+
+void DoorbellProvisioning::set_ring_button_handler(RingButtonHandler handler) {
+    std::lock_guard<std::mutex> lock(event_handler_mtx_);
+    ring_button_handler_ = std::move(handler);
 }
 
 bool DoorbellProvisioning::start() {
@@ -1330,7 +1339,17 @@ void DoorbellProvisioning::button_loop() {
             }
         }
         if (!pressed && was_pressed && !long_handled) {
-            std::fprintf(stdout, "[button] short press detected; ring event is not part of provisioning MVP\n");
+            RingButtonHandler handler;
+            {
+                std::lock_guard<std::mutex> lock(event_handler_mtx_);
+                handler = ring_button_handler_;
+            }
+            std::fprintf(stdout, "[button] short press detected\n");
+            if (handler) {
+                handler();
+            } else {
+                std::fprintf(stderr, "[button] ring handler is not ready\n");
+            }
         }
         was_pressed = pressed;
         wait_for_stop_or(std::chrono::milliseconds(100));

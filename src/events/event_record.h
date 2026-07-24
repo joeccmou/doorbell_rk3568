@@ -40,3 +40,11 @@ struct RecordingSegmentRecord {
     int64_t size_bytes = 0;
     std::string sha256;
 };
+
+struct RingPressRecord {
+    EventRecord event;
+    std::string ring_state;
+    int press_seq = 1;
+    int64_t pressed_at_ms = 0;
+    bool initial = false;
+};

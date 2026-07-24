@@ -81,7 +81,7 @@ void EventStore::close() {
 bool EventStore::initialize_schema(std::string *error) {
     int version = 0;
     if (!scalar_int(db_, "PRAGMA user_version", &version, error)) return false;
-    if (version != 0 && version != 3 && version != 4) {
+    if (version != 0 && version != 3 && version != 4 && version != 5) {
         if (error) {
             *error = "unsupported event database schema version: " + std::to_string(version) +
                      "; stop service and remove doorbell.db, doorbell.db-wal and doorbell.db-shm";
@@ -144,6 +144,26 @@ CREATE TABLE IF NOT EXISTS clip_daily_sequences (
 );
 CREATE INDEX IF NOT EXISTS idx_events_local_date
     ON events(occurred_local_date, at_ms DESC, event_id DESC);
+CREATE TABLE IF NOT EXISTS ring_events (
+    event_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    press_count INTEGER NOT NULL DEFAULT 1,
+    first_pressed_at_ms INTEGER NOT NULL,
+    last_pressed_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES events(event_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ring_events_one_active
+    ON ring_events((1)) WHERE state <> 'ended';
+CREATE TABLE IF NOT EXISTS ring_press_queue (
+    event_id TEXT NOT NULL,
+    press_seq INTEGER NOT NULL,
+    pressed_at_ms INTEGER NOT NULL,
+    reported INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(event_id, press_seq),
+    FOREIGN KEY(event_id) REFERENCES ring_events(event_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_ring_press_pending
+    ON ring_press_queue(reported, pressed_at_ms);
 )SQL";
     if (!exec_sql(db_, sql, error) || !migrate_schema(error)) return false;
     // 上次异常断电留下的 recording 不再伪装成“仍在录像”；保留事件并明确无可播放分片。
@@ -158,17 +178,20 @@ bool EventStore::migrate_schema(std::string *error) {
     int version = 0;
     if (!scalar_int(db_, "PRAGMA user_version", &version, error)) return false;
     if (version == 0) {
-        return exec_sql(db_, "PRAGMA user_version=4", error);
+        return exec_sql(db_, "PRAGMA user_version=5", error);
     }
     if (version == 3) {
         return exec_sql(
             db_,
             "ALTER TABLE recording_segments "
             "ADD COLUMN sha256 TEXT NOT NULL DEFAULT '';"
-            "PRAGMA user_version=4;",
+            "PRAGMA user_version=5;",
             error);
     }
-    return version == 4;
+    if (version == 4) {
+        return exec_sql(db_, "PRAGMA user_version=5", error);
+    }
+    return version == 5;
 }
 
 std::optional<EventRecord> EventStore::create_person_event(
@@ -251,6 +274,441 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
     }
     committed = true;
     return event;
+}
+
+std::optional<RingPressRecord> EventStore::record_ring_press(
+    const std::string &device_id,
+    const std::string &recording_id,
+    std::chrono::system_clock::time_point at,
+    const std::string &snapshot_path,
+    std::string *error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) {
+        if (error) *error = "event database is not open";
+        return std::nullopt;
+    }
+    if (!exec_sql(db_, "BEGIN IMMEDIATE", error)) return std::nullopt;
+    bool committed = false;
+    auto rollback = [&] {
+        if (!committed) sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    };
+    const int64_t at_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(at.time_since_epoch()).count();
+
+    sqlite3_stmt *active = nullptr;
+    const char *active_sql = R"SQL(
+SELECT e.event_id, e.device_id, e.recording_id, e.event_type, e.at_ms,
+       e.occurred_timezone, e.occurred_utc_offset_minutes, e.occurred_local_date,
+       e.snapshot_path, e.extra_json, e.reported, r.state, r.press_count
+FROM ring_events r
+JOIN events e ON e.event_id=r.event_id
+WHERE r.state <> 'ended'
+LIMIT 1
+)SQL";
+    if (sqlite3_prepare_v2(db_, active_sql, -1, &active, nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare active ring lookup failed");
+        rollback();
+        return std::nullopt;
+    }
+    if (sqlite3_step(active) == SQLITE_ROW) {
+        RingPressRecord press;
+        press.event.event_id = column_text(active, 0);
+        press.event.device_id = column_text(active, 1);
+        press.event.recording_id = column_text(active, 2);
+        press.event.type = column_text(active, 3);
+        press.event.at_ms = sqlite3_column_int64(active, 4);
+        press.event.occurred_timezone = column_text(active, 5);
+        press.event.occurred_utc_offset_minutes = sqlite3_column_int(active, 6);
+        press.event.occurred_local_date = column_text(active, 7);
+        press.event.snapshot_path = column_text(active, 8);
+        press.event.extra_json = column_text(active, 9);
+        press.event.reported = sqlite3_column_int(active, 10);
+        press.ring_state = column_text(active, 11);
+        press.press_seq = sqlite3_column_int(active, 12) + 1;
+        press.pressed_at_ms = at_ms;
+        press.initial = false;
+        sqlite3_finalize(active);
+
+        sqlite3_stmt *update = nullptr;
+        if (sqlite3_prepare_v2(
+                db_,
+                "UPDATE ring_events SET press_count=?, last_pressed_at_ms=? WHERE event_id=?",
+                -1,
+                &update,
+                nullptr) != SQLITE_OK) {
+            set_error(error, db_, "prepare ring press update failed");
+            rollback();
+            return std::nullopt;
+        }
+        sqlite3_bind_int(update, 1, press.press_seq);
+        sqlite3_bind_int64(update, 2, at_ms);
+        sqlite3_bind_text(update, 3, press.event.event_id.c_str(), -1, SQLITE_TRANSIENT);
+        const bool updated = sqlite3_step(update) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+        sqlite3_finalize(update);
+        if (!updated) {
+            set_error(error, db_, "update ring press failed");
+            rollback();
+            return std::nullopt;
+        }
+
+        sqlite3_stmt *queue = nullptr;
+        if (sqlite3_prepare_v2(
+                db_,
+                "INSERT INTO ring_press_queue(event_id,press_seq,pressed_at_ms,reported) "
+                "VALUES(?,?,?,0)",
+                -1,
+                &queue,
+                nullptr) != SQLITE_OK) {
+            set_error(error, db_, "prepare ring press queue insert failed");
+            rollback();
+            return std::nullopt;
+        }
+        sqlite3_bind_text(queue, 1, press.event.event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(queue, 2, press.press_seq);
+        sqlite3_bind_int64(queue, 3, at_ms);
+        const bool queued = sqlite3_step(queue) == SQLITE_DONE;
+        sqlite3_finalize(queue);
+        if (!queued || !exec_sql(db_, "COMMIT", error)) {
+            set_error(error, db_, "queue ring press failed");
+            rollback();
+            return std::nullopt;
+        }
+        committed = true;
+        return press;
+    }
+    sqlite3_finalize(active);
+
+    if (recording_id.empty()) {
+        if (error) *error = "ring recording_id is empty";
+        rollback();
+        return std::nullopt;
+    }
+    if (!exec_sql(db_, "UPDATE event_meta SET value=value+1 WHERE key='event_sequence'", error)) {
+        rollback();
+        return std::nullopt;
+    }
+    sqlite3_stmt *sequence_statement = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT value FROM event_meta WHERE key='event_sequence'",
+            -1,
+            &sequence_statement,
+            nullptr) != SQLITE_OK ||
+        sqlite3_step(sequence_statement) != SQLITE_ROW) {
+        set_error(error, db_, "read event sequence failed");
+        sqlite3_finalize(sequence_statement);
+        rollback();
+        return std::nullopt;
+    }
+    const uint64_t sequence =
+        static_cast<uint64_t>(sqlite3_column_int64(sequence_statement, 0));
+    sqlite3_finalize(sequence_statement);
+
+    RingPressRecord press;
+    press.event.event_id = format_event_id(at, sequence);
+    press.event.device_id = device_id;
+    press.event.recording_id = recording_id;
+    press.event.type = "ring";
+    press.event.at_ms = at_ms;
+    press.event.occurred_timezone = system_timezone_name();
+    press.event.occurred_utc_offset_minutes = utc_offset_minutes(at);
+    press.event.occurred_local_date = local_date_iso(at);
+    press.event.snapshot_path = snapshot_path;
+    press.event.extra_json = "{}";
+    press.ring_state = "ringing";
+    press.press_seq = 1;
+    press.pressed_at_ms = at_ms;
+    press.initial = true;
+
+    sqlite3_stmt *insert = nullptr;
+    const char *insert_sql = R"SQL(
+INSERT INTO events(event_id, device_id, recording_id, event_type, at_ms, occurred_timezone,
+                   occurred_utc_offset_minutes, occurred_local_date, snapshot_path, extra_json,
+                   reported, created_at_ms)
+VALUES(?, ?, ?, 'ring', ?, ?, ?, ?, ?, '{}', 0, ?)
+)SQL";
+    if (sqlite3_prepare_v2(db_, insert_sql, -1, &insert, nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare ring event insert failed");
+        rollback();
+        return std::nullopt;
+    }
+    sqlite3_bind_text(insert, 1, press.event.event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert, 2, device_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert, 3, recording_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(insert, 4, at_ms);
+    sqlite3_bind_text(
+        insert, 5, press.event.occurred_timezone.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(insert, 6, press.event.occurred_utc_offset_minutes);
+    sqlite3_bind_text(
+        insert, 7, press.event.occurred_local_date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(
+        insert, 8, press.event.snapshot_path.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(insert, 9, at_ms);
+    const bool event_inserted = sqlite3_step(insert) == SQLITE_DONE;
+    sqlite3_finalize(insert);
+    if (!event_inserted) {
+        set_error(error, db_, "insert ring event failed");
+        rollback();
+        return std::nullopt;
+    }
+
+    sqlite3_stmt *ring = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "INSERT INTO ring_events(event_id,state,press_count,first_pressed_at_ms,last_pressed_at_ms) "
+            "VALUES(?,'ringing',1,?,?)",
+            -1,
+            &ring,
+            nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare ring state insert failed");
+        rollback();
+        return std::nullopt;
+    }
+    sqlite3_bind_text(ring, 1, press.event.event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ring, 2, at_ms);
+    sqlite3_bind_int64(ring, 3, at_ms);
+    const bool ring_inserted = sqlite3_step(ring) == SQLITE_DONE;
+    sqlite3_finalize(ring);
+    if (!ring_inserted || !exec_sql(db_, "COMMIT", error)) {
+        set_error(error, db_, "insert ring state failed");
+        rollback();
+        return std::nullopt;
+    }
+    committed = true;
+    return press;
+}
+
+std::optional<std::string> EventStore::expire_open_ring(
+    std::chrono::system_clock::time_point at,
+    std::string *error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) {
+        if (error) *error = "event database is not open";
+        return std::nullopt;
+    }
+    const int64_t at_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(at.time_since_epoch()).count();
+    if (!exec_sql(db_, "BEGIN IMMEDIATE", error)) return std::nullopt;
+    bool committed = false;
+    auto rollback = [&] {
+        if (!committed) sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    };
+
+    sqlite3_stmt *lookup = nullptr;
+    const char *lookup_sql = R"SQL(
+SELECT event_id
+FROM ring_events
+WHERE state = 'ringing'
+  AND ? >= CASE
+      WHEN last_pressed_at_ms + 40000 < first_pressed_at_ms + 120000
+          THEN last_pressed_at_ms + 40000
+      ELSE first_pressed_at_ms + 120000
+  END
+LIMIT 1
+)SQL";
+    if (sqlite3_prepare_v2(db_, lookup_sql, -1, &lookup, nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare expired ring lookup failed");
+        rollback();
+        return std::nullopt;
+    }
+    sqlite3_bind_int64(lookup, 1, at_ms);
+    if (sqlite3_step(lookup) != SQLITE_ROW) {
+        sqlite3_finalize(lookup);
+        if (!exec_sql(db_, "COMMIT", error)) {
+            rollback();
+        } else {
+            committed = true;
+        }
+        return std::nullopt;
+    }
+    const std::string event_id = column_text(lookup, 0);
+    sqlite3_finalize(lookup);
+
+    sqlite3_stmt *update = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "UPDATE ring_events SET state='ended' WHERE event_id=? AND state='ringing'",
+            -1,
+            &update,
+            nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare expired ring update failed");
+        rollback();
+        return std::nullopt;
+    }
+    sqlite3_bind_text(update, 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    const bool updated = sqlite3_step(update) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    sqlite3_finalize(update);
+    if (!updated || !exec_sql(db_, "COMMIT", error)) {
+        set_error(error, db_, "expire open ring failed");
+        rollback();
+        return std::nullopt;
+    }
+    committed = true;
+    return event_id;
+}
+
+bool EventStore::recover_stale_accepted_ring(
+    std::string *event_id,
+    std::string *error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (event_id) event_id->clear();
+    if (!db_) {
+        if (error) *error = "event database is not open";
+        return false;
+    }
+    if (!exec_sql(db_, "BEGIN IMMEDIATE", error)) return false;
+    bool committed = false;
+    auto rollback = [&] {
+        if (!committed) sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    };
+
+    sqlite3_stmt *lookup = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT event_id FROM ring_events WHERE state='accepted' LIMIT 1",
+            -1,
+            &lookup,
+            nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare stale accepted ring lookup failed");
+        rollback();
+        return false;
+    }
+    const int lookup_rc = sqlite3_step(lookup);
+    if (lookup_rc == SQLITE_DONE) {
+        sqlite3_finalize(lookup);
+        if (!exec_sql(db_, "COMMIT", error)) {
+            rollback();
+            return false;
+        }
+        committed = true;
+        return true;
+    }
+    if (lookup_rc != SQLITE_ROW) {
+        set_error(error, db_, "read stale accepted ring failed");
+        sqlite3_finalize(lookup);
+        rollback();
+        return false;
+    }
+    const std::string recovered_event_id = column_text(lookup, 0);
+    sqlite3_finalize(lookup);
+
+    sqlite3_stmt *update = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "UPDATE ring_events SET state='ended' WHERE event_id=? AND state='accepted'",
+            -1,
+            &update,
+            nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare stale accepted ring recovery failed");
+        rollback();
+        return false;
+    }
+    sqlite3_bind_text(update, 1, recovered_event_id.c_str(), -1, SQLITE_TRANSIENT);
+    const bool updated = sqlite3_step(update) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    sqlite3_finalize(update);
+    if (!updated || !exec_sql(db_, "COMMIT", error)) {
+        set_error(error, db_, "recover stale accepted ring failed");
+        rollback();
+        return false;
+    }
+    committed = true;
+    if (event_id) *event_id = recovered_event_id;
+    return true;
+}
+
+std::vector<RingPressRecord> EventStore::pending_ring_presses(std::string *error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<RingPressRecord> presses;
+    if (!db_) return presses;
+    sqlite3_stmt *statement = nullptr;
+    const char *sql = R"SQL(
+SELECT e.event_id, e.device_id, e.recording_id, e.event_type, e.at_ms,
+       e.occurred_timezone, e.occurred_utc_offset_minutes, e.occurred_local_date,
+       e.snapshot_path, e.extra_json, e.reported,
+       r.state, q.press_seq, q.pressed_at_ms
+FROM ring_press_queue q
+JOIN events e ON e.event_id=q.event_id
+JOIN ring_events r ON r.event_id=q.event_id
+WHERE q.reported=0
+ORDER BY q.pressed_at_ms, q.press_seq
+)SQL";
+    if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare pending ring press query failed");
+        return presses;
+    }
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        RingPressRecord press;
+        press.event.event_id = column_text(statement, 0);
+        press.event.device_id = column_text(statement, 1);
+        press.event.recording_id = column_text(statement, 2);
+        press.event.type = column_text(statement, 3);
+        press.event.at_ms = sqlite3_column_int64(statement, 4);
+        press.event.occurred_timezone = column_text(statement, 5);
+        press.event.occurred_utc_offset_minutes = sqlite3_column_int(statement, 6);
+        press.event.occurred_local_date = column_text(statement, 7);
+        press.event.snapshot_path = column_text(statement, 8);
+        press.event.extra_json = column_text(statement, 9);
+        press.event.reported = sqlite3_column_int(statement, 10);
+        press.ring_state = column_text(statement, 11);
+        press.press_seq = sqlite3_column_int(statement, 12);
+        press.pressed_at_ms = sqlite3_column_int64(statement, 13);
+        press.initial = false;
+        presses.push_back(std::move(press));
+    }
+    sqlite3_finalize(statement);
+    return presses;
+}
+
+bool EventStore::mark_ring_press_reported(
+    const std::string &event_id,
+    int press_seq,
+    std::string *error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) return false;
+    sqlite3_stmt *statement = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "UPDATE ring_press_queue SET reported=1 WHERE event_id=? AND press_seq=?",
+            -1,
+            &statement,
+            nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare ring press reported update failed");
+        return false;
+    }
+    sqlite3_bind_text(statement, 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(statement, 2, press_seq);
+    const bool ok = sqlite3_step(statement) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    if (!ok) set_error(error, db_, "mark ring press reported failed");
+    sqlite3_finalize(statement);
+    return ok;
+}
+
+bool EventStore::update_ring_state(
+    const std::string &event_id,
+    const std::string &state,
+    std::string *error) {
+    if (state != "ringing" && state != "accepted" && state != "ended") {
+        if (error) *error = "invalid ring state";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) return false;
+    sqlite3_stmt *statement = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "UPDATE ring_events SET state=? WHERE event_id=?",
+            -1,
+            &statement,
+            nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare ring state update failed");
+        return false;
+    }
+    sqlite3_bind_text(statement, 1, state.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(statement) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    if (!ok) set_error(error, db_, "update ring state failed");
+    sqlite3_finalize(statement);
+    return ok;
 }
 
 bool EventStore::begin_recording(

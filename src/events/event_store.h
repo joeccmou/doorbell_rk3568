@@ -29,6 +29,29 @@ public:
         double confidence,
         std::string *error = nullptr);
 
+    std::optional<RingPressRecord> record_ring_press(
+        const std::string &device_id,
+        const std::string &recording_id,
+        std::chrono::system_clock::time_point at,
+        const std::string &snapshot_path,
+        std::string *error = nullptr);
+    std::optional<std::string> expire_open_ring(
+        std::chrono::system_clock::time_point at,
+        std::string *error = nullptr);
+    // 进程重启后媒体管线已经不存在，本地 accepted 事件必须先收敛，避免新按铃复用旧事件。
+    bool recover_stale_accepted_ring(
+        std::string *event_id,
+        std::string *error = nullptr);
+    std::vector<RingPressRecord> pending_ring_presses(std::string *error = nullptr);
+    bool mark_ring_press_reported(
+        const std::string &event_id,
+        int press_seq,
+        std::string *error = nullptr);
+    bool update_ring_state(
+        const std::string &event_id,
+        const std::string &state,
+        std::string *error = nullptr);
+
     bool begin_recording(
         const std::string &recording_id,
         std::chrono::system_clock::time_point started_at,

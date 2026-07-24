@@ -91,7 +91,8 @@ bool LiveViewSession::handle_command(const std::string &payload) {
         const std::string cmd_id = in.value("cmd_id", "");
         const std::string call_id = in.value("call_id", "");
 
-        if (action == "start_live") {
+        if (action == "start_live" || action == "answer_call") {
+            current_mode_ = action == "answer_call" ? "call" : "live_view";
             publish_command_ack(trace_id, cmd_id, true);
             publish_media_state(trace_id, call_id, "connecting");
 
@@ -102,7 +103,11 @@ bool LiveViewSession::handle_command(const std::string &payload) {
                 std::fprintf(stderr, "[mqtt] start_live failed call_id=%s error=%s\n", call_id.c_str(), error_message.c_str());
                 return true;
             }
-            std::fprintf(stdout, "[mqtt] accepted start_live call_id=%s quality=%s\n", call_id.c_str(), request.quality.c_str());
+            std::fprintf(stdout,
+                         "[mqtt] accepted media start action=%s call_id=%s quality=%s\n",
+                         action.c_str(),
+                         call_id.c_str(),
+                         request.quality.c_str());
             return true;
         }
 
@@ -156,7 +161,9 @@ void LiveViewSession::publish_media_state(const std::string &trace_id,
     const bool has_error = !error_code.empty();
     media["media_state"] = media_state;
     media["occupant_user_id"] = nullptr;
-    media["mode"] = (media_state == "idle" && !has_error) ? nlohmann::json(nullptr) : nlohmann::json("live_view");
+    media["mode"] = (media_state == "idle" && !has_error)
+        ? nlohmann::json(nullptr)
+        : nlohmann::json(current_mode_);
     media["call_id"] = (media_state == "idle" && !has_error) ? nlohmann::json(nullptr) : nlohmann::json(call_id);
     media["error_code"] = has_error ? nlohmann::json(error_code) : nlohmann::json(nullptr);
     media["error_message"] = has_error ? nlohmann::json(error_message) : nlohmann::json(nullptr);
