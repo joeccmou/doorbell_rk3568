@@ -24,7 +24,8 @@ struct SelectedSnapshot {
 class SnapshotCandidateSelector {
 public:
     explicit SnapshotCandidateSelector(
-        std::chrono::steady_clock::duration window = std::chrono::seconds(2));
+        std::chrono::steady_clock::duration window = std::chrono::seconds(2),
+        bool allow_empty_boxes = false);
 
     void start(std::chrono::steady_clock::time_point now);
     bool active() const;
@@ -48,6 +49,7 @@ private:
                                double sharpness);
 
     std::chrono::steady_clock::duration window_;
+    bool allow_empty_boxes_ = false;
     std::chrono::steady_clock::time_point deadline_{};
     bool active_ = false;
     std::optional<SelectedSnapshot> best_;

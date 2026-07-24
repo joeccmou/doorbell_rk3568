@@ -81,7 +81,7 @@ void EventStore::close() {
 bool EventStore::initialize_schema(std::string *error) {
     int version = 0;
     if (!scalar_int(db_, "PRAGMA user_version", &version, error)) return false;
-    if (version != 0 && version != 3 && version != 4 && version != 5) {
+    if (version != 0 && version != 3 && version != 4 && version != 5 && version != 6) {
         if (error) {
             *error = "unsupported event database schema version: " + std::to_string(version) +
                      "; stop service and remove doorbell.db, doorbell.db-wal and doorbell.db-shm";
@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS events (
     occurred_utc_offset_minutes INTEGER NOT NULL,
     occurred_local_date TEXT NOT NULL,
     snapshot_path TEXT NOT NULL,
+    snapshot_url TEXT,
     extra_json TEXT NOT NULL DEFAULT '{}',
     reported INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
@@ -178,20 +179,32 @@ bool EventStore::migrate_schema(std::string *error) {
     int version = 0;
     if (!scalar_int(db_, "PRAGMA user_version", &version, error)) return false;
     if (version == 0) {
-        return exec_sql(db_, "PRAGMA user_version=5", error);
+        return exec_sql(db_, "PRAGMA user_version=6", error);
     }
     if (version == 3) {
         return exec_sql(
             db_,
             "ALTER TABLE recording_segments "
             "ADD COLUMN sha256 TEXT NOT NULL DEFAULT '';"
-            "PRAGMA user_version=5;",
+            "ALTER TABLE events ADD COLUMN snapshot_url TEXT;"
+            "PRAGMA user_version=6;",
             error);
     }
     if (version == 4) {
-        return exec_sql(db_, "PRAGMA user_version=5", error);
+        return exec_sql(
+            db_,
+            "ALTER TABLE events ADD COLUMN snapshot_url TEXT;"
+            "PRAGMA user_version=6;",
+            error);
     }
-    return version == 5;
+    if (version == 5) {
+        return exec_sql(
+            db_,
+            "ALTER TABLE events ADD COLUMN snapshot_url TEXT;"
+            "PRAGMA user_version=6;",
+            error);
+    }
+    return version == 6;
 }
 
 std::optional<EventRecord> EventStore::create_person_event(
@@ -299,7 +312,8 @@ std::optional<RingPressRecord> EventStore::record_ring_press(
     const char *active_sql = R"SQL(
 SELECT e.event_id, e.device_id, e.recording_id, e.event_type, e.at_ms,
        e.occurred_timezone, e.occurred_utc_offset_minutes, e.occurred_local_date,
-       e.snapshot_path, e.extra_json, e.reported, r.state, r.press_count
+       e.snapshot_path, e.extra_json, e.reported, r.state, r.press_count,
+       COALESCE(e.snapshot_url, '')
 FROM ring_events r
 JOIN events e ON e.event_id=r.event_id
 WHERE r.state <> 'ended'
@@ -325,6 +339,7 @@ LIMIT 1
         press.event.reported = sqlite3_column_int(active, 10);
         press.ring_state = column_text(active, 11);
         press.press_seq = sqlite3_column_int(active, 12) + 1;
+        press.event.snapshot_url = column_text(active, 13);
         press.pressed_at_ms = at_ms;
         press.initial = false;
         sqlite3_finalize(active);
@@ -378,10 +393,39 @@ LIMIT 1
     }
     sqlite3_finalize(active);
 
+    const std::string effective_recording_id = recording_id.empty()
+        ? device_id + "-" + std::to_string(at_ms)
+        : recording_id;
     if (recording_id.empty()) {
-        if (error) *error = "ring recording_id is empty";
-        rollback();
-        return std::nullopt;
+        sqlite3_stmt *recording = nullptr;
+        const char *recording_sql = R"SQL(
+INSERT INTO recordings(recording_id, status, started_at_ms, recorded_timezone,
+                       started_utc_offset_minutes, started_local_date, created_at_ms)
+VALUES(?, 'recording', ?, ?, ?, ?, ?)
+)SQL";
+        if (sqlite3_prepare_v2(
+                db_, recording_sql, -1, &recording, nullptr) != SQLITE_OK) {
+            set_error(error, db_, "prepare ring recording identity insert failed");
+            rollback();
+            return std::nullopt;
+        }
+        const std::string timezone = system_timezone_name();
+        const int offset_minutes = utc_offset_minutes(at);
+        const std::string local_date = local_date_iso(at);
+        sqlite3_bind_text(
+            recording, 1, effective_recording_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(recording, 2, at_ms);
+        sqlite3_bind_text(recording, 3, timezone.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(recording, 4, offset_minutes);
+        sqlite3_bind_text(recording, 5, local_date.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(recording, 6, at_ms);
+        const bool recording_inserted = sqlite3_step(recording) == SQLITE_DONE;
+        sqlite3_finalize(recording);
+        if (!recording_inserted) {
+            set_error(error, db_, "insert ring recording identity failed");
+            rollback();
+            return std::nullopt;
+        }
     }
     if (!exec_sql(db_, "UPDATE event_meta SET value=value+1 WHERE key='event_sequence'", error)) {
         rollback();
@@ -407,7 +451,7 @@ LIMIT 1
     RingPressRecord press;
     press.event.event_id = format_event_id(at, sequence);
     press.event.device_id = device_id;
-    press.event.recording_id = recording_id;
+    press.event.recording_id = effective_recording_id;
     press.event.type = "ring";
     press.event.at_ms = at_ms;
     press.event.occurred_timezone = system_timezone_name();
@@ -434,7 +478,8 @@ VALUES(?, ?, ?, 'ring', ?, ?, ?, ?, ?, '{}', 0, ?)
     }
     sqlite3_bind_text(insert, 1, press.event.event_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(insert, 2, device_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(insert, 3, recording_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(
+        insert, 3, effective_recording_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(insert, 4, at_ms);
     sqlite3_bind_text(
         insert, 5, press.event.occurred_timezone.c_str(), -1, SQLITE_TRANSIENT);
@@ -1021,7 +1066,8 @@ std::vector<EventRecord> EventStore::pending_events(std::string *error) {
     sqlite3_stmt *statement = nullptr;
     const char *sql = R"SQL(
 SELECT event_id, device_id, event_type, at_ms, occurred_timezone, occurred_utc_offset_minutes,
-       occurred_local_date, snapshot_path, recording_id, extra_json, reported
+       occurred_local_date, snapshot_path, recording_id, extra_json, reported,
+       COALESCE(snapshot_url, '')
 FROM events WHERE reported=0 ORDER BY at_ms ASC
 )SQL";
     if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK) {
@@ -1041,6 +1087,7 @@ FROM events WHERE reported=0 ORDER BY at_ms ASC
         event.recording_id = column_text(statement, 8);
         event.extra_json = column_text(statement, 9);
         event.reported = sqlite3_column_int(statement, 10);
+        event.snapshot_url = column_text(statement, 11);
         events.push_back(std::move(event));
     }
     sqlite3_finalize(statement);
@@ -1053,7 +1100,8 @@ std::optional<EventRecord> EventStore::find_event(const std::string &event_id, s
     sqlite3_stmt *statement = nullptr;
     const char *sql = R"SQL(
 SELECT event_id, device_id, event_type, at_ms, occurred_timezone, occurred_utc_offset_minutes,
-       occurred_local_date, snapshot_path, recording_id, extra_json, reported
+       occurred_local_date, snapshot_path, recording_id, extra_json, reported,
+       COALESCE(snapshot_url, '')
 FROM events WHERE event_id=?
 )SQL";
     if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK) {
@@ -1078,8 +1126,39 @@ FROM events WHERE event_id=?
     event.recording_id = column_text(statement, 8);
     event.extra_json = column_text(statement, 9);
     event.reported = sqlite3_column_int(statement, 10);
+    event.snapshot_url = column_text(statement, 11);
     sqlite3_finalize(statement);
     return event;
+}
+
+bool EventStore::update_event_snapshot_url(
+    const std::string &event_id,
+    const std::string &snapshot_url,
+    std::string *error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) {
+        if (error) *error = "event database is not open";
+        return false;
+    }
+    sqlite3_stmt *statement = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "UPDATE events SET snapshot_url=? WHERE event_id=?",
+            -1,
+            &statement,
+            nullptr) != SQLITE_OK) {
+        set_error(error, db_, "prepare snapshot URL update failed");
+        return false;
+    }
+    sqlite3_bind_text(statement, 1, snapshot_url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    const bool updated =
+        sqlite3_step(statement) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    sqlite3_finalize(statement);
+    if (!updated) {
+        set_error(error, db_, "update snapshot URL failed");
+    }
+    return updated;
 }
 
 std::optional<RecordingRecord> EventStore::find_recording(

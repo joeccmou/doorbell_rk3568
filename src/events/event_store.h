@@ -95,6 +95,10 @@ public:
 
     std::vector<EventRecord> pending_events(std::string *error = nullptr);
     std::optional<EventRecord> find_event(const std::string &event_id, std::string *error = nullptr);
+    bool update_event_snapshot_url(
+        const std::string &event_id,
+        const std::string &snapshot_url,
+        std::string *error = nullptr);
     std::optional<RecordingRecord> find_recording(
         const std::string &recording_id,
         std::string *error = nullptr);

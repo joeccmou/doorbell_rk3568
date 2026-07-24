@@ -182,11 +182,13 @@ bool MqttDeviceClient::publish_media_state(const std::string &payload) {
 }
 
 bool MqttDeviceClient::publish_event(const std::string &payload) {
-    return publish_payload(event_topic(), payload, 1, false);
+    // event 以 report_ack 作为业务成功依据，不能同步等待最多 5 秒的 MQTT PUBACK，
+    // 否则会拖慢按铃事件和抓拍链路。
+    return publish_payload_nonblocking(event_topic(), payload, 1, false);
 }
 
 bool MqttDeviceClient::publish_ring_press(const std::string &payload) {
-    return publish_payload(ring_press_topic(), payload, 1, false);
+    return publish_payload_nonblocking(ring_press_topic(), payload, 1, false);
 }
 
 bool MqttDeviceClient::publish_time_sync(const std::string &payload) {
@@ -433,6 +435,12 @@ void MqttDeviceClient::mqtt_loop() {
             }
         }
         mosquitto_destroy(client);
+        {
+            std::lock_guard<std::mutex> lock(publish_mtx_);
+            published_message_ids_.clear();
+            nonblocking_message_ids_.clear();
+        }
+        publish_cv_.notify_all();
         set_online(false);
 
         if (!should_stop()) {
@@ -563,6 +571,43 @@ std::string MqttDeviceClient::media_state_topic() const {
 
 std::string MqttDeviceClient::event_topic() const {
     return "doorbell/devices/" + device_id_ + "/event";
+}
+
+bool MqttDeviceClient::publish_payload_nonblocking(
+    const std::string &topic,
+    const std::string &payload,
+    int qos,
+    bool retained) {
+    int message_id = 0;
+    int rc = MOSQ_ERR_NO_CONN;
+    {
+        std::lock_guard<std::mutex> lock(mqtt_mtx_);
+        if (!mqtt_client_) return false;
+        rc = mosquitto_publish(
+            mqtt_client_,
+            &message_id,
+            topic.c_str(),
+            static_cast<int>(payload.size()),
+            payload.data(),
+            qos,
+            retained);
+    }
+    if (rc != MOSQ_ERR_SUCCESS) {
+        std::fprintf(
+            stderr,
+            "[mqtt] nonblocking publish failed topic=%s rc=%d error=%s\n",
+            topic.c_str(),
+            rc,
+            mosquitto_strerror(rc));
+        return false;
+    }
+    if (qos > 0) {
+        std::lock_guard<std::mutex> lock(publish_mtx_);
+        if (published_message_ids_.erase(message_id) == 0) {
+            nonblocking_message_ids_.insert(message_id);
+        }
+    }
+    return true;
 }
 
 std::string MqttDeviceClient::ring_press_topic() const {

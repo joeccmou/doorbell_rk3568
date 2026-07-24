@@ -15,8 +15,9 @@ double clamp01(double value) {
 }
 
 SnapshotCandidateSelector::SnapshotCandidateSelector(
-    std::chrono::steady_clock::duration window)
-    : window_(window) {}
+    std::chrono::steady_clock::duration window,
+    bool allow_empty_boxes)
+    : window_(window), allow_empty_boxes_(allow_empty_boxes) {}
 
 void SnapshotCandidateSelector::start(std::chrono::steady_clock::time_point now) {
     deadline_ = now + window_;
@@ -36,11 +37,18 @@ void SnapshotCandidateSelector::consider(
     std::chrono::steady_clock::time_point now) {
     const size_t expected = static_cast<size_t>(width) * height * 3;
     if (!active_ || now > deadline_ || width == 0 || height == 0 ||
-        rgb.size() < expected || boxes.empty()) {
+        rgb.size() < expected) {
         return;
     }
 
     const double sharpness = sharpness_score(rgb, width, height);
+    if (boxes.empty()) {
+        if (!allow_empty_boxes_) return;
+        if (!best_ || sharpness > best_->score) {
+            best_ = SelectedSnapshot{rgb, width, height, 0.0, sharpness};
+        }
+        return;
+    }
     double best_box_score = -std::numeric_limits<double>::infinity();
     double best_confidence = 0.0;
     for (const auto &box : boxes) {

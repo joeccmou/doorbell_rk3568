@@ -84,6 +84,8 @@ bool DeviceEventProcessor::start(std::string *error) {
         enqueue(std::move(job));
     }
     worker_ = std::thread(&DeviceEventProcessor::worker_loop, this);
+    report_worker_ =
+        std::thread(&DeviceEventProcessor::report_worker_loop, this);
     return true;
 }
 
@@ -108,8 +110,16 @@ std::optional<RingPressRecord> DeviceEventProcessor::begin_ring_press(
 
     Job job;
     if (press->initial) {
-        job.kind = Job::Kind::ReportEvent;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_ring_snapshots_.insert(press->event.event_id);
+        }
+        job.kind = Job::Kind::PrepareRingEvent;
         job.event = press->event;
+        // 1 秒选帧窗口结束后给主画面线程一个调度余量，再无结果才无图上报。
+        job.ready_at =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(1100);
+        job.ring_snapshot_timeout = true;
     } else {
         job.kind = Job::Kind::ReportRingPress;
         job.ring_press = *press;
@@ -129,6 +139,7 @@ void DeviceEventProcessor::stop() {
     stop_.store(true);
     cv_.notify_all();
     if (worker_.joinable()) worker_.join();
+    if (report_worker_.joinable()) report_worker_.join();
     store_.close();
 }
 
@@ -250,17 +261,39 @@ void DeviceEventProcessor::submit_person_snapshot(EventRecord event,
     enqueue(std::move(job));
 }
 
+void DeviceEventProcessor::submit_ring_snapshot(EventRecord event,
+                                                std::vector<uint8_t> rgb,
+                                                uint32_t width,
+                                                uint32_t height) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pending_ring_snapshots_.erase(event.event_id) == 0) {
+            return;
+        }
+    }
+    Job job;
+    job.kind = Job::Kind::PrepareRingEvent;
+    job.event = std::move(event);
+    job.rgb = std::move(rgb);
+    job.width = width;
+    job.height = height;
+    enqueue(std::move(job));
+}
+
 void DeviceEventProcessor::enqueue(Job job) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (job.kind == Job::Kind::PersistRecordingSegment ||
+        if (job.kind == Job::Kind::ReportEvent ||
+            job.kind == Job::Kind::ReportRingPress) {
+            report_jobs_.push_back(std::move(job));
+        } else if (job.kind == Job::Kind::PersistRecordingSegment ||
             job.kind == Job::Kind::FinalizeRecording) {
             recording_jobs_.push_back(std::move(job));
         } else {
             jobs_.push_back(std::move(job));
         }
     }
-    cv_.notify_one();
+    cv_.notify_all();
 }
 
 void DeviceEventProcessor::worker_loop() {
@@ -269,26 +302,78 @@ void DeviceEventProcessor::worker_loop() {
         Job job;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::seconds(1), [this] {
-                return stop_.load() || !recording_jobs_.empty() || !jobs_.empty();
-            });
-            if (stop_.load()) break;
-            if (recording_jobs_.empty() && jobs_.empty()) continue;
-            if (!recording_jobs_.empty()) {
-                job = std::move(recording_jobs_.front());
-                recording_jobs_.pop_front();
-            } else {
-                job = std::move(jobs_.front());
-                jobs_.pop_front();
+            while (!stop_.load()) {
+                if (!recording_jobs_.empty()) {
+                    job = std::move(recording_jobs_.front());
+                    recording_jobs_.pop_front();
+                    break;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                auto ready = jobs_.end();
+                auto next_ready = std::chrono::steady_clock::time_point::max();
+                for (auto it = jobs_.begin(); it != jobs_.end(); ++it) {
+                    if (it->ready_at.time_since_epoch().count() == 0 ||
+                        it->ready_at <= now) {
+                        ready = it;
+                        break;
+                    }
+                    next_ready = std::min(next_ready, it->ready_at);
+                }
+                if (ready != jobs_.end()) {
+                    job = std::move(*ready);
+                    jobs_.erase(ready);
+                    break;
+                }
+                if (next_ready == std::chrono::steady_clock::time_point::max()) {
+                    cv_.wait_for(lock, std::chrono::seconds(1));
+                } else {
+                    cv_.wait_until(lock, next_ready);
+                }
             }
+            if (stop_.load()) break;
         }
         if (!process(&job) && !stop_.load()) {
+            // 失败任务只延迟自身，不能让等待业务 ACK 的 5 秒退避饿死抓拍等其他任务。
+            job.ready_at = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            enqueue(std::move(job));
+        }
+    }
+}
+
+void DeviceEventProcessor::report_worker_loop() {
+    while (!stop_.load()) {
+        Job job;
+        {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::seconds(5), [this] {
-                return stop_.load() || !recording_jobs_.empty();
-            });
-            lock.unlock();
-            if (!stop_.load()) enqueue(std::move(job));
+            while (!stop_.load()) {
+                const auto now = std::chrono::steady_clock::now();
+                auto ready = report_jobs_.end();
+                auto next_ready = std::chrono::steady_clock::time_point::max();
+                for (auto it = report_jobs_.begin(); it != report_jobs_.end(); ++it) {
+                    if (it->ready_at.time_since_epoch().count() == 0 ||
+                        it->ready_at <= now) {
+                        ready = it;
+                        break;
+                    }
+                    next_ready = std::min(next_ready, it->ready_at);
+                }
+                if (ready != report_jobs_.end()) {
+                    job = std::move(*ready);
+                    report_jobs_.erase(ready);
+                    break;
+                }
+                if (next_ready == std::chrono::steady_clock::time_point::max()) {
+                    cv_.wait_for(lock, std::chrono::seconds(1));
+                } else {
+                    cv_.wait_until(lock, next_ready);
+                }
+            }
+            if (stop_.load()) break;
+        }
+        if (!process(&job) && !stop_.load()) {
+            job.ready_at =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            enqueue(std::move(job));
         }
     }
 }
@@ -434,6 +519,69 @@ bool DeviceEventProcessor::process(Job *job) {
         return true;
     }
 
+    if (job->kind == Job::Kind::PrepareRingEvent) {
+        if (job->ring_snapshot_timeout) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_ring_snapshots_.erase(job->event.event_id) == 0) {
+                return true;
+            }
+        }
+
+        const std::string snapshot_file = media_root_ + "/" + job->event.snapshot_path;
+        bool snapshot_saved = false;
+        std::string error;
+        if (!job->rgb.empty()) {
+            snapshot_saved = snapshots_.save_rgb_jpeg(
+                snapshot_file, job->rgb, job->width, job->height, &error);
+            if (!snapshot_saved) {
+                std::fprintf(stderr,
+                             "[ring] save selected snapshot failed event_id=%s error=%s\n",
+                             job->event.event_id.c_str(),
+                             error.c_str());
+            }
+        }
+        if (snapshot_saved) {
+            std::string snapshot_url;
+            error.clear();
+            if (uploader_.upload(
+                    snapshot_file,
+                    job->event.snapshot_path,
+                    &snapshot_url,
+                    &error,
+                    2000L)) {
+                if (store_.update_event_snapshot_url(
+                        job->event.event_id, snapshot_url, &error)) {
+                    job->event.snapshot_url = snapshot_url;
+                    std::fprintf(stdout,
+                                 "[ring] snapshot pre-uploaded event_id=%s url=%s\n",
+                                 job->event.event_id.c_str(),
+                                 snapshot_url.c_str());
+                } else {
+                    std::fprintf(stderr,
+                                 "[ring] persist snapshot URL failed event_id=%s error=%s\n",
+                                 job->event.event_id.c_str(),
+                                 error.c_str());
+                }
+            } else {
+                std::fprintf(stderr,
+                             "[ring] snapshot pre-upload failed event_id=%s error=%s; "
+                             "continue reporting without URL\n",
+                             job->event.event_id.c_str(),
+                             error.c_str());
+            }
+        } else if (job->ring_snapshot_timeout) {
+            std::fprintf(stderr,
+                         "[ring] one-second snapshot window expired without frame event_id=%s\n",
+                         job->event.event_id.c_str());
+        }
+
+        Job report;
+        report.kind = Job::Kind::ReportEvent;
+        report.event = std::move(job->event);
+        enqueue(std::move(report));
+        return true;
+    }
+
     if (job->kind == Job::Kind::ReportRingPress) {
         RingPublisher publisher;
         {
@@ -458,14 +606,14 @@ bool DeviceEventProcessor::process(Job *job) {
                 job->ring_press.press_seq,
                 &error)) {
             std::fprintf(stderr,
-                         "[ring] persist ring_press PUBACK failed event_id=%s press_seq=%d error=%s\n",
+                         "[ring] persist queued ring_press failed event_id=%s press_seq=%d error=%s\n",
                          job->ring_press.event.event_id.c_str(),
                          job->ring_press.press_seq,
                          error.c_str());
             return false;
         }
         std::fprintf(stdout,
-                     "[ring] published ring_press event_id=%s press_seq=%d\n",
+                     "[ring] queued ring_press publish event_id=%s press_seq=%d\n",
                      job->ring_press.event.event_id.c_str(),
                      job->ring_press.press_seq);
         return true;
@@ -487,7 +635,7 @@ bool DeviceEventProcessor::process(Job *job) {
         extra = nlohmann::json::parse(job->event.extra_json);
     } catch (const std::exception &) {
     }
-    const nlohmann::json payload{
+    nlohmann::json payload{
         {"trace_id", "tr_" + job->event.event_id},
         {"event_id", job->event.event_id},
         {"device_id", job->event.device_id},
@@ -499,6 +647,9 @@ bool DeviceEventProcessor::process(Job *job) {
         {"occurred_local_date", job->event.occurred_local_date},
         {"extra", extra},
     };
+    if (!job->event.snapshot_url.empty()) {
+        payload["snapshot_url"] = job->event.snapshot_url;
+    }
     if (!publisher_ || !publisher_(payload.dump())) return false;
     std::fprintf(stdout,
                  "[event] published pending event_id=%s; waiting business ACK\n",

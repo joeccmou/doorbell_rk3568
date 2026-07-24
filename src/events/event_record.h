@@ -13,6 +13,7 @@ struct EventRecord {
     int occurred_utc_offset_minutes = 0;
     std::string occurred_local_date;
     std::string snapshot_path;
+    std::string snapshot_url;
     std::string extra_json;
     int reported = 0;
 };

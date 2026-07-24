@@ -68,6 +68,11 @@ private:
     void mqtt_loop();
     void handle_message(const struct mosquitto_message *msg);
     bool publish_payload(const std::string &topic, const std::string &payload, int qos, bool retained);
+    bool publish_payload_nonblocking(
+        const std::string &topic,
+        const std::string &payload,
+        int qos,
+        bool retained);
     bool wait_for_stop_or(std::chrono::milliseconds duration) const;
     bool should_stop() const;
     void set_online(bool online);

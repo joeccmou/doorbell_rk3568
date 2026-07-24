@@ -165,6 +165,7 @@ add_executable(doorbell
     src/utils/file_sha256.cpp
     src/utils/image_utils.cpp
     src/utils/audio_capture_manager.cpp
+    src/utils/doorbell_chime_player.cpp
     src/utils/image_drawing.c
     src/utils/perf_logger.cpp
     src/utils/mp4_recorder.cpp

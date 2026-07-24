@@ -31,7 +31,8 @@ HttpSnapshotUploader::HttpSnapshotUploader(std::string api_base_url,
 bool HttpSnapshotUploader::upload(const std::string &jpeg_path,
                                   const std::string &device_relative_path,
                                   std::string *snapshot_url,
-                                  std::string *error) const {
+                                  std::string *error,
+                                  long timeout_ms) const {
     if (api_base_url_.rfind("https://", 0) != 0 || !is_canonical_snapshot_path(device_relative_path)) {
         if (error) *error = "snapshot upload requires HTTPS";
         return false;
@@ -83,8 +84,9 @@ bool HttpSnapshotUploader::upload(const std::string &jpeg_path,
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, content.data());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(content.size()));
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 20000L);
+    const long bounded_timeout_ms = timeout_ms > 0 ? timeout_ms : 20000L;
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, bounded_timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, bounded_timeout_ms);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);

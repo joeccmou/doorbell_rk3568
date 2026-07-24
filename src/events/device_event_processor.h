@@ -93,6 +93,10 @@ public:
                                 std::vector<uint8_t> rgb,
                                 uint32_t width,
                                 uint32_t height);
+    void submit_ring_snapshot(EventRecord event,
+                              std::vector<uint8_t> rgb,
+                              uint32_t width,
+                              uint32_t height);
 
     // 先同步落 SQLite，再把抓拍上传与 MQTT 上报交给后台线程。
     // 只有后端业务 ACK 才能推进 reported；MQTT PUBACK 不改变本地状态。
@@ -105,6 +109,7 @@ private:
             ReportEvent,
             ReportRingPress,
             SaveSnapshot,
+            PrepareRingEvent,
             PersistRecordingSegment,
             FinalizeRecording,
         };
@@ -123,9 +128,12 @@ private:
         std::chrono::system_clock::time_point ended_at{};
         std::string recording_status;
         std::shared_ptr<std::promise<bool>> completion;
+        std::chrono::steady_clock::time_point ready_at{};
+        bool ring_snapshot_timeout = false;
     };
 
     void worker_loop();
+    void report_worker_loop();
     bool process(Job *job);
     void enqueue(Job job);
     void expire_ring_if_needed(std::chrono::system_clock::time_point at);
@@ -146,6 +154,9 @@ private:
     std::condition_variable cv_;
     std::deque<Job> recording_jobs_;
     std::deque<Job> jobs_;
+    std::deque<Job> report_jobs_;
+    std::unordered_set<std::string> pending_ring_snapshots_;
     std::unordered_set<std::string> failed_recordings_;
     std::thread worker_;
+    std::thread report_worker_;
 };

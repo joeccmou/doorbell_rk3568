@@ -38,6 +38,7 @@
 #include "ai/yolo_person_detector.h"
 #include "utils/mp4_recorder.h"
 #include "utils/audio_capture_manager.h"
+#include "utils/doorbell_chime_player.h"
 #include "utils/perf_logger.h"
 #include "utils/image_utils.h"
 #include "utils/image_drawing.h"
@@ -48,7 +49,7 @@ constexpr uint32_t kDetectIntervalMs = 250;
 constexpr uint32_t kRecordFpsLimit = 24;
 constexpr uint64_t kRecordFrameIntervalNs = 1000000000ULL / kRecordFpsLimit;
 constexpr uint64_t kOverlayFreshNs = 300ULL * 1000ULL * 1000ULL;
-constexpr uint64_t kRingRecordingTailNs = 30ULL * 1000ULL * 1000ULL * 1000ULL;
+constexpr uint32_t kRingSnapshotSampleIntervalMs = 100;
 
 void perf_log(const char *fmt, ...) {
     va_list args;
@@ -107,6 +108,11 @@ struct UiContext {
     PersonEventGate person_event_gate{std::chrono::seconds(30)};
     SnapshotCandidateSelector snapshot_candidate_selector{std::chrono::seconds(2)};
     std::optional<EventRecord> pending_person_event;
+    std::mutex ring_snapshot_mtx;
+    SnapshotCandidateSelector ring_snapshot_candidate_selector{
+        std::chrono::seconds(1), true};
+    std::optional<EventRecord> pending_ring_snapshot_event;
+    uint32_t ring_snapshot_last_sample_ms = 0;
     std::unique_ptr<DeviceEventProcessor> event_processor;
 
     bool record_exit = false;
@@ -120,12 +126,16 @@ struct UiContext {
     std::vector<uint8_t> display_frame;
     Mp4Recorder recorder;
     AudioCaptureManager audio_capture;
+    std::unique_ptr<DoorbellChimePlayer> doorbell_chime;
     std::string record_dir;
     std::string current_recording_id;
     std::string last_recording_attempt_id;
+    std::string pending_ring_recording_id;
+    std::chrono::system_clock::time_point pending_ring_recording_started_at{};
     std::string active_ring_event_id;
     bool ring_event_open = false;
-    uint64_t ring_event_closed_ts_ns = 0;
+    bool ring_press_in_progress = false;
+    bool recording_stop_in_progress = false;
     std::chrono::system_clock::time_point current_recording_last_segment_ended_at{};
     // SDL_Window *sdl_window = nullptr;
 };
@@ -152,14 +162,8 @@ bool detection_is_fresh(uint64_t frame_ts_ns, uint64_t det_ts_ns) {
     return (frame_ts_ns - det_ts_ns) <= kOverlayFreshNs;
 }
 
-bool ring_recording_active(
-    bool ring_event_open,
-    uint64_t ring_event_closed_ts_ns,
-    uint64_t now_ns) {
-    if (ring_event_open) return true;
-    return ring_event_closed_ts_ns != 0 &&
-           now_ns >= ring_event_closed_ts_ns &&
-           now_ns - ring_event_closed_ts_ns <= kRingRecordingTailNs;
+bool ring_recording_active(bool ring_event_open) {
+    return ring_event_open;
 }
 
 void inference_worker(UiContext *ctx) {
@@ -306,6 +310,10 @@ void recorder_worker(UiContext *ctx) {
             ended_at = ctx->current_recording_last_segment_ended_at;
             ctx->current_recording_id.clear();
             ctx->current_recording_last_segment_ended_at = {};
+            if (ctx->last_recording_attempt_id == recording_id) {
+                ctx->last_recording_attempt_id.clear();
+            }
+            ctx->recording_stop_in_progress = false;
         }
         ctx->record_cv.notify_all();
         if (recording_id.empty() || !ctx->event_processor) return;
@@ -316,6 +324,33 @@ void recorder_worker(UiContext *ctx) {
         if (!ctx->event_processor->finalize_recording(recording_id, ended_at, status, &error)) {
             std::fprintf(stderr,
                          "[record] persist completion failed recording_id=%s error=%s\n",
+                         recording_id.c_str(),
+                         error.c_str());
+        }
+    };
+    auto finalize_pending_ring_recording = [ctx]() {
+        std::string recording_id;
+        std::chrono::system_clock::time_point started_at;
+        {
+            std::lock_guard<std::mutex> lock(ctx->record_mtx);
+            recording_id = std::move(ctx->pending_ring_recording_id);
+            started_at = ctx->pending_ring_recording_started_at;
+            ctx->pending_ring_recording_id.clear();
+            ctx->pending_ring_recording_started_at = {};
+            if (ctx->last_recording_attempt_id == recording_id) {
+                ctx->last_recording_attempt_id.clear();
+            }
+        }
+        if (recording_id.empty() || !ctx->event_processor) return;
+        if (started_at.time_since_epoch().count() == 0) {
+            started_at = std::chrono::system_clock::now();
+        }
+        std::string error;
+        if (!ctx->event_processor->finalize_recording(
+                recording_id, started_at, "failed", &error)) {
+            std::fprintf(stderr,
+                         "[record] persist pending ring recording failure failed "
+                         "recording_id=%s error=%s\n",
                          recording_id.c_str(),
                          error.c_str());
         }
@@ -344,18 +379,23 @@ void recorder_worker(UiContext *ctx) {
 
         const uint64_t now_ns = monotonic_time_ns();
         bool ring_open = false;
-        uint64_t ring_closed_ts_ns = 0;
         {
             std::lock_guard<std::mutex> lock(ctx->record_mtx);
             ring_open = ctx->ring_event_open;
-            ring_closed_ts_ns = ctx->ring_event_closed_ts_ns;
         }
         const bool want_record =
             person_recording_active(last_person_ts_ns, now_ns) ||
-            ring_recording_active(ring_open, ring_closed_ts_ns, now_ns);
+            ring_recording_active(ring_open);
 
         if (!want_record) {
             if (ctx->recorder.running()) {
+                {
+                    std::lock_guard<std::mutex> lock(ctx->record_mtx);
+                    if (ctx->ring_press_in_progress || ctx->ring_event_open) {
+                        continue;
+                    }
+                    ctx->recording_stop_in_progress = true;
+                }
                 std::fprintf(stdout, "[record] stop %s\n", ctx->recorder.last_file().c_str());
                 uint64_t stop_begin_ns = monotonic_time_ns();
                 ctx->recorder.stop();
@@ -367,6 +407,8 @@ void recorder_worker(UiContext *ctx) {
                 running_width = 0;
                 running_height = 0;
                 last_written_ts_ns = 0;
+            } else {
+                finalize_pending_ring_recording();
             }
             continue;
         }
@@ -374,18 +416,27 @@ void recorder_worker(UiContext *ctx) {
         uint32_t camera_width = 0;
         uint32_t camera_height = 0;
         uint32_t camera_pixfmt = 0;
+        bool camera_ready = false;
         {
             std::lock_guard<std::mutex> camera_lock(ctx->camera_mtx);
-            if (!ctx->camera || !ctx->camera->ready()) {
-                continue;
+            if (ctx->camera && ctx->camera->ready()) {
+                camera_width = ctx->camera->width();
+                camera_height = ctx->camera->height();
+                camera_pixfmt = ctx->camera->media_pixel_format();
+                camera_ready = true;
             }
-            camera_width = ctx->camera->width();
-            camera_height = ctx->camera->height();
-            camera_pixfmt = ctx->camera->media_pixel_format();
+        }
+        if (!camera_ready) {
+            finalize_pending_ring_recording();
+            continue;
         }
 
 		if (!ctx->recorder.running() || running_width != camera_width || running_height != camera_height) {
             if (ctx->recorder.running()) {
+                {
+                    std::lock_guard<std::mutex> lock(ctx->record_mtx);
+                    ctx->recording_stop_in_progress = true;
+                }
                 std::fprintf(stdout, "[record] restart on resolution change\n");
                 uint64_t stop_begin_ns = monotonic_time_ns();
                 ctx->recorder.stop();
@@ -396,18 +447,30 @@ void recorder_worker(UiContext *ctx) {
                          static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
             }
             uint64_t start_begin_ns = monotonic_time_ns();
-            const auto recording_started_at = std::chrono::system_clock::now();
+            auto recording_started_at = std::chrono::system_clock::now();
             std::string recording_error;
-            auto recording_id = ctx->event_processor
-                ? ctx->event_processor->register_started_recording(
-                      recording_started_at, &recording_error)
-                : std::nullopt;
+            std::optional<std::string> recording_id;
+            bool waiting_for_ring_identity = false;
+            {
+                std::lock_guard<std::mutex> lock(ctx->record_mtx);
+                if (!ctx->pending_ring_recording_id.empty()) {
+                    recording_id = ctx->pending_ring_recording_id;
+                    recording_started_at = ctx->pending_ring_recording_started_at;
+                } else if (ctx->ring_event_open) {
+                    waiting_for_ring_identity = true;
+                } else if (ctx->event_processor) {
+                    recording_id = ctx->event_processor->register_started_recording(
+                        recording_started_at, &recording_error);
+                    if (recording_id) {
+                        ctx->last_recording_attempt_id = *recording_id;
+                    }
+                }
+            }
+            if (waiting_for_ring_identity) {
+                continue;
+            }
             bool started = false;
             if (recording_id) {
-                {
-                    std::lock_guard<std::mutex> lock(ctx->record_mtx);
-                    ctx->last_recording_attempt_id = *recording_id;
-                }
                 ctx->record_cv.notify_all();
                 const std::string temporary_pattern_ref =
                     clip_directory_relative_path(recording_started_at) + "/." +
@@ -456,6 +519,16 @@ void recorder_worker(UiContext *ctx) {
                                      recording_id->c_str(),
                                      finalize_error.c_str());
                     }
+                    {
+                        std::lock_guard<std::mutex> lock(ctx->record_mtx);
+                        if (ctx->pending_ring_recording_id == *recording_id) {
+                            ctx->pending_ring_recording_id.clear();
+                            ctx->pending_ring_recording_started_at = {};
+                        }
+                        if (ctx->last_recording_attempt_id == *recording_id) {
+                            ctx->last_recording_attempt_id.clear();
+                        }
+                    }
                 }
             }
             uint64_t start_end_ns = monotonic_time_ns();
@@ -483,6 +556,10 @@ void recorder_worker(UiContext *ctx) {
                 std::lock_guard<std::mutex> lock(ctx->record_mtx);
                 ctx->current_recording_id = *recording_id;
                 ctx->current_recording_last_segment_ended_at = {};
+                if (ctx->pending_ring_recording_id == *recording_id) {
+                    ctx->pending_ring_recording_id.clear();
+                    ctx->pending_ring_recording_started_at = {};
+                }
             }
             ctx->record_cv.notify_all();
         }
@@ -567,6 +644,10 @@ void recorder_worker(UiContext *ctx) {
         if (!write_ok) {
             std::fprintf(stderr, "[record] write_frame failed, stopping recorder\n");
             uint64_t stop_begin_ns = monotonic_time_ns();
+            {
+                std::lock_guard<std::mutex> lock(ctx->record_mtx);
+                ctx->recording_stop_in_progress = true;
+            }
             ctx->recorder.stop();
             finalize_recording("interrupted");
             uint64_t stop_end_ns = monotonic_time_ns();
@@ -581,6 +662,10 @@ void recorder_worker(UiContext *ctx) {
     if (ctx->recorder.running()) {
         std::fprintf(stdout, "[record] stop %s\n", ctx->recorder.last_file().c_str());
         uint64_t stop_begin_ns = monotonic_time_ns();
+        {
+            std::lock_guard<std::mutex> lock(ctx->record_mtx);
+            ctx->recording_stop_in_progress = true;
+        }
         ctx->recorder.stop();
         finalize_recording("interrupted");
         uint64_t stop_end_ns = monotonic_time_ns();
@@ -695,6 +780,44 @@ void camera_timer_cb(lv_timer_t *timer) {
         ctx->display_frame.resize(bgra_size);
     }
 
+    const uint32_t now = lv_tick_get();
+    std::optional<EventRecord> completed_ring_snapshot_event;
+    std::optional<SelectedSnapshot> selected_ring_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(ctx->ring_snapshot_mtx);
+        if (ctx->ring_snapshot_candidate_selector.active()) {
+            const auto selection_now = std::chrono::steady_clock::now();
+            if (ctx->ring_snapshot_last_sample_ms == 0 ||
+                now - ctx->ring_snapshot_last_sample_ms >=
+                    kRingSnapshotSampleIntervalMs) {
+                ctx->ring_snapshot_last_sample_ms = now;
+                ctx->ring_snapshot_candidate_selector.consider(
+                    ctx->blank, width, height, {}, selection_now);
+            }
+            selected_ring_snapshot =
+                ctx->ring_snapshot_candidate_selector.take_if_ready(selection_now);
+            if (!ctx->ring_snapshot_candidate_selector.active() &&
+                ctx->pending_ring_snapshot_event) {
+                completed_ring_snapshot_event =
+                    std::move(ctx->pending_ring_snapshot_event);
+                ctx->pending_ring_snapshot_event.reset();
+                ctx->ring_snapshot_last_sample_ms = 0;
+            }
+        }
+    }
+    if (completed_ring_snapshot_event && ctx->event_processor) {
+        if (selected_ring_snapshot) {
+            ctx->event_processor->submit_ring_snapshot(
+                std::move(*completed_ring_snapshot_event),
+                std::move(selected_ring_snapshot->rgb),
+                selected_ring_snapshot->width,
+                selected_ring_snapshot->height);
+        } else {
+            ctx->event_processor->submit_ring_snapshot(
+                std::move(*completed_ring_snapshot_event), {}, 0, 0);
+        }
+    }
+
     image_buffer_t rgb_img{};
     rgb_img.width = static_cast<int>(width);
     rgb_img.height = static_cast<int>(height);
@@ -704,7 +827,6 @@ void camera_timer_cb(lv_timer_t *timer) {
     rgb_img.fd = -1;
 
     copy_begin_ns = monotonic_time_ns();
-    uint32_t now = lv_tick_get();
     if (ctx->detector_ready && ctx->person_detection_enabled.load() &&
         now - ctx->last_detect_ms >= kDetectIntervalMs) {
         ctx->last_detect_ms = now;
@@ -741,15 +863,13 @@ void camera_timer_cb(lv_timer_t *timer) {
     const uint64_t overlay_fetch_end_ns = monotonic_time_ns();
 
     bool ring_open = false;
-    uint64_t ring_closed_ts_ns = 0;
     {
         std::lock_guard<std::mutex> lock(ctx->record_mtx);
         ring_open = ctx->ring_event_open;
-        ring_closed_ts_ns = ctx->ring_event_closed_ts_ns;
     }
     const bool want_record =
         person_recording_active(last_person_ts_ns, frame_ts_ns) ||
-        ring_recording_active(ring_open, ring_closed_ts_ns, frame_ts_ns);
+        ring_recording_active(ring_open);
     const uint64_t record_state_end_ns = monotonic_time_ns();
 
 	uint64_t draw_rectangle_begin_ns = monotonic_time_ns();
@@ -967,6 +1087,14 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[audio] capture disabled: %s\n", audio_error.c_str());
     } else {
         std::fprintf(stdout, "[audio] capture manager started device=plughw:0,0\n");
+        const char *configured_chime = std::getenv("DOORBELL_CHIME_WAV");
+        const std::string chime_path =
+            configured_chime && *configured_chime
+            ? configured_chime
+            : "/userdata/doorbell/voices/叮咚门铃版.wav";
+        ctx.doorbell_chime =
+            std::make_unique<DoorbellChimePlayer>(&ctx.audio_capture, chime_path);
+        ctx.doorbell_chime->start();
     }
     // ctx.sdl_window = lv_sdl_window_get_window(disp);
     // if (ctx.sdl_window) {
@@ -1102,13 +1230,11 @@ int main(int argc, char **argv) {
                             if (ctx.active_ring_event_id == event_id) {
                                 ctx.active_ring_event_id.clear();
                                 ctx.ring_event_open = false;
-                                ctx.ring_event_closed_ts_ns = monotonic_time_ns();
                                 applied = true;
                             }
                         } else {
                             ctx.active_ring_event_id = event_id;
                             ctx.ring_event_open = true;
-                            ctx.ring_event_closed_ts_ns = 0;
                             applied = true;
                         }
                         if (applied) {
@@ -1123,103 +1249,65 @@ int main(int argc, char **argv) {
                                  applied ? 1 : 0);
                 });
             provisioning.set_ring_button_handler([&ctx] {
+                if (ctx.doorbell_chime) {
+                    ctx.doorbell_chime->play_once();
+                }
                 if (!ctx.event_processor) {
                     std::fprintf(stderr, "[ring] ignore short press: event processor unavailable\n");
                     return;
                 }
                 const auto pressed_at = std::chrono::system_clock::now();
-                bool ring_was_open = false;
-                {
-                    std::lock_guard<std::mutex> lock(ctx.record_mtx);
-                    ring_was_open = ctx.ring_event_open;
-                    if (!ctx.ring_event_open) {
-                        ctx.last_recording_attempt_id.clear();
-                    }
-                    ctx.ring_event_open = true;
-                    ctx.ring_event_closed_ts_ns = 0;
-                    ++ctx.record_frame_gen;
-                }
-                ctx.record_cv.notify_all();
-
                 std::string recording_id;
                 {
-                    std::unique_lock<std::mutex> lock(ctx.record_mtx);
-                    ctx.record_cv.wait_for(
-                        lock,
-                        std::chrono::seconds(3),
-                        [&ctx] {
-                            return !ctx.current_recording_id.empty() ||
-                                   !ctx.last_recording_attempt_id.empty() ||
-                                   g_stop.load();
-                        });
-                    recording_id = !ctx.current_recording_id.empty()
-                        ? ctx.current_recording_id
-                        : ctx.last_recording_attempt_id;
-                }
-                if (recording_id.empty()) {
-                    std::string recording_error;
-                    auto failed_recording =
-                        ctx.event_processor->register_failed_ring_recording(
-                            pressed_at, &recording_error);
-                    if (!failed_recording) {
-                        std::fprintf(stderr,
-                                     "[ring] create failed recording identity failed error=%s\n",
-                                     recording_error.c_str());
-                        if (!ring_was_open) {
-                            std::lock_guard<std::mutex> lock(ctx.record_mtx);
-                            ctx.ring_event_open = false;
-                            ctx.ring_event_closed_ts_ns = monotonic_time_ns();
-                        }
-                        return;
+                    std::lock_guard<std::mutex> lock(ctx.record_mtx);
+                    ctx.ring_press_in_progress = true;
+                    if (!ctx.recording_stop_in_progress) {
+                        recording_id = !ctx.current_recording_id.empty()
+                            ? ctx.current_recording_id
+                            : ctx.last_recording_attempt_id;
                     }
-                    recording_id = *failed_recording;
-                    {
-                        std::lock_guard<std::mutex> lock(ctx.record_mtx);
-                        ctx.last_recording_attempt_id = recording_id;
-                    }
-                    std::fprintf(stderr,
-                                 "[ring] recorder unavailable; keep failed recording_id=%s\n",
-                                 recording_id.c_str());
                 }
 
                 std::string error;
                 auto press = ctx.event_processor->begin_ring_press(
                     pressed_at, recording_id, &error);
+                {
+                    std::lock_guard<std::mutex> lock(ctx.record_mtx);
+                    ctx.ring_press_in_progress = false;
+                    ++ctx.record_frame_gen;
+                }
+                ctx.record_cv.notify_all();
                 if (!press) {
                     std::fprintf(stderr,
                                  "[ring] persist short press failed recording_id=%s error=%s\n",
                                  recording_id.c_str(),
                                  error.c_str());
-                    if (!ring_was_open) {
-                        std::lock_guard<std::mutex> lock(ctx.record_mtx);
-                        ctx.ring_event_open = false;
-                        ctx.ring_event_closed_ts_ns = monotonic_time_ns();
-                    }
-                    ctx.record_cv.notify_all();
                     return;
                 }
-                if (press->initial && ctx.camera && ctx.camera->ready()) {
-                    std::vector<uint8_t> snapshot_rgb;
-                    uint64_t snapshot_seq = 0;
-                    uint64_t snapshot_ts_ns = 0;
-                    const uint32_t snapshot_width = ctx.camera->width();
-                    const uint32_t snapshot_height = ctx.camera->height();
-                    if (ctx.camera->copy_latest_frame(
-                            snapshot_rgb, snapshot_seq, snapshot_ts_ns)) {
-                        ctx.event_processor->submit_person_snapshot(
-                            press->event,
-                            std::move(snapshot_rgb),
-                            snapshot_width,
-                            snapshot_height);
-                        std::fprintf(stdout,
-                                     "[ring] snapshot queued event_id=%s frame_seq=%llu\n",
-                                     press->event.event_id.c_str(),
-                                     static_cast<unsigned long long>(snapshot_seq));
-                    } else {
-                        std::fprintf(stderr,
-                                     "[ring] snapshot unavailable event_id=%s error_code=NO_CAMERA_FRAME\n",
-                                     press->event.event_id.c_str());
+                if (press->initial) {
+                    if (recording_id.empty()) {
+                        {
+                            std::lock_guard<std::mutex> lock(ctx.record_mtx);
+                            ctx.pending_ring_recording_id =
+                                press->event.recording_id;
+                            ctx.pending_ring_recording_started_at = pressed_at;
+                            ctx.last_recording_attempt_id =
+                                press->event.recording_id;
+                            ++ctx.record_frame_gen;
+                        }
+                        ctx.record_cv.notify_all();
                     }
+                    {
+                        std::lock_guard<std::mutex> lock(ctx.ring_snapshot_mtx);
+                        ctx.pending_ring_snapshot_event = press->event;
+                        ctx.ring_snapshot_last_sample_ms = 0;
+                        ctx.ring_snapshot_candidate_selector.start(
+                            std::chrono::steady_clock::now());
+                    }
+                    std::fprintf(stdout,
+                                 "[ring] one-second snapshot selection started "
+                                 "event_id=%s\n",
+                                 press->event.event_id.c_str());
                 }
                 std::fprintf(stdout,
                              "[ring] short press persisted event_id=%s press_seq=%d initial=%d "
@@ -1309,6 +1397,7 @@ int main(int argc, char **argv) {
     if (ctx.event_processor) ctx.event_processor->stop();
     close_perf_log_file();
     provisioning.stop();
+    if (ctx.doorbell_chime) ctx.doorbell_chime->stop();
     ctx.audio_capture.stop();
     ctx.camera->stop();
     delete ctx.camera;
