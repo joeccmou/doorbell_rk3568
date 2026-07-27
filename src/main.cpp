@@ -1105,7 +1105,7 @@ int main(int argc, char **argv) {
         const std::string chime_path =
             configured_chime && *configured_chime
             ? configured_chime
-            : "/userdata/doorbell/voices/叮咚门铃版.wav";
+            : "/userdata/doorbell/voices/dingdong.wav";
         ctx.doorbell_chime =
             std::make_unique<DoorbellChimePlayer>(&ctx.audio_capture, chime_path);
         ctx.doorbell_chime->start();

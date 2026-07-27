@@ -5,8 +5,15 @@
 #include <gst/app/gstappsink.h>
 
 #include <cstdio>
+#include <cstdint>
 #include <filesystem>
 #include <utility>
+
+namespace {
+
+constexpr unsigned kChimeRepeatCount = 2;
+
+}
 
 DoorbellChimePlayer::DoorbellChimePlayer(
     AudioCaptureManager *audio,
@@ -30,39 +37,74 @@ void DoorbellChimePlayer::stop() {
 }
 
 void DoorbellChimePlayer::play_once() {
+    // 新按铃只保留最新请求，播放线程会立即中断旧铃声并从头播放两次。
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        ++pending_plays_;
+        requested_play_sequence_.fetch_add(1);
     }
     cv_.notify_one();
 }
 
 void DoorbellChimePlayer::worker_loop() {
+    uint64_t handled_play_sequence = 0;
     while (!stop_requested_.load()) {
+        uint64_t play_sequence = 0;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] {
-                return stop_requested_.load() || pending_plays_ > 0;
+            cv_.wait(lock, [this, &handled_play_sequence] {
+                return stop_requested_.load() ||
+                       requested_play_sequence_.load() != handled_play_sequence;
             });
             if (stop_requested_.load()) break;
-            --pending_plays_;
+            play_sequence = requested_play_sequence_.load();
+            handled_play_sequence = play_sequence;
         }
-        if (!play_file_once()) {
-            std::fprintf(stderr,
-                         "[ring] play device chime failed path=%s\n",
-                         wav_path_.c_str());
+
+        for (unsigned repeat_index = 1;
+             repeat_index <= kChimeRepeatCount;
+             ++repeat_index) {
+            const PlaybackResult result =
+                play_file_once(play_sequence, repeat_index);
+            if (result == PlaybackResult::kFailed) {
+                std::fprintf(stderr,
+                             "[ring] play device chime failed path=%s "
+                             "play_sequence=%llu repeat=%u/%u\n",
+                             wav_path_.c_str(),
+                             static_cast<unsigned long long>(play_sequence),
+                             repeat_index,
+                             kChimeRepeatCount);
+                break;
+            }
+            if (result == PlaybackResult::kInterrupted) {
+                std::fprintf(stdout,
+                             "[ring] device chime interrupted "
+                             "play_sequence=%llu repeat=%u/%u\n",
+                             static_cast<unsigned long long>(play_sequence),
+                             repeat_index,
+                             kChimeRepeatCount);
+                break;
+            }
         }
     }
 }
 
-bool DoorbellChimePlayer::play_file_once() {
+DoorbellChimePlayer::PlaybackResult DoorbellChimePlayer::play_file_once(
+    uint64_t play_sequence,
+    unsigned repeat_index) {
+    const auto interrupted = [this, play_sequence] {
+        return stop_requested_.load() ||
+               requested_play_sequence_.load() != play_sequence;
+    };
+    if (interrupted()) {
+        return PlaybackResult::kInterrupted;
+    }
     if (!audio_ || !audio_->running() || !std::filesystem::is_regular_file(wav_path_)) {
-        return false;
+        return PlaybackResult::kFailed;
     }
 
     gchar *description = g_strdup_printf(
         "filesrc location=\"%s\" ! wavparse ! audioconvert ! audioresample ! "
-        "%s ! appsink name=chime_sink sync=false max-buffers=8 drop=false",
+        "%s ! appsink name=chime_sink sync=true max-buffers=8 drop=false",
         wav_path_.c_str(),
         audio_webrtc_raw_caps());
     GError *error = nullptr;
@@ -73,7 +115,7 @@ bool DoorbellChimePlayer::play_file_once() {
             std::fprintf(stderr, "[ring] create chime pipeline failed error=%s\n", error->message);
             g_error_free(error);
         }
-        return false;
+        return PlaybackResult::kFailed;
     }
     if (error) {
         std::fprintf(stderr, "[ring] chime pipeline warning=%s\n", error->message);
@@ -88,14 +130,16 @@ bool DoorbellChimePlayer::play_file_once() {
         if (bus) gst_object_unref(bus);
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
-        return false;
+        return PlaybackResult::kFailed;
     }
 
     bool ok = true;
     bool finished = false;
-    while (!stop_requested_.load() && !finished) {
+    uint64_t sample_count = 0;
+    uint64_t duration_ns = 0;
+    while (!interrupted() && !finished) {
         GstSample *sample =
-            gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 100 * GST_MSECOND);
+            gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 50 * GST_MSECOND);
         if (sample) {
             GstBuffer *buffer = gst_sample_get_buffer(sample);
             GstMapInfo map{};
@@ -107,6 +151,8 @@ bool DoorbellChimePlayer::play_file_once() {
                                         GST_BUFFER_DURATION(buffer))
                     ? GST_BUFFER_DURATION(buffer)
                     : 20ULL * 1000ULL * 1000ULL;
+                sample_count += map.size / sizeof(int16_t);
+                duration_ns += frame.duration_ns;
                 ok = audio_->push_playback_frame(frame) && ok;
                 gst_buffer_unmap(buffer, &map);
             }
@@ -137,5 +183,22 @@ bool DoorbellChimePlayer::play_file_once() {
     gst_object_unref(bus);
     gst_object_unref(sink);
     gst_object_unref(pipeline);
-    return ok && finished;
+
+    if (interrupted()) {
+        return PlaybackResult::kInterrupted;
+    }
+    if (!ok || !finished) {
+        return PlaybackResult::kFailed;
+    }
+
+    std::fprintf(stdout,
+                 "[ring] device chime completed play_sequence=%llu "
+                 "repeat=%u/%u samples=%llu duration_ms=%llu\n",
+                 static_cast<unsigned long long>(play_sequence),
+                 repeat_index,
+                 kChimeRepeatCount,
+                 static_cast<unsigned long long>(sample_count),
+                 static_cast<unsigned long long>(
+                     duration_ns / (1000ULL * 1000ULL)));
+    return PlaybackResult::kCompleted;
 }

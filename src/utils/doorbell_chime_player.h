@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -21,14 +22,22 @@ public:
     void play_once();
 
 private:
+    enum class PlaybackResult {
+        kCompleted,
+        kInterrupted,
+        kFailed,
+    };
+
     void worker_loop();
-    bool play_file_once();
+    PlaybackResult play_file_once(
+        uint64_t play_sequence,
+        unsigned repeat_index);
 
     AudioCaptureManager *audio_ = nullptr;
     std::string wav_path_;
     std::atomic<bool> stop_requested_{false};
+    std::atomic<uint64_t> requested_play_sequence_{0};
     std::mutex mutex_;
     std::condition_variable cv_;
-    unsigned pending_plays_ = 0;
     std::thread worker_;
 };
