@@ -1,5 +1,6 @@
 #include "mp4_recorder.h"
 #include "perf_logger.h"
+#include "image_utils.h"
 
 #include <algorithm>
 #include <chrono>
@@ -62,23 +63,29 @@ Mp4Recorder::~Mp4Recorder() {
 }
 
 bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
-                                  uint32_t width,
-                                  uint32_t height,
+                                  uint32_t source_width,
+                                  uint32_t source_height,
+                                  uint32_t output_width,
+                                  uint32_t output_height,
                                   uint32_t fps,
                                   uint32_t pixfmt,
+                                  uint32_t bitrate,
                                   SegmentClosedCallback segment_closed_callback) {
     uint64_t start_begin_ns = mono_time_ns();
     rec_trace("start enter pattern=%s w=%u h=%u fps=%u pixfmt=%c%c%c%c",
               temporary_file_pattern.c_str(),
-              width,
-              height,
+              output_width,
+              output_height,
               fps,
               pixfmt & 0xFF,
               (pixfmt >> 8) & 0xFF,
               (pixfmt >> 16) & 0xFF,
               (pixfmt >> 24) & 0xFF);
     if (running()) return true;
-    if (temporary_file_pattern.empty() || width == 0 || height == 0 || fps == 0) return false;
+    if (temporary_file_pattern.empty() || source_width == 0 || source_height == 0 ||
+        output_width == 0 || output_height == 0 || fps == 0 || bitrate == 0) {
+        return false;
+    }
 
     const std::string output_dir = std::filesystem::path(temporary_file_pattern).parent_path().string();
     std::error_code ec;
@@ -102,7 +109,7 @@ bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
     switch (pixfmt) {
         case V4L2_PIX_FMT_NV12:
             gst_format = "NV12";
-            frame_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 3 / 2;
+            frame_size = static_cast<size_t>(output_width) * static_cast<size_t>(output_height) * 3 / 2;
             break;
         default:
             g_printerr("[recorder] unsupported media pixfmt: %c%c%c%c\n",
@@ -124,20 +131,22 @@ bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
         pipeline_desc = g_strdup_printf(
             "appsrc name=vsrc is-live=true block=false format=time do-timestamp=true "
             "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "            "! queue leaky=downstream max-size-buffers=2 "
-            "! mpph264enc ! h264parse config-interval=-1 ! queue ! mux.video "
+            "! mpph264enc bps=%u gop=24 header-mode=each-idr "
+            "! h264parse config-interval=-1 ! queue ! mux.video "
             "appsrc name=asrc is-live=true block=false format=time do-timestamp=false "
             "caps=audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1 "
             "! queue leaky=downstream max-size-buffers=16 ! audioconvert ! audioresample "
             "! voaacenc bitrate=128000 ! aacparse ! queue ! mux.audio_0 "
             "splitmuxsink name=mux",
-            gst_format, width, height, fps);
+            gst_format, output_width, output_height, fps, bitrate);
     } else {
         pipeline_desc = g_strdup_printf(
             "appsrc name=vsrc is-live=true block=false format=time do-timestamp=true "
             "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "            "! queue leaky=downstream max-size-buffers=2 "
-            "! mpph264enc ! h264parse config-interval=-1 ! queue ! mux.video "
+            "! mpph264enc bps=%u gop=24 header-mode=each-idr "
+            "! h264parse config-interval=-1 ! queue ! mux.video "
             "splitmuxsink name=mux",
-            gst_format, width, height, fps);
+            gst_format, output_width, output_height, fps, bitrate);
     }
 
     GError *error = nullptr;
@@ -238,6 +247,13 @@ bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
     bus_ = gst_element_get_bus(pipeline_);
 
     frame_size_ = frame_size;
+    source_frame_size_ =
+        static_cast<size_t>(source_width) * static_cast<size_t>(source_height) * 3 / 2;
+    source_width_ = source_width;
+    source_height_ = source_height;
+    output_width_ = output_width;
+    output_height_ = output_height;
+    scaled_frame_.assign(frame_size_, 0);
     frame_duration_ns_ = GST_SECOND / fps;
     frame_index_ = 0;
     first_frame_ts_ns_ = 0;
@@ -321,6 +337,12 @@ void Mp4Recorder::stop() {
     rec_trace("stop done total_ms=%.3f", static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
 
     frame_size_ = 0;
+    source_frame_size_ = 0;
+    source_width_ = 0;
+    source_height_ = 0;
+    output_width_ = 0;
+    output_height_ = 0;
+    scaled_frame_.clear();
     frame_duration_ns_ = 0;
     frame_index_ = 0;
     first_frame_ts_ns_ = 0;
@@ -334,7 +356,7 @@ void Mp4Recorder::stop() {
 }
 
 bool Mp4Recorder::write_frame(const uint8_t *data, size_t size, uint64_t frame_ts_ns) {
-    if (!pipeline_ || !appsrc_ || !data || size < frame_size_) return false;
+    if (!pipeline_ || !appsrc_ || !data || size < source_frame_size_) return false;
     const uint64_t frame_idx = frame_index_;
     uint64_t wf_begin_ns = mono_time_ns();
     rec_trace("write enter idx=%llu size=%zu", static_cast<unsigned long long>(frame_idx), size);
@@ -354,6 +376,31 @@ bool Mp4Recorder::write_frame(const uint8_t *data, size_t size, uint64_t frame_t
               static_cast<double>(bus_end_ns - bus_begin_ns) / 1000000.0);
 
     uint64_t alloc_begin_ns = mono_time_ns();
+    const uint8_t *encoded_input = data;
+    if (source_width_ != output_width_ || source_height_ != output_height_) {
+        image_buffer_t source{};
+        source.width = static_cast<int>(source_width_);
+        source.height = static_cast<int>(source_height_);
+        source.format = IMAGE_FORMAT_YUV420SP_NV12;
+        source.size = static_cast<int>(source_frame_size_);
+        source.virt_addr = const_cast<uint8_t *>(data);
+        source.fd = -1;
+
+        image_buffer_t output{};
+        output.width = static_cast<int>(output_width_);
+        output.height = static_cast<int>(output_height_);
+        output.format = IMAGE_FORMAT_YUV420SP_NV12;
+        output.size = static_cast<int>(frame_size_);
+        output.virt_addr = scaled_frame_.data();
+        output.fd = -1;
+        if (convert_image(&source, &output, nullptr, nullptr, 0) != 0) {
+            g_printerr("[recorder] RGA scale failed %ux%u -> %ux%u\n",
+                       source_width_, source_height_, output_width_, output_height_);
+            return false;
+        }
+        encoded_input = scaled_frame_.data();
+    }
+
     GstBuffer *buffer = gst_buffer_new_allocate(nullptr, frame_size_, nullptr);
     uint64_t alloc_end_ns = mono_time_ns();
     rec_trace("write buffer alloc idx=%llu alloc_ms=%.3f",
@@ -366,7 +413,7 @@ bool Mp4Recorder::write_frame(const uint8_t *data, size_t size, uint64_t frame_t
         gst_buffer_unref(buffer);
         return false;
     }
-    std::memcpy(map.data, data, frame_size_);
+    std::memcpy(map.data, encoded_input, frame_size_);
     gst_buffer_unmap(buffer, &map);
     uint64_t copy_end_ns = mono_time_ns();
     rec_trace("write map+copy idx=%llu copy_ms=%.3f",

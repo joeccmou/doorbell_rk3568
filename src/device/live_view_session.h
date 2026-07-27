@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -21,6 +22,14 @@ public:
         virtual void handle_signal(const std::string &payload) = 0;
         virtual void set_frame_provider(FrameProvider provider) = 0;
         virtual void set_audio_manager(AudioCaptureManager *manager) = 0;
+        virtual bool switch_quality(
+            const std::string &trace_id,
+            const std::string &quality,
+            LiveWebRtcSession::QualitySwitchCallback callback,
+            std::string *error_code) {
+            if (error_code) *error_code = "LIVE_QUALITY_SWITCH_FAILED";
+            return false;
+        }
     };
 
     struct Publishers {
@@ -28,8 +37,13 @@ public:
                            const std::string &cmd_id,
                            bool ok,
                            const std::string &error_code)> command_ack_publisher;
+        std::function<void(const std::string &trace_id,
+                           const std::string &cmd_id,
+                           bool ok,
+                           const std::string &error_code,
+                           const std::string &data_json)> command_ack_data_publisher;
         std::function<void(const std::string &payload)> signal_publisher;
-        std::function<void(const std::string &payload)> media_state_publisher;
+        std::function<bool(const std::string &payload)> media_state_publisher;
     };
 
     LiveViewSession(std::string device_id, Publishers publishers);
@@ -43,14 +57,16 @@ public:
     void set_audio_manager(AudioCaptureManager *manager);
     bool handle_command(const std::string &payload);
     void handle_signal(const std::string &payload);
+    bool publish_startup_media_state();
     void stop();
 
 private:
     void publish_command_ack(const std::string &trace_id,
                              const std::string &cmd_id,
                              bool ok,
-                             const std::string &error_code = "");
-    void publish_media_state(const std::string &trace_id,
+                             const std::string &error_code = "",
+                             const std::string &data_json = "");
+    bool publish_media_state(const std::string &trace_id,
                              const std::string &call_id,
                              const std::string &media_state,
                              const std::string &error_code = "",
@@ -60,6 +76,8 @@ private:
 
     std::string device_id_;
     std::string current_mode_ = "live_view";
+    std::mutex session_mtx_;
+    std::string current_call_id_;
     Publishers publishers_;
     std::unique_ptr<RtcBackend> backend_;
 };

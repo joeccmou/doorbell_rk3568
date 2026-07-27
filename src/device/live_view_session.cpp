@@ -19,6 +19,13 @@ std::string iso_utc_now() {
     return std::string(buf);
 }
 
+std::pair<int, int> quality_dimensions(const std::string &quality) {
+    if (quality == "360p") return {640, 360};
+    if (quality == "1080p") return {1920, 1080};
+    if (quality == "1440p") return {2560, 1440};
+    return {1280, 720};
+}
+
 class LiveWebRtcBackend final : public LiveViewSession::RtcBackend {
 public:
     LiveWebRtcBackend(LiveWebRtcSession::SignalPublisher signal_publisher,
@@ -43,6 +50,15 @@ public:
 
     void set_audio_manager(AudioCaptureManager *manager) override {
         session_.set_audio_manager(manager);
+    }
+
+    bool switch_quality(
+        const std::string &trace_id,
+        const std::string &quality,
+        LiveWebRtcSession::QualitySwitchCallback callback,
+        std::string *error_code) override {
+        return session_.switch_quality(
+            trace_id, quality, std::move(callback), error_code);
     }
 
 private:
@@ -93,6 +109,10 @@ bool LiveViewSession::handle_command(const std::string &payload) {
 
         if (action == "start_live" || action == "answer_call") {
             current_mode_ = action == "answer_call" ? "call" : "live_view";
+            {
+                std::lock_guard<std::mutex> lock(session_mtx_);
+                current_call_id_ = call_id;
+            }
             publish_command_ack(trace_id, cmd_id, true);
             publish_media_state(trace_id, call_id, "connecting");
 
@@ -111,9 +131,64 @@ bool LiveViewSession::handle_command(const std::string &payload) {
             return true;
         }
 
+        if (action == "set_live_quality") {
+            std::string current_call_id;
+            {
+                std::lock_guard<std::mutex> lock(session_mtx_);
+                current_call_id = current_call_id_;
+            }
+            const std::string quality = in.value("quality", "");
+            if (call_id.empty() || call_id != current_call_id) {
+                publish_command_ack(
+                    trace_id, cmd_id, false, "CALL_NOT_ACTIVE");
+                return true;
+            }
+            std::string error_code;
+            const bool accepted = backend_ && backend_->switch_quality(
+                trace_id,
+                quality,
+                [this, trace_id, cmd_id, call_id](
+                    bool ok,
+                    const std::string &applied_quality,
+                    const std::string &previous_quality,
+                    const std::string &switch_error) {
+                    const auto [width, height] =
+                        quality_dimensions(applied_quality);
+                    nlohmann::json data = {
+                        {"call_id", call_id},
+                        {"state", ok ? "applied" : "failed"},
+                        {"quality", applied_quality},
+                        {"previous_quality", previous_quality},
+                        {"width", width},
+                        {"height", height},
+                    };
+                    publish_command_ack(
+                        trace_id,
+                        cmd_id,
+                        ok,
+                        ok ? "" : switch_error,
+                        data.dump());
+                },
+                &error_code);
+            if (!accepted) {
+                publish_command_ack(
+                    trace_id,
+                    cmd_id,
+                    false,
+                    error_code.empty()
+                        ? "LIVE_QUALITY_SWITCH_FAILED"
+                        : error_code);
+            }
+            return true;
+        }
+
         if (action == "hangup") {
             publish_command_ack(trace_id, cmd_id, true);
             if (backend_) backend_->stop();
+            {
+                std::lock_guard<std::mutex> lock(session_mtx_);
+                current_call_id_.clear();
+            }
             publish_media_state(trace_id, call_id, "idle");
             std::fprintf(stdout, "[mqtt] accepted hangup call_id=%s\n", call_id.c_str());
             return true;
@@ -133,27 +208,39 @@ void LiveViewSession::handle_signal(const std::string &payload) {
     }
 }
 
+bool LiveViewSession::publish_startup_media_state() {
+    return publish_media_state("", "", "idle");
+}
+
 void LiveViewSession::stop() {
     if (backend_) {
         backend_->stop();
     }
+    std::lock_guard<std::mutex> lock(session_mtx_);
+    current_call_id_.clear();
 }
 
 void LiveViewSession::publish_command_ack(const std::string &trace_id,
                                           const std::string &cmd_id,
                                           bool ok,
-                                          const std::string &error_code) {
+                                          const std::string &error_code,
+                                          const std::string &data_json) {
+    if (!data_json.empty() && publishers_.command_ack_data_publisher) {
+        publishers_.command_ack_data_publisher(
+            trace_id, cmd_id, ok, error_code, data_json);
+        return;
+    }
     if (publishers_.command_ack_publisher) {
         publishers_.command_ack_publisher(trace_id, cmd_id, ok, error_code);
     }
 }
 
-void LiveViewSession::publish_media_state(const std::string &trace_id,
+bool LiveViewSession::publish_media_state(const std::string &trace_id,
                                           const std::string &call_id,
                                           const std::string &media_state,
                                           const std::string &error_code,
                                           const std::string &error_message) {
-    if (!publishers_.media_state_publisher) return;
+    if (!publishers_.media_state_publisher) return false;
 
     nlohmann::json media;
     media["trace_id"] = trace_id;
@@ -168,7 +255,7 @@ void LiveViewSession::publish_media_state(const std::string &trace_id,
     media["error_code"] = has_error ? nlohmann::json(error_code) : nlohmann::json(nullptr);
     media["error_message"] = has_error ? nlohmann::json(error_message) : nlohmann::json(nullptr);
     media["updated_at"] = iso_utc_now();
-    publishers_.media_state_publisher(media.dump());
+    return publishers_.media_state_publisher(media.dump());
 }
 
 LiveWebRtcSession::StartRequest LiveViewSession::parse_start_request(const std::string &device_id,
@@ -177,7 +264,7 @@ LiveWebRtcSession::StartRequest LiveViewSession::parse_start_request(const std::
     request.trace_id = command.value("trace_id", "");
     request.call_id = command.value("call_id", "");
     request.device_id = device_id;
-    request.quality = command.value("quality", "720p");
+    request.quality = command.value("quality", "1080p");
     if (command.contains("ice_servers") && command["ice_servers"].is_array()) {
         for (const auto &item : command["ice_servers"]) {
             LiveWebRtcSession::IceServer server;

@@ -14,6 +14,7 @@ struct DeviceSettingsPatch {
     std::optional<std::string> person_sensitivity;
     std::optional<bool> status_led;
     std::optional<bool> image_rotate180;
+    std::optional<std::string> recording_quality;
     std::optional<std::string> timezone;
 
     bool empty() const;

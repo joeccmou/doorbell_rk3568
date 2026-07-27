@@ -5,7 +5,8 @@
 #include <nlohmann/json.hpp>
 
 bool DeviceSettingsPatch::empty() const {
-    return !person_detection && !person_sensitivity && !status_led && !image_rotate180 && !timezone;
+    return !person_detection && !person_sensitivity && !status_led &&
+           !image_rotate180 && !recording_quality && !timezone;
 }
 
 DeviceSettingsCommand parse_device_settings_command(const std::string &payload) {
@@ -39,8 +40,9 @@ DeviceSettingsCommand parse_device_settings_command(const std::string &payload) 
             return command;
         }
         const auto &settings = body["params"]["settings"];
-        static constexpr std::array<const char *, 5> allowed = {
-            "person_detection", "person_sensitivity", "status_led", "image_rotate180", "timezone"};
+        static constexpr std::array<const char *, 6> allowed = {
+            "person_detection", "person_sensitivity", "status_led", "image_rotate180",
+            "recording_quality", "timezone"};
         for (auto it = settings.begin(); it != settings.end(); ++it) {
             bool known = false;
             for (const char *name : allowed) known = known || it.key() == name;
@@ -53,6 +55,7 @@ DeviceSettingsCommand parse_device_settings_command(const std::string &payload) 
         if (settings.contains("person_sensitivity")) command.patch.person_sensitivity = settings.at("person_sensitivity").get<std::string>();
         if (settings.contains("status_led")) command.patch.status_led = settings.at("status_led").get<bool>();
         if (settings.contains("image_rotate180")) command.patch.image_rotate180 = settings.at("image_rotate180").get<bool>();
+        if (settings.contains("recording_quality")) command.patch.recording_quality = settings.at("recording_quality").get<std::string>();
         if (settings.contains("timezone")) command.patch.timezone = settings.at("timezone").get<std::string>();
         if (command.patch.empty()) {
             command.error_code = "INVALID_DEVICE_SETTINGS";

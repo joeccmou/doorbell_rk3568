@@ -17,6 +17,18 @@ size_t append_response(char *data, size_t size, size_t count, void *user_data) {
     response->append(data, size * count);
     return size * count;
 }
+
+std::string summarize_response(std::string response) {
+    for (char &ch : response) {
+        if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
+    }
+    constexpr size_t kMaxResponseLength = 512;
+    if (response.size() > kMaxResponseLength) {
+        response.resize(kMaxResponseLength);
+        response += "...";
+    }
+    return response;
+}
 }
 
 HttpSnapshotUploader::HttpSnapshotUploader(std::string api_base_url,
@@ -98,7 +110,21 @@ bool HttpSnapshotUploader::upload(const std::string &jpeg_path,
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     if (result != CURLE_OK || status < 200 || status >= 300) {
-        if (error) *error = result != CURLE_OK ? curl_easy_strerror(result) : "snapshot server rejected upload";
+        if (error) {
+            std::ostringstream message;
+            if (result != CURLE_OK) {
+                message << "snapshot upload transport failed: "
+                        << curl_easy_strerror(result);
+            } else {
+                message << "snapshot server rejected upload: http_status="
+                        << status;
+            }
+            const std::string response_summary = summarize_response(response);
+            if (!response_summary.empty()) {
+                message << " response=" << response_summary;
+            }
+            *error = message.str();
+        }
         return false;
     }
     try {

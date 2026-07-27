@@ -174,7 +174,9 @@ void MqttDeviceClient::stop(bool /*publish_offline*/) {
 }
 
 bool MqttDeviceClient::publish_signal(const std::string &payload) {
-    return publish_payload(signal_topic(), payload, 1, false);
+    // WebRTC 回调可能在设置远端 SDP 时发布 ICE；同步等 PUBACK 会与 MQTT
+    // 收包线程形成互等，因此信令保持 QoS 1，但发送路径不阻塞 GStreamer。
+    return publish_payload_nonblocking(signal_topic(), payload, 1, false);
 }
 
 bool MqttDeviceClient::publish_media_state(const std::string &payload) {

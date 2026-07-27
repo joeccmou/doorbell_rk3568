@@ -1,5 +1,7 @@
 ﻿#include "device/live_webrtc_session.h"
 
+#include "utils/image_utils.h"
+
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <gst/sdp/sdp.h>
@@ -11,6 +13,7 @@
 #include <thread>
 #include <linux/videodev2.h>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <utility>
@@ -381,7 +384,22 @@ const char *message_source_name(GstMessage *message) {
     return GST_OBJECT_NAME(GST_MESSAGE_SRC(message));
 }
 
+bool is_video_branch_source(const char *source) {
+    if (!source) return false;
+    return std::strcmp(source, "live_appsrc") == 0 ||
+           std::strcmp(source, "raw_queue") == 0 ||
+           std::strcmp(source, "live_enc") == 0 ||
+           std::strcmp(source, "live_parse") == 0 ||
+           std::strcmp(source, "live_pay") == 0 ||
+           std::strcmp(source, "rtp_queue") == 0;
+}
+
 }  // namespace
+
+struct LiveWebRtcSession::RemoteDescriptionContext {
+    LiveWebRtcSession *session = nullptr;
+    std::string call_id;
+};
 
 LiveWebRtcSession::LiveWebRtcSession(SignalPublisher signal_publisher, StatePublisher state_publisher)
     : signal_publisher_(std::move(signal_publisher)), state_publisher_(std::move(state_publisher)) {}
@@ -461,23 +479,12 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
                      frame_size);
         return false;
     }
-    if (profile.width != static_cast<int>(initial_frame.width) ||
-        profile.height != static_cast<int>(initial_frame.height)) {
-        std::fprintf(stderr,
-                     "[live] requested quality=%s profile=%dx%d but camera provides %ux%u; using camera frame size\n",
-                     request.quality.c_str(),
-                     profile.width,
-                     profile.height,
-                     initial_frame.width,
-                     initial_frame.height);
-    }
-
     std::ostringstream desc;
     desc << "webrtcbin name=webrtc bundle-policy=max-bundle stun-server=" << stun_server
          << " appsrc name=live_appsrc is-live=true block=false format=time do-timestamp=false "
          << "caps=video/x-raw,format=" << gst_format
-         << ",width=" << initial_frame.width
-         << ",height=" << initial_frame.height
+         << ",width=" << profile.width
+         << ",height=" << profile.height
          << ",framerate=24/1 ! queue name=raw_queue leaky=downstream max-size-buffers=2 ! "
          << "mpph264enc name=live_enc bps=" << profile.bitrate << " gop=24 header-mode=each-idr ! "
          << "h264parse name=live_parse config-interval=-1 ! "
@@ -520,10 +527,26 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         return false;
     }
     gst_app_src_set_stream_type(GST_APP_SRC(appsrc), GST_APP_STREAM_TYPE_STREAM);
-    g_object_set(G_OBJECT(appsrc), "block", FALSE, nullptr);
+    const guint64 appsrc_max_bytes = static_cast<guint64>(
+        raw_frame_size(initial_frame.pixfmt,
+                       static_cast<uint32_t>(profile.width),
+                       static_cast<uint32_t>(profile.height))) * 2;
+    g_object_set(G_OBJECT(appsrc),
+                 "block", FALSE,
+                 "max-bytes", appsrc_max_bytes,
+                 nullptr);
+    GstElement *video_encoder = gst_bin_get_by_name(GST_BIN(pipeline), "live_enc");
+    if (!video_encoder) {
+        gst_object_unref(appsrc);
+        gst_object_unref(webrtc);
+        gst_object_unref(pipeline);
+        if (error_message) *error_message = "live video encoder element not found";
+        return false;
+    }
 
     GstElement *rtp_queue = gst_bin_get_by_name(GST_BIN(pipeline), "rtp_queue");
     if (!rtp_queue) {
+        gst_object_unref(video_encoder);
         gst_object_unref(appsrc);
         gst_object_unref(webrtc);
         gst_object_unref(pipeline);
@@ -689,6 +712,7 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         pipeline_ = pipeline;
         webrtc_ = webrtc;
         appsrc_ = appsrc;
+        video_encoder_ = video_encoder;
         audio_appsrc_ = audio_appsrc;
         remote_audio_queue_ = remote_audio_queue;
         remote_audio_sink_ = remote_audio_sink;
@@ -705,14 +729,24 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         video_input_count_.store(0);
         rtp_buffer_count_ = 0;
         rtp_bytes_ = 0;
-        appsrc_width_ = initial_frame.width;
-        appsrc_height_ = initial_frame.height;
+        appsrc_width_ = static_cast<uint32_t>(profile.width);
+        appsrc_height_ = static_cast<uint32_t>(profile.height);
         appsrc_pixfmt_ = initial_frame.pixfmt;
-        appsrc_frame_size_ = frame_size;
+        appsrc_frame_size_ = raw_frame_size(
+            initial_frame.pixfmt,
+            static_cast<uint32_t>(profile.width),
+            static_cast<uint32_t>(profile.height));
         frame_stop_.store(false);
+        video_paused_.store(false);
         active_published_ = false;
         offer_requested_ = false;
+        pending_quality_switch_.reset();
+        quality_switch_deadline_ = {};
+        quality_switch_answer_applied_ = false;
+        quality_switch_watchdog_stop_ = false;
     }
+    quality_switch_watchdog_thread_ =
+        std::thread(&LiveWebRtcSession::quality_switch_watchdog_loop, this);
 
     GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
@@ -739,11 +773,93 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
                  request.quality.c_str(),
                  profile.width,
                  profile.height,
-                 initial_frame.width,
-                 initial_frame.height,
+                 static_cast<unsigned int>(profile.width),
+                 static_cast<unsigned int>(profile.height),
                  profile.bitrate,
                  request.call_id.c_str());
     request_offer("start");
+    return true;
+}
+
+bool LiveWebRtcSession::switch_quality(const std::string &trace_id,
+                                       const std::string &quality,
+                                       QualitySwitchCallback callback,
+                                       std::string *error_code) {
+    if (quality != "360p" && quality != "720p" &&
+        quality != "1080p" && quality != "1440p") {
+        if (error_code) *error_code = "INVALID_QUALITY";
+        return false;
+    }
+
+    GstElement *appsrc = nullptr;
+    GstElement *encoder = nullptr;
+    QualityProfile profile = profile_for_quality(quality);
+    std::string previous_quality;
+    std::string call_id;
+    uint32_t pixfmt = 0;
+    bool unchanged = false;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!webrtc_ || !appsrc_ || !video_encoder_ || !active_published_) {
+            if (error_code) *error_code = "CALL_NOT_ACTIVE";
+            return false;
+        }
+        if (pending_quality_switch_) {
+            if (error_code) *error_code = "LIVE_QUALITY_SWITCH_IN_PROGRESS";
+            return false;
+        }
+        previous_quality = current_.quality;
+        call_id = current_.call_id;
+        pixfmt = appsrc_pixfmt_;
+        unchanged = previous_quality == quality;
+        if (!unchanged) {
+            pending_quality_switch_ = PendingQualitySwitch{
+                trace_id, previous_quality, quality, std::move(callback)};
+            quality_switch_deadline_ =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            quality_switch_answer_applied_ = false;
+            current_.trace_id = trace_id;
+            current_.quality = quality;
+            appsrc_width_ = static_cast<uint32_t>(profile.width);
+            appsrc_height_ = static_cast<uint32_t>(profile.height);
+            appsrc_frame_size_ = raw_frame_size(
+                appsrc_pixfmt_, appsrc_width_, appsrc_height_);
+            offer_requested_ = false;
+            video_paused_.store(true);
+            appsrc = appsrc_;
+            encoder = video_encoder_;
+            gst_object_ref(appsrc);
+            gst_object_ref(encoder);
+        }
+    }
+    quality_switch_cv_.notify_all();
+    if (unchanged) {
+        if (callback) callback(true, quality, previous_quality, "");
+        return true;
+    }
+
+    gst_object_unref(encoder);
+    gst_object_unref(appsrc);
+
+    if (!reconfigure_video_branch(profile, pixfmt, "quality-switch")) {
+        std::fprintf(stderr,
+                     "[live] quality switch video branch reconfigure failed call_id=%s %s -> %s\n",
+                     call_id.c_str(),
+                     previous_quality.c_str(),
+                     quality.c_str());
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
+        return true;
+    }
+
+    std::fprintf(stdout,
+                 "[live] quality switch requested call_id=%s %s -> %s (%dx%d bps=%d)\n",
+                 call_id.c_str(),
+                 previous_quality.c_str(),
+                 quality.c_str(),
+                 profile.width,
+                 profile.height,
+                 profile.bitrate);
+    request_offer("quality-switch");
     return true;
 }
 
@@ -753,6 +869,7 @@ void LiveWebRtcSession::stop() {
     GstElement *pipeline = nullptr;
     GstElement *webrtc = nullptr;
     GstElement *appsrc = nullptr;
+    GstElement *video_encoder = nullptr;
     GstElement *audio_appsrc = nullptr;
     GstElement *remote_audio_queue = nullptr;
     GstElement *remote_audio_sink = nullptr;
@@ -771,6 +888,7 @@ void LiveWebRtcSession::stop() {
     uint64_t video_input_count = 0;
     std::thread loop_thread;
     std::thread frame_thread;
+    std::thread quality_switch_watchdog_thread;
 
     frame_stop_.store(true);
     {
@@ -778,6 +896,7 @@ void LiveWebRtcSession::stop() {
         pipeline = pipeline_;
         webrtc = webrtc_;
         appsrc = appsrc_;
+        video_encoder = video_encoder_;
         audio_appsrc = audio_appsrc_;
         remote_audio_queue = remote_audio_queue_;
         remote_audio_sink = remote_audio_sink_;
@@ -797,6 +916,7 @@ void LiveWebRtcSession::stop() {
         pipeline_ = nullptr;
         webrtc_ = nullptr;
         appsrc_ = nullptr;
+        video_encoder_ = nullptr;
         audio_appsrc_ = nullptr;
         remote_audio_queue_ = nullptr;
         remote_audio_sink_ = nullptr;
@@ -816,11 +936,24 @@ void LiveWebRtcSession::stop() {
         appsrc_frame_size_ = 0;
         active_published_ = false;
         offer_requested_ = false;
+        pending_quality_switch_.reset();
+        quality_switch_deadline_ = {};
+        quality_switch_answer_applied_ = false;
+        quality_switch_watchdog_stop_ = true;
+        video_paused_.store(false);
         if (frame_thread_.joinable()) {
             frame_thread = std::move(frame_thread_);
         }
+        if (quality_switch_watchdog_thread_.joinable()) {
+            quality_switch_watchdog_thread =
+                std::move(quality_switch_watchdog_thread_);
+        }
     }
 
+    quality_switch_cv_.notify_all();
+    if (quality_switch_watchdog_thread.joinable()) {
+        quality_switch_watchdog_thread.join();
+    }
     if (frame_thread.joinable()) frame_thread.join();
     if (appsrc) gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
     if (audio_appsrc) gst_app_src_end_of_stream(GST_APP_SRC(audio_appsrc));
@@ -863,6 +996,7 @@ void LiveWebRtcSession::stop() {
     if (remote_audio_queue) gst_object_unref(remote_audio_queue);
     if (remote_audio_sink) gst_object_unref(remote_audio_sink);
     if (appsrc) gst_object_unref(appsrc);
+    if (video_encoder) gst_object_unref(video_encoder);
     if (webrtc) gst_object_unref(webrtc);
     if (pipeline) gst_object_unref(pipeline);
 }
@@ -1051,6 +1185,7 @@ void LiveWebRtcSession::on_bus_message(GstMessage *message) {
             GError *error = nullptr;
             gchar *debug = nullptr;
             gst_message_parse_error(message, &error, &debug);
+            const bool video_branch_error = is_video_branch_source(source);
             std::fprintf(stderr,
                          "[live] bus error source=%s message=%s debug=%s\n",
                          source,
@@ -1058,6 +1193,26 @@ void LiveWebRtcSession::on_bus_message(GstMessage *message) {
                          debug ? debug : "(none)");
             if (error) g_error_free(error);
             if (debug) g_free(debug);
+            if (video_branch_error &&
+                !video_branch_reconfiguring_.load() &&
+                !frame_stop_.load()) {
+                // 编码支路异常后必须立即停帧，避免 appsrc 队列继续吞入整帧导致 OOM。
+                video_paused_.store(true);
+                bool switching = false;
+                {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    switching = pending_quality_switch_.has_value();
+                }
+                if (switching) {
+                    finish_quality_switch(
+                        false, "LIVE_QUALITY_SWITCH_FAILED");
+                } else {
+                    std::fprintf(
+                        stderr,
+                        "[live] video branch paused after fatal error source=%s; audio remains active\n",
+                        source);
+                }
+            }
             break;
         }
         case GST_MESSAGE_WARNING: {
@@ -1108,6 +1263,7 @@ GstPadProbeReturn LiveWebRtcSession::on_rtp_probe(GstPadProbeInfo *info) {
     guint64 count = 0;
     guint64 total_bytes = 0;
     std::string call_id;
+    bool quality_switch_ready = false;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         rtp_buffer_count_ += 1;
@@ -1115,6 +1271,9 @@ GstPadProbeReturn LiveWebRtcSession::on_rtp_probe(GstPadProbeInfo *info) {
         count = rtp_buffer_count_;
         total_bytes = rtp_bytes_;
         call_id = current_.call_id;
+        quality_switch_ready =
+            pending_quality_switch_.has_value() &&
+            quality_switch_answer_applied_;
     }
 
     if (count == 1 || count % 600 == 0) {
@@ -1126,6 +1285,13 @@ GstPadProbeReturn LiveWebRtcSession::on_rtp_probe(GstPadProbeInfo *info) {
                      static_cast<unsigned long long>(total_bytes),
                      static_cast<unsigned long long>(pts),
                      static_cast<unsigned long long>(dts));
+    }
+    if (quality_switch_ready) {
+        std::fprintf(
+            stderr,
+            "[live] quality switch produced first RTP packet call_id=%s\n",
+            call_id.c_str());
+        finish_quality_switch(true, "");
     }
     return GST_PAD_PROBE_OK;
 }
@@ -1148,8 +1314,14 @@ void LiveWebRtcSession::frame_push_loop() {
     uint64_t first_ts_ns = 0;
     uint64_t last_pts_ns = 0;
     uint64_t pushed = 0;
+    uint64_t queue_full_drops = 0;
+    std::vector<uint8_t> scaled_frame;
 
     while (!frame_stop_.load()) {
+        if (video_paused_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
         FrameProvider provider;
         GstElement *appsrc = nullptr;
         uint32_t expected_width = 0;
@@ -1186,11 +1358,40 @@ void LiveWebRtcSession::frame_push_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(3));
             continue;
         }
+        guint64 current_level_bytes = 0;
+        guint64 max_bytes = 0;
+        g_object_get(
+            G_OBJECT(appsrc),
+            "current-level-bytes", &current_level_bytes,
+            "max-bytes", &max_bytes,
+            nullptr);
+        if (max_bytes > 0 &&
+            current_level_bytes + static_cast<guint64>(expected_size) >
+                max_bytes) {
+            ++queue_full_drops;
+            if (queue_full_drops == 1 || queue_full_drops % 120 == 0) {
+                std::fprintf(
+                    stderr,
+                    "[live] drop camera frame reason=appsrc-full call_id=%s drops=%llu level_bytes=%llu max_bytes=%llu frame_bytes=%zu\n",
+                    call_id.c_str(),
+                    static_cast<unsigned long long>(queue_full_drops),
+                    static_cast<unsigned long long>(current_level_bytes),
+                    static_cast<unsigned long long>(max_bytes),
+                    expected_size);
+            }
+            last_seq = frame.seq;
+            gst_object_unref(appsrc);
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            continue;
+        }
+        const size_t source_size =
+            raw_frame_size(frame.pixfmt, frame.width, frame.height);
         if (frame.data == nullptr ||
-            frame.width != expected_width || frame.height != expected_height ||
-            frame.pixfmt != expected_pixfmt || frame.size < expected_size) {
+            frame.pixfmt != expected_pixfmt ||
+            source_size == 0 ||
+            frame.size < source_size) {
             std::fprintf(stderr,
-                         "[live] drop camera frame seq=%llu reason=caps-mismatch got=%ux%u fmt=%c%c%c%c bytes=%zu expected=%ux%u fmt=%c%c%c%c bytes=%zu\n",
+                         "[live] drop camera frame seq=%llu reason=format-mismatch got=%ux%u fmt=%c%c%c%c bytes=%zu expected_fmt=%c%c%c%c\n",
                          static_cast<unsigned long long>(frame.seq),
                          frame.width,
                          frame.height,
@@ -1199,16 +1400,46 @@ void LiveWebRtcSession::frame_push_loop() {
                          (frame.pixfmt >> 16) & 0xFF,
                          (frame.pixfmt >> 24) & 0xFF,
                          frame.size,
-                         expected_width,
-                         expected_height,
                          expected_pixfmt & 0xFF,
                          (expected_pixfmt >> 8) & 0xFF,
                          (expected_pixfmt >> 16) & 0xFF,
-                         (expected_pixfmt >> 24) & 0xFF,
-                         expected_size);
+                         (expected_pixfmt >> 24) & 0xFF);
             last_seq = frame.seq;
             gst_object_unref(appsrc);
             continue;
+        }
+
+        const uint8_t *output_data = frame.data;
+        if (frame.width != expected_width || frame.height != expected_height) {
+            scaled_frame.assign(expected_size, 0);
+            image_buffer_t source{};
+            source.width = static_cast<int>(frame.width);
+            source.height = static_cast<int>(frame.height);
+            source.format = IMAGE_FORMAT_YUV420SP_NV12;
+            source.size = static_cast<int>(source_size);
+            source.virt_addr = const_cast<uint8_t *>(frame.data);
+            source.fd = frame.dmabuf_fd;
+
+            image_buffer_t output{};
+            output.width = static_cast<int>(expected_width);
+            output.height = static_cast<int>(expected_height);
+            output.format = IMAGE_FORMAT_YUV420SP_NV12;
+            output.size = static_cast<int>(expected_size);
+            output.virt_addr = scaled_frame.data();
+            output.fd = -1;
+            if (convert_image(&source, &output, nullptr, nullptr, 0) != 0) {
+                std::fprintf(stderr,
+                             "[live] RGA scale failed seq=%llu %ux%u -> %ux%u\n",
+                             static_cast<unsigned long long>(frame.seq),
+                             frame.width,
+                             frame.height,
+                             expected_width,
+                             expected_height);
+                last_seq = frame.seq;
+                gst_object_unref(appsrc);
+                continue;
+            }
+            output_data = scaled_frame.data();
         }
 
         GstBuffer *buffer = gst_buffer_new_allocate(nullptr, expected_size, nullptr);
@@ -1223,7 +1454,7 @@ void LiveWebRtcSession::frame_push_loop() {
             gst_object_unref(appsrc);
             continue;
         }
-        std::memcpy(map.data, frame.data, expected_size);
+        std::memcpy(map.data, output_data, expected_size);
         gst_buffer_unmap(buffer, &map);
 
         uint64_t pts_ns = pushed * kFrameDurationNs;
@@ -1263,6 +1494,17 @@ void LiveWebRtcSession::frame_push_loop() {
                          static_cast<unsigned long long>(pts_ns));
         }
         if (flow_ret != GST_FLOW_OK && flow_ret != GST_FLOW_FLUSHING) {
+            // 非临时流错误后停止继续入队；切档中则立即回滚旧清晰度。
+            video_paused_.store(true);
+            bool switching = false;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                switching = pending_quality_switch_.has_value();
+            }
+            if (switching) {
+                finish_quality_switch(
+                    false, "LIVE_QUALITY_SWITCH_FAILED");
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
@@ -1364,6 +1606,7 @@ void LiveWebRtcSession::on_offer_created(GstPromise *promise) {
     if (!reply) {
         std::fprintf(stderr, "[live] offer promise has no reply\n");
         gst_promise_unref(promise);
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
         return;
     }
     GstWebRTCSessionDescription *offer = nullptr;
@@ -1371,6 +1614,7 @@ void LiveWebRtcSession::on_offer_created(GstPromise *promise) {
     gst_promise_unref(promise);
     if (!offer) {
         std::fprintf(stderr, "[live] offer promise reply has no offer\n");
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
         return;
     }
 
@@ -1437,39 +1681,333 @@ void LiveWebRtcSession::on_ice_connection_state_changed() {
     }
 }
 
+bool LiveWebRtcSession::reconfigure_video_branch(
+    const QualityProfile &profile,
+    uint32_t pixfmt,
+    const char *reason) {
+    std::lock_guard<std::mutex> branch_lock(video_branch_mtx_);
+    video_branch_reconfiguring_.store(true);
+
+    GstElement *pipeline = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        pipeline = pipeline_;
+        if (pipeline) gst_object_ref(pipeline);
+    }
+    if (!pipeline) {
+        video_branch_reconfiguring_.store(false);
+        return false;
+    }
+
+    // 只重置视频支路，webrtcbin 和音频支路始终保持 PLAYING。
+    const char *element_names[] = {
+        "rtp_queue",
+        "live_pay",
+        "live_parse",
+        "live_enc",
+        "raw_queue",
+        "live_appsrc",
+    };
+    std::vector<GstElement *> elements;
+    elements.reserve(sizeof(element_names) / sizeof(element_names[0]));
+    bool ok = true;
+    for (const char *name : element_names) {
+        GstElement *element = gst_bin_get_by_name(GST_BIN(pipeline), name);
+        if (!element) {
+            std::fprintf(stderr,
+                         "[live] video branch element missing name=%s reason=%s\n",
+                         name,
+                         reason ? reason : "unknown");
+            ok = false;
+            break;
+        }
+        elements.push_back(element);
+    }
+
+    if (ok) {
+        for (GstElement *element : elements) {
+            const GstStateChangeReturn ret =
+                gst_element_set_state(element, GST_STATE_READY);
+            if (ret == GST_STATE_CHANGE_FAILURE) {
+                std::fprintf(stderr,
+                             "[live] set video element READY failed name=%s reason=%s\n",
+                             GST_OBJECT_NAME(element),
+                             reason ? reason : "unknown");
+                ok = false;
+            }
+        }
+    }
+
+    if (ok) {
+        GstElement *appsrc = elements.back();
+        GstElement *encoder = elements[3];
+        const char *format = gst_format_for_pixfmt(pixfmt);
+        const size_t frame_size = raw_frame_size(
+            pixfmt,
+            static_cast<uint32_t>(profile.width),
+            static_cast<uint32_t>(profile.height));
+        if (!format || frame_size == 0) {
+            ok = false;
+        } else {
+            GstCaps *caps = gst_caps_new_simple(
+                "video/x-raw",
+                "format", G_TYPE_STRING, format,
+                "width", G_TYPE_INT, profile.width,
+                "height", G_TYPE_INT, profile.height,
+                "framerate", GST_TYPE_FRACTION, 24, 1,
+                nullptr);
+            gst_app_src_set_caps(GST_APP_SRC(appsrc), caps);
+            gst_caps_unref(caps);
+            g_object_set(
+                G_OBJECT(appsrc),
+                "max-bytes", static_cast<guint64>(frame_size) * 2,
+                nullptr);
+            g_object_set(
+                G_OBJECT(encoder),
+                "bps", profile.bitrate,
+                nullptr);
+        }
+    }
+
+    if (ok) {
+        // 下游先恢复，避免上游开始送帧时编码链路还未就绪。
+        for (GstElement *element : elements) {
+            if (!gst_element_sync_state_with_parent(element)) {
+                std::fprintf(stderr,
+                             "[live] restore video element state failed name=%s reason=%s\n",
+                             GST_OBJECT_NAME(element),
+                             reason ? reason : "unknown");
+                ok = false;
+            }
+        }
+    }
+
+    for (GstElement *element : elements) {
+        gst_object_unref(element);
+    }
+    gst_object_unref(pipeline);
+    video_branch_reconfiguring_.store(false);
+
+    std::fprintf(stderr,
+                 "[live] video branch reconfigure reason=%s result=%s size=%dx%d bps=%d\n",
+                 reason ? reason : "unknown",
+                 ok ? "ok" : "failed",
+                 profile.width,
+                 profile.height,
+                 profile.bitrate);
+    return ok;
+}
+
+void LiveWebRtcSession::request_video_keyframe() {
+    GstElement *encoder = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        encoder = video_encoder_;
+        if (encoder) gst_object_ref(encoder);
+    }
+    if (!encoder) return;
+    GstStructure *structure = gst_structure_new(
+        "GstForceKeyUnit",
+        "all-headers", G_TYPE_BOOLEAN, TRUE,
+        "count", G_TYPE_UINT, 0,
+        nullptr);
+    GstEvent *event = gst_event_new_custom(
+        GST_EVENT_CUSTOM_UPSTREAM, structure);
+    const gboolean sent = gst_element_send_event(encoder, event);
+    std::fprintf(stderr, "[live] force video keyframe sent=%d\n", sent ? 1 : 0);
+    gst_object_unref(encoder);
+}
+
+void LiveWebRtcSession::finish_quality_switch(bool ok,
+                                              const std::string &error_code) {
+    std::optional<PendingQualitySwitch> pending;
+    QualityProfile rollback_profile{};
+    uint32_t pixfmt = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!pending_quality_switch_) return;
+        pending = std::move(pending_quality_switch_);
+        pending_quality_switch_.reset();
+        quality_switch_deadline_ = {};
+        quality_switch_answer_applied_ = false;
+        offer_requested_ = false;
+        if (!ok) {
+            rollback_profile = profile_for_quality(pending->previous_quality);
+            current_.quality = pending->previous_quality;
+            appsrc_width_ = static_cast<uint32_t>(rollback_profile.width);
+            appsrc_height_ = static_cast<uint32_t>(rollback_profile.height);
+            appsrc_frame_size_ = raw_frame_size(
+                appsrc_pixfmt_, appsrc_width_, appsrc_height_);
+            pixfmt = appsrc_pixfmt_;
+        }
+    }
+
+    bool video_ready = ok;
+    if (!ok) {
+        video_ready = reconfigure_video_branch(
+            rollback_profile, pixfmt, "quality-switch-rollback");
+        if (!video_ready) {
+            std::fprintf(
+                stderr,
+                "[live] rollback video branch failed; keep video paused previous_quality=%s\n",
+                pending->previous_quality.c_str());
+        }
+    }
+
+    quality_switch_cv_.notify_all();
+    if (video_ready) {
+        request_video_keyframe();
+        video_paused_.store(false);
+    }
+    if (pending->callback) {
+        pending->callback(
+            ok,
+            pending->quality,
+            pending->previous_quality,
+            ok ? "" : error_code);
+    }
+}
+
+void LiveWebRtcSession::quality_switch_watchdog_loop() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    while (!quality_switch_watchdog_stop_) {
+        if (!pending_quality_switch_) {
+            quality_switch_cv_.wait(lock, [this] {
+                return quality_switch_watchdog_stop_ ||
+                       pending_quality_switch_.has_value();
+            });
+            continue;
+        }
+
+        const auto deadline = quality_switch_deadline_;
+        const bool changed = quality_switch_cv_.wait_until(
+            lock, deadline, [this, deadline] {
+                return quality_switch_watchdog_stop_ ||
+                       !pending_quality_switch_ ||
+                       quality_switch_deadline_ != deadline;
+            });
+        if (changed) continue;
+
+        lock.unlock();
+        std::fprintf(stderr,
+                     "[live] quality switch timed out, rolling back\n");
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
+        lock.lock();
+    }
+}
+
+void LiveWebRtcSession::on_remote_description_set_cb(
+    GstPromise *promise,
+    gpointer user_data) {
+    std::unique_ptr<RemoteDescriptionContext> context(
+        static_cast<RemoteDescriptionContext *>(user_data));
+    if (!context || !context->session) {
+        gst_promise_unref(promise);
+        return;
+    }
+    context->session->on_remote_description_set(
+        promise, context->call_id);
+}
+
+void LiveWebRtcSession::on_remote_description_set(
+    GstPromise *promise,
+    const std::string &call_id) {
+    // change_func 被调用时 Promise 已结束，wait 只读取结果，不会阻塞 MQTT 回调线程。
+    const GstPromiseResult result = gst_promise_wait(promise);
+    gst_promise_unref(promise);
+
+    bool current_session = false;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        current_session =
+            webrtc_ != nullptr && current_.call_id == call_id;
+    }
+    if (!current_session) {
+        std::fprintf(
+            stderr,
+            "[live] ignore stale remote answer completion call_id=%s result=%d\n",
+            call_id.c_str(),
+            static_cast<int>(result));
+        return;
+    }
+    if (result == GST_PROMISE_RESULT_REPLIED) {
+        std::fprintf(
+            stderr,
+            "[live] set remote answer completed call_id=%s\n",
+            call_id.c_str());
+        bool switching = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (pending_quality_switch_) {
+                quality_switch_answer_applied_ = true;
+                switching = true;
+            }
+        }
+        if (switching) {
+            // 等新分辨率实际产出首包 RTP 后再确认成功；首帧协商失败仍可回滚。
+            request_video_keyframe();
+            video_paused_.store(false);
+        }
+        return;
+    }
+
+    std::fprintf(stderr,
+                 "[live] set remote answer failed call_id=%s promise_result=%d\n",
+                 call_id.c_str(),
+                 static_cast<int>(result));
+    finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
+}
+
 void LiveWebRtcSession::handle_answer(const nlohmann::json &signal) {
     GstElement *webrtc = nullptr;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         webrtc = webrtc_;
+        if (webrtc) gst_object_ref(webrtc);
     }
     if (!webrtc) return;
 
     const std::string sdp = signal.value("sdp", "");
+    const std::string call_id = signal.value("call_id", "");
     std::fprintf(stderr,
                  "[live] handle answer call_id=%s sdp_len=%zu\n",
-                 signal.value("call_id", "").c_str(),
+                 call_id.c_str(),
                  sdp.size());
     log_sdp_candidate_lines("remote-answer", sdp);
-    if (sdp.empty()) return;
+    if (sdp.empty()) {
+        gst_object_unref(webrtc);
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
+        return;
+    }
 
     GstSDPMessage *sdp_msg = nullptr;
-    if (gst_sdp_message_new(&sdp_msg) != GST_SDP_OK) return;
+    if (gst_sdp_message_new(&sdp_msg) != GST_SDP_OK) {
+        gst_object_unref(webrtc);
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
+        return;
+    }
     GstSDPResult parse_result = gst_sdp_message_parse_buffer(
         reinterpret_cast<const guint8 *>(sdp.data()), sdp.size(), sdp_msg);
     if (parse_result != GST_SDP_OK) {
         gst_sdp_message_free(sdp_msg);
+        gst_object_unref(webrtc);
         std::fprintf(stderr, "[live] parse answer SDP failed\n");
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
         return;
     }
 
     GstWebRTCSessionDescription *answer = gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_ANSWER, sdp_msg);
-    GstPromise *promise = gst_promise_new();
+    auto *context = new RemoteDescriptionContext{this, call_id};
+    GstPromise *promise = gst_promise_new_with_change_func(
+        &LiveWebRtcSession::on_remote_description_set_cb,
+        context,
+        nullptr);
     g_signal_emit_by_name(webrtc, "set-remote-description", answer, promise);
-    std::fprintf(stderr, "[live] set remote answer requested\n");
-    gst_promise_interrupt(promise);
-    gst_promise_unref(promise);
+    std::fprintf(stderr,
+                 "[live] set remote answer requested asynchronously call_id=%s\n",
+                 call_id.c_str());
     gst_webrtc_session_description_free(answer);
+    gst_object_unref(webrtc);
 }
 
 void LiveWebRtcSession::handle_candidate(const nlohmann::json &signal) {

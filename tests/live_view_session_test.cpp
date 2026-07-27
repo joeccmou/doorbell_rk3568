@@ -69,6 +69,7 @@ LiveViewSession make_session(PublishCapture *capture, std::unique_ptr<FakeRtcBac
     };
     publishers.media_state_publisher = [capture](const std::string &payload) {
         capture->media_states.push_back(nlohmann::json::parse(payload));
+        return true;
     };
     return LiveViewSession("device-1", std::move(publishers), std::move(backend));
 }

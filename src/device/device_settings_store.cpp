@@ -36,6 +36,11 @@ bool valid_sensitivity(const std::string &value) {
     return value == "low" || value == "medium" || value == "high";
 }
 
+bool valid_quality(const std::string &value) {
+    return value == "360p" || value == "720p" ||
+           value == "1080p" || value == "1440p";
+}
+
 nlohmann::json to_json(const DeviceSettingsSnapshot &snapshot) {
     return {
         {"version", snapshot.version},
@@ -44,6 +49,7 @@ nlohmann::json to_json(const DeviceSettingsSnapshot &snapshot) {
             {"person_sensitivity", snapshot.settings.person_sensitivity},
             {"status_led", snapshot.settings.status_led},
             {"image_rotate180", snapshot.settings.image_rotate180},
+            {"recording_quality", snapshot.settings.recording_quality},
             {"timezone", snapshot.settings.timezone},
         }},
         {"runtime", {{"time_sync", {
@@ -105,6 +111,7 @@ bool DeviceSettingsStore::initialize(std::string *error) {
         loaded.settings.person_sensitivity = settings.at("person_sensitivity").get<std::string>();
         loaded.settings.status_led = settings.at("status_led").get<bool>();
         loaded.settings.image_rotate180 = settings.at("image_rotate180").get<bool>();
+        loaded.settings.recording_quality = settings.value("recording_quality", "1080p");
         loaded.settings.timezone = settings.at("timezone").get<std::string>();
         const auto &sync = body.at("runtime").at("time_sync");
         loaded.runtime.time_sync.state = sync.value("state", "unsynced");
@@ -115,7 +122,10 @@ bool DeviceSettingsStore::initialize(std::string *error) {
             loaded.runtime.time_sync.last_offset_ms = sync["last_offset_ms"].get<std::int64_t>();
         }
         loaded.updated_at = body.value("updated_at", "");
-        if (loaded.version != 1 || !valid_sensitivity(loaded.settings.person_sensitivity) || loaded.settings.timezone.empty()) {
+        if (loaded.version != 1 ||
+            !valid_sensitivity(loaded.settings.person_sensitivity) ||
+            !valid_quality(loaded.settings.recording_quality) ||
+            loaded.settings.timezone.empty()) {
             if (error) *error = "invalid settings.json values";
             return false;
         }
@@ -133,7 +143,9 @@ DeviceSettingsSnapshot DeviceSettingsStore::snapshot() const {
 }
 
 bool DeviceSettingsStore::replace_settings(const DeviceSettingsValues &settings, std::string *error) {
-    if (!valid_sensitivity(settings.person_sensitivity) || settings.timezone.empty()) {
+    if (!valid_sensitivity(settings.person_sensitivity) ||
+        !valid_quality(settings.recording_quality) ||
+        settings.timezone.empty()) {
         if (error) *error = "invalid device settings";
         return false;
     }

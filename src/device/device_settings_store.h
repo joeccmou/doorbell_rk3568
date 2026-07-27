@@ -10,6 +10,7 @@ struct DeviceSettingsValues {
     std::string person_sensitivity = "medium";
     bool status_led = true;
     bool image_rotate180 = false;
+    std::string recording_quality = "1080p";
     std::string timezone = "Asia/Shanghai";
 };
 

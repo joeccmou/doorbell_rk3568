@@ -12,6 +12,7 @@
 #include <string>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -50,6 +51,24 @@ constexpr uint32_t kRecordFpsLimit = 24;
 constexpr uint64_t kRecordFrameIntervalNs = 1000000000ULL / kRecordFpsLimit;
 constexpr uint64_t kOverlayFreshNs = 300ULL * 1000ULL * 1000ULL;
 constexpr uint32_t kRingSnapshotSampleIntervalMs = 100;
+constexpr uint32_t kMasterCaptureWidth = 2560;
+constexpr uint32_t kMasterCaptureHeight = 1440;
+constexpr uint32_t kMasterCaptureFps = 24;
+constexpr uint32_t kDisplayWidth = 1280;
+constexpr uint32_t kDisplayHeight = 800;
+
+struct RecordingProfile {
+    uint32_t width;
+    uint32_t height;
+    uint32_t bitrate;
+};
+
+RecordingProfile recording_profile_for(const std::string &quality) {
+    if (quality == "360p") return {640, 360, 800000};
+    if (quality == "1080p") return {1920, 1080, 4000000};
+    if (quality == "1440p") return {2560, 1440, 6000000};
+    return {1280, 720, 2000000};
+}
 
 void perf_log(const char *fmt, ...) {
     va_list args;
@@ -137,6 +156,7 @@ struct UiContext {
     bool ring_press_in_progress = false;
     bool recording_stop_in_progress = false;
     std::chrono::system_clock::time_point current_recording_last_segment_ended_at{};
+    std::function<std::string()> recording_quality_provider;
     // SDL_Window *sdl_window = nullptr;
 };
 
@@ -286,8 +306,6 @@ void inference_worker(UiContext *ctx) {
 }
 
 void recorder_worker(UiContext *ctx) {
-    uint32_t running_width = 0;
-    uint32_t running_height = 0;
     uint64_t last_written_ts_ns = 0;
     uint64_t last_seen_seq = 0;
     uint64_t seq_zero_count = 0;
@@ -404,8 +422,6 @@ void recorder_worker(UiContext *ctx) {
                 perf_log("record stop ts_ns=%llu stop_ms=%.3f reason=no_want\n",
                          static_cast<unsigned long long>(stop_end_ns),
                          static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
-                running_width = 0;
-                running_height = 0;
                 last_written_ts_ns = 0;
             } else {
                 finalize_pending_ring_recording();
@@ -431,21 +447,7 @@ void recorder_worker(UiContext *ctx) {
             continue;
         }
 
-		if (!ctx->recorder.running() || running_width != camera_width || running_height != camera_height) {
-            if (ctx->recorder.running()) {
-                {
-                    std::lock_guard<std::mutex> lock(ctx->record_mtx);
-                    ctx->recording_stop_in_progress = true;
-                }
-                std::fprintf(stdout, "[record] restart on resolution change\n");
-                uint64_t stop_begin_ns = monotonic_time_ns();
-                ctx->recorder.stop();
-                finalize_recording("interrupted");
-                uint64_t stop_end_ns = monotonic_time_ns();
-                perf_log("record stop ts_ns=%llu stop_ms=%.3f reason=resolution_change\n",
-                         static_cast<unsigned long long>(stop_end_ns),
-                         static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
-            }
+		if (!ctx->recorder.running()) {
             uint64_t start_begin_ns = monotonic_time_ns();
             auto recording_started_at = std::chrono::system_clock::now();
             std::string recording_error;
@@ -477,12 +479,20 @@ void recorder_worker(UiContext *ctx) {
                     *recording_id + "-%06d.mp4.part";
                 const std::string temporary_pattern =
                     (std::filesystem::path(ctx->record_dir) / temporary_pattern_ref).string();
+                const std::string recording_quality = ctx->recording_quality_provider
+                    ? ctx->recording_quality_provider()
+                    : "1080p";
+                const RecordingProfile recording_profile =
+                    recording_profile_for(recording_quality);
                 started = ctx->recorder.start_segmented(
                     temporary_pattern,
                     camera_width,
                     camera_height,
+                    recording_profile.width,
+                    recording_profile.height,
                     kRecordFpsLimit,
                     camera_pixfmt,
+                    recording_profile.bitrate,
                     [ctx, recording_id = *recording_id, recording_started_at](
                         const Mp4Recorder::ClosedSegment &segment) {
                         const int segment_index = static_cast<int>(segment.fragment_index) + 1;
@@ -548,8 +558,6 @@ void recorder_worker(UiContext *ctx) {
                              recording_error.c_str());
                 continue;
             }
-            running_width = camera_width;
-            running_height = camera_height;
             last_written_ts_ns = 0;
             std::fprintf(stdout, "[record] start %s\n", ctx->recorder.last_file().c_str());
             {
@@ -654,8 +662,6 @@ void recorder_worker(UiContext *ctx) {
             perf_log("record stop ts_ns=%llu stop_ms=%.3f reason=write_fail\n",
                      static_cast<unsigned long long>(stop_end_ns),
                      static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
-            running_width = 0;
-            running_height = 0;
         }
     }
 
@@ -682,9 +688,9 @@ void recorder_worker(UiContext *ctx) {
 
 void handle_signal(int) { g_stop.store(true); }
 
-lv_display_t *create_display(const Camera::Config &cfg) {
-    uint32_t w = 1280;
-    uint32_t h = 800;
+lv_display_t *create_display(const Camera::Config &) {
+    uint32_t w = kDisplayWidth;
+    uint32_t h = kDisplayHeight;
 #if LV_USE_SDL
     lv_display_t *disp = lv_sdl_window_create(static_cast<int>(w), static_cast<int>(h));
     if (disp) {
@@ -752,7 +758,8 @@ void camera_timer_cb(lv_timer_t *timer) {
     const uint32_t width = ctx->camera->width();
     const uint32_t height = ctx->camera->height();
     const size_t rgb_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 3;
-    const size_t bgra_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    const size_t bgra_size =
+        static_cast<size_t>(kDisplayWidth) * static_cast<size_t>(kDisplayHeight) * 4;
     uint64_t frame_seq = 0;
     uint64_t frame_ts_ns = 0;
     uint64_t copy_begin_ns = monotonic_time_ns();
@@ -906,8 +913,8 @@ void camera_timer_cb(lv_timer_t *timer) {
     }
 
     image_buffer_t dst_bgra{};
-    dst_bgra.width = static_cast<int>(width);
-    dst_bgra.height = static_cast<int>(height);
+    dst_bgra.width = static_cast<int>(kDisplayWidth);
+    dst_bgra.height = static_cast<int>(kDisplayHeight);
     dst_bgra.format = IMAGE_FORMAT_BGRA8888;
     dst_bgra.size = static_cast<int>(bgra_size);
     dst_bgra.virt_addr = ctx->display_frame.data();
@@ -973,8 +980,9 @@ bool restart_camera(void *user_ctx, uint32_t pixfmt, uint32_t w, uint32_t h) {
 
     Camera::Config new_cfg = ctx->cfg;
     new_cfg.pixelformat = pixfmt;
-    new_cfg.width = w;
-    new_cfg.height = h;
+    new_cfg.width = kMasterCaptureWidth;
+    new_cfg.height = kMasterCaptureHeight;
+    new_cfg.fps = kMasterCaptureFps;
 
     std::lock_guard<std::mutex> camera_lock(ctx->camera_mtx);
     Camera *old = ctx->camera;
@@ -999,11 +1007,12 @@ bool restart_camera(void *user_ctx, uint32_t pixfmt, uint32_t w, uint32_t h) {
     ctx->camera = cam;
     ctx->cfg = new_cfg;
 
-    ctx->image_dsc.header.w = cam->width();
-    ctx->image_dsc.header.h = cam->height();
+    ctx->image_dsc.header.w = kDisplayWidth;
+    ctx->image_dsc.header.h = kDisplayHeight;
     ctx->image_dsc.header.cf = LV_COLOR_FORMAT_ARGB8888;
-    ctx->image_dsc.header.stride = cam->width() * 4;
-    size_t bgra_size = static_cast<size_t>(cam->width()) * static_cast<size_t>(cam->height()) * 4;
+    ctx->image_dsc.header.stride = kDisplayWidth * 4;
+    size_t bgra_size =
+        static_cast<size_t>(kDisplayWidth) * static_cast<size_t>(kDisplayHeight) * 4;
     ctx->image_dsc.data_size = bgra_size;
     ctx->display_frame.assign(bgra_size, 0);
     ctx->image_dsc.data = ctx->display_frame.data();
@@ -1018,7 +1027,7 @@ bool restart_camera(void *user_ctx, uint32_t pixfmt, uint32_t w, uint32_t h) {
     }
     // Rebind image src so LVGL refreshes cached header/stride when resolution changes.
     lv_image_set_src(ctx->image_obj, &ctx->image_dsc);
-    lv_obj_set_size(ctx->image_obj, cam->width(), cam->height());
+    lv_obj_set_size(ctx->image_obj, kDisplayWidth, kDisplayHeight);
     lv_obj_center(ctx->image_obj);
     lv_obj_invalidate(ctx->image_obj);
     // Reset FPS counters after format/size switch to avoid a large transient value.
@@ -1035,15 +1044,17 @@ int main(int argc, char **argv) {
     Camera::Config cfg;
     const char *model_arg = (argc >= 2) ? argv[1] : nullptr;
     const int arg_base = model_arg ? 2 : 1;
-    if (argc >= arg_base + 2) {
-        cfg.width = static_cast<uint32_t>(std::strtoul(argv[arg_base], nullptr, 10));
-        cfg.height = static_cast<uint32_t>(std::strtoul(argv[arg_base + 1], nullptr, 10));
-    }
+    // 正式媒体架构固定一路 1440P 主采集，分辨率只在下游分支切换。
+    cfg.width = kMasterCaptureWidth;
+    cfg.height = kMasterCaptureHeight;
+    cfg.fps = kMasterCaptureFps;
     if (argc >= arg_base + 3) {
         cfg.device = argv[arg_base + 2];
     }
     if (argc >= arg_base + 4) {
-        cfg.fps = static_cast<uint32_t>(std::strtoul(argv[arg_base + 3], nullptr, 10));
+        std::fprintf(stdout,
+                     "[main] ignore legacy capture fps argument; master capture is fixed at %u fps\n",
+                     kMasterCaptureFps);
     }
 
     signal(SIGINT, handle_signal);
@@ -1079,6 +1090,9 @@ int main(int argc, char **argv) {
 
     UiContext ctx;
     ctx.cfg = cfg;
+    ctx.recording_quality_provider = [&provisioning] {
+        return provisioning.current_settings().recording_quality;
+    };
     ctx.disp = disp;
     ctx.recorder.set_audio_dispatcher(ctx.audio_capture.dispatcher());
     provisioning.set_live_audio_manager(&ctx.audio_capture);
@@ -1160,11 +1174,12 @@ int main(int argc, char **argv) {
     ctx.image_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
     ctx.image_dsc.header.cf = LV_COLOR_FORMAT_ARGB8888;
     ctx.image_dsc.header.flags = 0;
-    ctx.image_dsc.header.w = ctx.camera->width();
-    ctx.image_dsc.header.h = ctx.camera->height();
-    ctx.image_dsc.header.stride = ctx.camera->width() * 4;
+    ctx.image_dsc.header.w = kDisplayWidth;
+    ctx.image_dsc.header.h = kDisplayHeight;
+    ctx.image_dsc.header.stride = kDisplayWidth * 4;
     ctx.image_dsc.header.reserved_2 = 0;
-    size_t bgra_size = static_cast<size_t>(ctx.camera->width()) * static_cast<size_t>(ctx.camera->height()) * 4;
+    size_t bgra_size =
+        static_cast<size_t>(kDisplayWidth) * static_cast<size_t>(kDisplayHeight) * 4;
     ctx.image_dsc.data_size = bgra_size;
     ctx.display_frame.assign(bgra_size, 0);
     ctx.image_dsc.data = ctx.display_frame.data();
@@ -1175,7 +1190,7 @@ int main(int argc, char **argv) {
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), 0);
     lv_obj_set_style_bg_opa(lv_screen_active(), LV_OPA_COVER, 0);
     lv_image_set_src(ctx.image_obj, &ctx.image_dsc);
-    lv_obj_set_size(ctx.image_obj, ctx.camera->width(), ctx.camera->height());
+    lv_obj_set_size(ctx.image_obj, kDisplayWidth, kDisplayHeight);
     lv_obj_center(ctx.image_obj);
     std::fprintf(stdout, "[main] image object created\n");
 

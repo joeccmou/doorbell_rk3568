@@ -1,10 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,6 +51,10 @@ public:
                                               const std::string &call_id,
                                               const std::string &media_state)>;
     using FrameProvider = std::function<bool(VideoFrame &frame)>;
+    using QualitySwitchCallback = std::function<void(bool ok,
+                                                     const std::string &quality,
+                                                     const std::string &previous_quality,
+                                                     const std::string &error_code)>;
 
     LiveWebRtcSession(SignalPublisher signal_publisher, StatePublisher state_publisher);
     ~LiveWebRtcSession();
@@ -56,6 +63,10 @@ public:
     LiveWebRtcSession &operator=(const LiveWebRtcSession &) = delete;
 
     bool start(const StartRequest &request, std::string *error_message);
+    bool switch_quality(const std::string &trace_id,
+                        const std::string &quality,
+                        QualitySwitchCallback callback,
+                        std::string *error_code);
     void stop();
     void handle_signal(const std::string &payload);
     void set_frame_provider(FrameProvider provider);
@@ -91,6 +102,24 @@ private:
     void unregister_audio_consumer();
     void handle_answer(const nlohmann::json &signal);
     void handle_candidate(const nlohmann::json &signal);
+    bool reconfigure_video_branch(const QualityProfile &profile,
+                                  uint32_t pixfmt,
+                                  const char *reason);
+    void finish_quality_switch(bool ok, const std::string &error_code);
+    void request_video_keyframe();
+    void quality_switch_watchdog_loop();
+    struct RemoteDescriptionContext;
+    static void on_remote_description_set_cb(GstPromise *promise,
+                                             gpointer user_data);
+    void on_remote_description_set(GstPromise *promise,
+                                   const std::string &call_id);
+
+    struct PendingQualitySwitch {
+        std::string trace_id;
+        std::string previous_quality;
+        std::string quality;
+        QualitySwitchCallback callback;
+    };
 
     SignalPublisher signal_publisher_;
     StatePublisher state_publisher_;
@@ -100,6 +129,7 @@ private:
     GstElement *pipeline_ = nullptr;
     GstElement *webrtc_ = nullptr;
     GstElement *appsrc_ = nullptr;
+    GstElement *video_encoder_ = nullptr;
     GstElement *audio_appsrc_ = nullptr;
     GstElement *remote_audio_queue_ = nullptr;
     GstElement *remote_audio_sink_ = nullptr;
@@ -122,11 +152,20 @@ private:
     size_t appsrc_frame_size_ = 0;
     std::thread loop_thread_;
     std::thread frame_thread_;
+    std::thread quality_switch_watchdog_thread_;
     std::atomic<bool> frame_stop_{false};
+    std::atomic<bool> video_paused_{false};
+    std::atomic<bool> video_branch_reconfiguring_{false};
+    std::mutex video_branch_mtx_;
     AudioTimestampRebaser audio_timestamp_rebaser_;
     std::atomic<uint64_t> audio_input_count_{0};
     std::atomic<uint64_t> remote_audio_count_{0};
     std::atomic<uint64_t> video_input_count_{0};
     bool active_published_ = false;
     bool offer_requested_ = false;
+    bool quality_switch_answer_applied_ = false;
+    std::optional<PendingQualitySwitch> pending_quality_switch_;
+    std::condition_variable quality_switch_cv_;
+    std::chrono::steady_clock::time_point quality_switch_deadline_{};
+    bool quality_switch_watchdog_stop_ = true;
 };

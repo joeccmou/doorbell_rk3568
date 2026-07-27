@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "utils/audio_capture_manager.h"
 
@@ -30,10 +31,13 @@ public:
     void set_audio_dispatcher(AudioFrameDispatcher *dispatcher) { audio_dispatcher_ = dispatcher; }
 
     bool start_segmented(const std::string &temporary_file_pattern,
-                         uint32_t width,
-                         uint32_t height,
+                         uint32_t source_width,
+                         uint32_t source_height,
+                         uint32_t output_width,
+                         uint32_t output_height,
                          uint32_t fps,
                          uint32_t pixfmt,
+                         uint32_t bitrate,
                          SegmentClosedCallback segment_closed_callback);
     void stop();
     bool running() const { return pipeline_ != nullptr; }
@@ -54,6 +58,12 @@ private:
     GstBus *bus_ = nullptr;
     std::string last_file_;
     size_t frame_size_ = 0;
+    size_t source_frame_size_ = 0;
+    uint32_t source_width_ = 0;
+    uint32_t source_height_ = 0;
+    uint32_t output_width_ = 0;
+    uint32_t output_height_ = 0;
+    std::vector<uint8_t> scaled_frame_;
     uint64_t frame_index_ = 0;
     uint64_t frame_duration_ns_ = 0;
     uint64_t first_frame_ts_ns_ = 0;

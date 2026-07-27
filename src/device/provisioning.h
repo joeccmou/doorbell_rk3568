@@ -167,6 +167,7 @@ private:
 
     std::unique_ptr<MqttDeviceClient> mqtt_client_;
     std::unique_ptr<LiveViewSession> live_view_session_;
+    std::atomic<bool> startup_media_state_published_{false};
     std::unique_ptr<SntpClient> sntp_client_;
     std::unique_ptr<TimeSyncService> time_sync_service_;
     std::unique_ptr<TimezoneManager> timezone_manager_;

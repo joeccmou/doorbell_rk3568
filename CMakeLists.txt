@@ -3,6 +3,11 @@ project(doorbell C CXX)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Debug)
+
+# 设备端默认只构建正式程序；需要时必须显式开启测试目标。
+option(DOORBELL_BUILD_TESTS "Build RK3568 device tests" OFF)
+set(BUILD_TESTING "${DOORBELL_BUILD_TESTS}" CACHE BOOL
+    "Build RK3568 device tests" FORCE)
 include(CTest)
 
 # Allow linking to targets defined in subdirectories (lvgl) from this directory.
@@ -79,11 +84,11 @@ set(LV_BUILD_CONF_PATH ${CMAKE_SOURCE_DIR}/lv_conf.h CACHE PATH "" FORCE)
 set(LV_BUILD_SET_CONFIG_OPTS ON CACHE BOOL
     "create CMAKE variables from lv_conf_internal.h" FORCE)
 
-# 1) 寮曞叆 LVGL 鏍稿績
+# 1) 引入 LVGL 核心
 add_subdirectory(${DOORBELL_SDK_ROOT}/external/lvgl/9.4/lv_port_linux/lvgl
                  ${CMAKE_BINARY_DIR}/lvgl_build)
 
-# 2) 閫夋嫨骞跺姞鍏ョЩ妞嶅眰婧愮爜锛堜粠 lv_port_linux/src/lib/鈥?澶嶅埗鎴栧紩鐢級
+# 2) 选择并加入移植层源码（从 lv_port_linux/src/lib/ 复制或引用）
 set(LV_LINUX_BACKEND_SRC "")
 
 if (CONFIG_LV_USE_EVDEV)
@@ -256,7 +261,7 @@ if (DOORBELL_USE_RKNN_YOLO)
 else()
     message(STATUS "RKNN YOLO disabled on non-aarch64 host build")
 endif()
-# 3) 渚濊禆搴擄細鏍规嵁浣犻€夌殑鍚庣娣诲姞
+# 3) 依赖库：根据所选后端添加
 target_link_libraries(doorbell
     PRIVATE
       lvgl                    # 鏉ヨ嚜 add_subdirectory

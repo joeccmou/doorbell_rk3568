@@ -500,7 +500,29 @@ bool DeviceEventProcessor::process(Job *job) {
 
     if (job->kind == Job::Kind::SaveSnapshot) {
         const std::string snapshot_file = media_root_ + "/" + job->event.snapshot_path;
-        if (!std::filesystem::exists(snapshot_file) && !job->rgb.empty()) {
+        std::error_code fs_error;
+        bool snapshot_exists = std::filesystem::exists(
+            snapshot_file, fs_error);
+        if (fs_error) {
+            std::fprintf(
+                stderr,
+                "[event] inspect snapshot failed event_id=%s path=%s error=%s\n",
+                job->event.event_id.c_str(),
+                snapshot_file.c_str(),
+                fs_error.message().c_str());
+            return true;
+        }
+        if (!snapshot_exists && job->rgb.empty()) {
+            std::fprintf(
+                stderr,
+                "[event] save snapshot skipped event_id=%s reason=empty-rgb size=%ux%u path=%s\n",
+                job->event.event_id.c_str(),
+                job->width,
+                job->height,
+                snapshot_file.c_str());
+            return true;
+        }
+        if (!snapshot_exists) {
             std::string error;
             if (!snapshots_.save_rgb_jpeg(
                     snapshot_file, job->rgb, job->width, job->height, &error)) {
@@ -511,11 +533,29 @@ bool DeviceEventProcessor::process(Job *job) {
                              error.c_str());
                 return true;
             }
+            snapshot_exists = true;
+        }
+        const uintmax_t snapshot_bytes =
+            snapshot_exists
+                ? std::filesystem::file_size(snapshot_file, fs_error)
+                : 0;
+        if (fs_error || snapshot_bytes == 0) {
+            std::fprintf(
+                stderr,
+                "[event] snapshot file invalid event_id=%s path=%s bytes=%llu error=%s\n",
+                job->event.event_id.c_str(),
+                snapshot_file.c_str(),
+                static_cast<unsigned long long>(snapshot_bytes),
+                fs_error ? fs_error.message().c_str() : "empty-file");
+            return true;
         }
         std::fprintf(stdout,
-                     "[event] snapshot saved locally event_id=%s path=%s\n",
+                     "[event] snapshot ready locally event_id=%s path=%s bytes=%llu size=%ux%u\n",
                      job->event.event_id.c_str(),
-                     job->event.snapshot_path.c_str());
+                     job->event.snapshot_path.c_str(),
+                     static_cast<unsigned long long>(snapshot_bytes),
+                     job->width,
+                     job->height);
         return true;
     }
 
@@ -877,19 +917,40 @@ bool DeviceEventProcessor::handle_media_command(
         std::string error;
         const auto event = store_.find_event(event_id, &error);
         if (!event) {
+            std::fprintf(
+                stderr,
+                "[event] query snapshot event missing event_id=%s error=%s\n",
+                event_id.c_str(),
+                error.c_str());
             ack_publisher(trace_id, cmd_id, false, "SNAPSHOT_NOT_FOUND", "{}");
             return true;
         }
         const std::string snapshot_file = media_root_ + "/" + event->snapshot_path;
         if (!std::filesystem::exists(snapshot_file)) {
+            std::fprintf(
+                stderr,
+                "[event] query snapshot file missing event_id=%s path=%s\n",
+                event_id.c_str(),
+                snapshot_file.c_str());
             ack_publisher(trace_id, cmd_id, false, "SNAPSHOT_NOT_FOUND", "{}");
             return true;
         }
         std::string snapshot_url;
         if (!uploader_.upload(snapshot_file, event->snapshot_path, &snapshot_url, &error)) {
+            std::fprintf(
+                stderr,
+                "[event] query snapshot upload failed event_id=%s path=%s error=%s\n",
+                event_id.c_str(),
+                snapshot_file.c_str(),
+                error.c_str());
             ack_publisher(trace_id, cmd_id, false, "SNAPSHOT_UPLOAD_FAILED", "{}");
             return true;
         }
+        std::fprintf(
+            stdout,
+            "[event] query snapshot upload succeeded event_id=%s url=%s\n",
+            event_id.c_str(),
+            snapshot_url.c_str());
         const nlohmann::json data{
             {"event_id", event_id},
             {"snapshot_url", snapshot_url},

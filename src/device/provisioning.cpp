@@ -62,6 +62,7 @@ nlohmann::json settings_state_json(const DeviceSettingsSnapshot &snapshot) {
             {"person_sensitivity", snapshot.settings.person_sensitivity},
             {"status_led", snapshot.settings.status_led},
             {"image_rotate180", snapshot.settings.image_rotate180},
+            {"recording_quality", snapshot.settings.recording_quality},
             {"timezone", snapshot.settings.timezone},
         }},
         {"runtime", {{"time_sync", {
@@ -531,8 +532,9 @@ bool DoorbellProvisioning::start() {
     };
     live_publishers.media_state_publisher = [this](const std::string &payload) {
         if (mqtt_client_) {
-            mqtt_client_->publish_media_state(payload);
+            return mqtt_client_->publish_media_state(payload);
         }
+        return false;
     };
     live_view_session_ = std::make_unique<LiveViewSession>(identity_.device_id, std::move(live_publishers));
 
@@ -543,6 +545,17 @@ bool DoorbellProvisioning::start() {
     mqtt_callbacks.signal_handler = [this](const std::string &payload) {
         if (live_view_session_) {
             live_view_session_->handle_signal(payload);
+        }
+    };
+    live_publishers.command_ack_data_publisher = [this](
+        const std::string &trace_id,
+        const std::string &cmd_id,
+        bool ok,
+        const std::string &error_code,
+        const std::string &data_json) {
+        if (mqtt_client_) {
+            mqtt_client_->publish_command_ack(
+                trace_id, cmd_id, ok, error_code, data_json);
         }
     };
     mqtt_callbacks.report_ack_handler = [this](const std::string &payload) {
@@ -563,6 +576,14 @@ bool DoorbellProvisioning::start() {
         set_stage(Stage::ConnectingCloud);
     };
     mqtt_callbacks.on_online = [this]() {
+        if (!startup_media_state_published_.load() && live_view_session_) {
+            if (live_view_session_->publish_startup_media_state()) {
+                startup_media_state_published_.store(true);
+                std::fprintf(stdout, "[live] startup media_state=idle published\n");
+            } else {
+                std::fprintf(stderr, "[live] startup media_state=idle publish failed\n");
+            }
+        }
         set_stage(Stage::Online);
         publish_capabilities();
         if (time_sync_service_) time_sync_service_->notify_network_online();
@@ -748,6 +769,31 @@ void DoorbellProvisioning::handle_mqtt_command(const std::string &payload) {
             }
         }
     }
+    if (command.patch.recording_quality) {
+        const std::string value = *command.patch.recording_quality;
+        const bool valid = value == "360p" || value == "720p" ||
+                           value == "1080p" || value == "1440p";
+        if (!valid) {
+            fields["recording_quality"] = {
+                {"state", "failed"},
+                {"error_code", "INVALID_DEVICE_SETTINGS"}};
+            ++failed;
+        } else if (current.recording_quality == value) {
+            mark_unchanged("recording_quality");
+        } else {
+            const auto before = current;
+            auto next = current;
+            next.recording_quality = value;
+            std::string error;
+            if (!settings_store_->replace_settings(next, &error)) {
+                fail_store(before, [] {});
+                return;
+            }
+            current = next;
+            fields["recording_quality"] = {{"state", "applied"}};
+            ++succeeded;
+        }
+    }
     if (command.patch.timezone) {
         if (current.timezone == *command.patch.timezone) {
             mark_unchanged("timezone");
@@ -827,6 +873,7 @@ void DoorbellProvisioning::publish_capabilities() {
         {"firmware_version", identity_.firmware_version},
         {"capabilities", {
             {"video_qualities", {"360p", "720p", "1080p", "1440p"}},
+            {"recording_qualities", {"360p", "720p", "1080p", "1440p"}},
             {"max_fps", 24},
             {"audio", {{"codec", "opus"}, {"sample_rate", 48000}}},
             {"person_detection", true},
