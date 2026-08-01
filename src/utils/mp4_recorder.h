@@ -3,16 +3,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 #include "utils/audio_capture_manager.h"
 
 typedef struct _GstElement GstElement;
 typedef struct _GstBus GstBus;
 typedef struct _GstMessage GstMessage;
+typedef struct _GstAllocator GstAllocator;
+
+struct Mp4RecorderDmaPoolState;
 
 class Mp4Recorder {
 public:
@@ -42,7 +45,11 @@ public:
     void stop();
     bool running() const { return pipeline_ != nullptr; }
 
-    bool write_frame(const uint8_t *data, size_t size, uint64_t frame_ts_ns);
+    bool write_frame(const uint8_t *data,
+                     size_t size,
+                     uint64_t frame_ts_ns,
+                     int dmabuf_fd,
+                     uint32_t stride_y);
     const std::string &last_file() const { return last_file_; }
 
 private:
@@ -56,14 +63,17 @@ private:
     GstElement *audio_appsrc_ = nullptr;
     GstElement *splitmuxsink_ = nullptr;
     GstBus *bus_ = nullptr;
+    GstAllocator *dma_allocator_ = nullptr;
+    std::shared_ptr<Mp4RecorderDmaPoolState> dma_pool_;
     std::string last_file_;
     size_t frame_size_ = 0;
+    size_t dma_frame_size_ = 0;
     size_t source_frame_size_ = 0;
     uint32_t source_width_ = 0;
     uint32_t source_height_ = 0;
     uint32_t output_width_ = 0;
     uint32_t output_height_ = 0;
-    std::vector<uint8_t> scaled_frame_;
+    uint64_t dma_pool_drop_count_ = 0;
     uint64_t frame_index_ = 0;
     uint64_t frame_duration_ns_ = 0;
     uint64_t first_frame_ts_ns_ = 0;

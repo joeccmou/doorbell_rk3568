@@ -94,7 +94,7 @@ private:
     int port_ = 8883;
     std::string ca_dir_;
     bool tls_ = true;
-    bool tls_insecure_ = true;
+    bool tls_insecure_ = false;
     Callbacks callbacks_;
 
     std::atomic<bool> stop_{false};

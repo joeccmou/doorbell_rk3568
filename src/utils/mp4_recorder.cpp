@@ -1,22 +1,234 @@
 #include "mp4_recorder.h"
 #include "perf_logger.h"
-#include "image_utils.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
+#include <fcntl.h>
 #include <linux/videodev2.h>
-#include <unistd.h>
 #include <filesystem>
+#include <memory>
+#include <mutex>
+#include <sys/ioctl.h>
 #include <system_error>
+#include <unistd.h>
 #include <utility>
+#include <vector>
 
+#include <gst/allocators/gstdmabuf.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/video/video.h>
+
+#if __has_include(<linux/dma-heap.h>)
+#include <linux/dma-heap.h>
+#else
+#include "../../../kernel/include/uapi/linux/dma-heap.h"
+#endif
+
+#if !defined(DOORBELL_DISABLE_RGA)
+#include <rga/im2d.h>
+#endif
+
+struct Mp4RecorderDmaSlot {
+    int fd = -1;
+    size_t size = 0;
+    bool in_use = false;
+};
+
+struct Mp4RecorderDmaPoolState {
+    ~Mp4RecorderDmaPoolState() {
+        for (auto &slot : slots) {
+            if (slot.fd >= 0) ::close(slot.fd);
+        }
+        if (heap_fd >= 0) ::close(heap_fd);
+    }
+
+    std::mutex mutex;
+    int heap_fd = -1;
+    std::vector<Mp4RecorderDmaSlot> slots;
+};
 
 namespace {
+constexpr size_t kRecorderDmaPoolMaxSlots = 6;
+
+// 相机 DMA 双缓冲会继续被采集线程复用，录制编码链路必须持有独立缓冲。
+struct RecorderDmaLease {
+    std::shared_ptr<Mp4RecorderDmaPoolState> state;
+    size_t slot_index = 0;
+    int fd = -1;
+    size_t size = 0;
+};
+
+const char *select_recorder_dma_heap_path() {
+    static const char *chosen = [] {
+        if (const char *value = std::getenv("DOORBELL_DMA_HEAP")) return value;
+        static const char *candidates[] = {
+            "/dev/dma_heap/system-dma32",
+            "/dev/dma_heap/system",
+            "/dev/dma_heap/cma",
+        };
+        for (const char *path : candidates) {
+            if (::access(path, F_OK) == 0) return path;
+        }
+        return candidates[0];
+    }();
+    return chosen;
+}
+
+int allocate_recorder_dma_buffer(int heap_fd, size_t size) {
+    dma_heap_allocation_data allocation{};
+    allocation.len = size;
+    allocation.fd_flags = O_RDWR | O_CLOEXEC;
+    allocation.heap_flags = 0;
+    if (::ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &allocation) < 0) {
+        return -1;
+    }
+    return static_cast<int>(allocation.fd);
+}
+
+std::unique_ptr<RecorderDmaLease> acquire_recorder_dma_buffer(
+    const std::shared_ptr<Mp4RecorderDmaPoolState> &state,
+    size_t size,
+    bool *pool_exhausted) {
+    if (pool_exhausted) *pool_exhausted = false;
+    if (!state || size == 0) return nullptr;
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->heap_fd < 0) {
+        state->heap_fd = ::open(
+            select_recorder_dma_heap_path(), O_RDWR | O_CLOEXEC);
+        if (state->heap_fd < 0) {
+            g_printerr("[recorder] open DMA heap failed path=%s errno=%d error=%s\n",
+                       select_recorder_dma_heap_path(),
+                       errno,
+                       std::strerror(errno));
+            return nullptr;
+        }
+    }
+
+    size_t slot_index = state->slots.size();
+    for (size_t i = 0; i < state->slots.size(); ++i) {
+        if (!state->slots[i].in_use && state->slots[i].size == size) {
+            slot_index = i;
+            break;
+        }
+    }
+    if (slot_index == state->slots.size()) {
+        for (size_t i = 0; i < state->slots.size(); ++i) {
+            if (!state->slots[i].in_use) {
+                slot_index = i;
+                break;
+            }
+        }
+    }
+    if (slot_index == state->slots.size()) {
+        if (state->slots.size() >= kRecorderDmaPoolMaxSlots) {
+            if (pool_exhausted) *pool_exhausted = true;
+            return nullptr;
+        }
+        state->slots.emplace_back();
+    }
+
+    Mp4RecorderDmaSlot &slot = state->slots[slot_index];
+    if (slot.fd < 0 || slot.size != size) {
+        if (slot.fd >= 0) ::close(slot.fd);
+        slot.fd = allocate_recorder_dma_buffer(state->heap_fd, size);
+        slot.size = slot.fd >= 0 ? size : 0;
+        if (slot.fd < 0) {
+            g_printerr("[recorder] allocate DMA-BUF failed size=%zu errno=%d error=%s\n",
+                       size,
+                       errno,
+                       std::strerror(errno));
+            return nullptr;
+        }
+    }
+    slot.in_use = true;
+    return std::make_unique<RecorderDmaLease>(
+        RecorderDmaLease{state, slot_index, slot.fd, slot.size});
+}
+
+void release_recorder_dma_buffer(RecorderDmaLease *lease) {
+    if (!lease) return;
+    if (lease->state) {
+        std::lock_guard<std::mutex> lock(lease->state->mutex);
+        if (lease->slot_index < lease->state->slots.size()) {
+            lease->state->slots[lease->slot_index].in_use = false;
+        }
+    }
+    delete lease;
+}
+
+void on_recorder_dma_buffer_released(gpointer data, GstMiniObject *) {
+    release_recorder_dma_buffer(static_cast<RecorderDmaLease *>(data));
+}
+
+uint32_t align_recorder_height(uint32_t height) {
+    return (height + 15U) & ~15U;
+}
+
+size_t recorder_dma_frame_size(uint32_t width, uint32_t height) {
+    return static_cast<size_t>(width) * align_recorder_height(height) * 3 / 2;
+}
+
+bool copy_recorder_frame_to_dma(int source_fd,
+                                uint32_t source_width,
+                                uint32_t source_height,
+                                uint32_t source_stride_y,
+                                int output_fd,
+                                uint32_t output_width,
+                                uint32_t output_height,
+                                int *rga_status) {
+#if defined(DOORBELL_DISABLE_RGA)
+    (void)source_fd;
+    (void)source_width;
+    (void)source_height;
+    (void)source_stride_y;
+    (void)output_fd;
+    (void)output_width;
+    (void)output_height;
+    if (rga_status) *rga_status = -1;
+    return false;
+#else
+    if (source_fd < 0 || output_fd < 0) {
+        if (rga_status) *rga_status = -1;
+        return false;
+    }
+
+    const int source_stride = static_cast<int>(
+        source_stride_y >= source_width ? source_stride_y : source_width);
+    const int output_stride = static_cast<int>(output_width);
+    const int output_hstride = static_cast<int>(align_recorder_height(output_height));
+    rga_buffer_t source = wrapbuffer_fd(
+        source_fd,
+        static_cast<int>(source_width),
+        static_cast<int>(source_height),
+        RK_FORMAT_YCbCr_420_SP,
+        source_stride,
+        static_cast<int>(source_height));
+    rga_buffer_t output = wrapbuffer_fd(
+        output_fd,
+        static_cast<int>(output_width),
+        static_cast<int>(output_height),
+        RK_FORMAT_YCbCr_420_SP,
+        output_stride,
+        output_hstride);
+    rga_buffer_t pattern{};
+    im_rect source_rect{
+        0, 0, static_cast<int>(source_width), static_cast<int>(source_height)};
+    im_rect output_rect{
+        0, 0, static_cast<int>(output_width), static_cast<int>(output_height)};
+    im_rect pattern_rect{};
+    const IM_STATUS status = improcess(
+        source, output, pattern, source_rect, output_rect, pattern_rect, 0);
+    if (rga_status) *rga_status = static_cast<int>(status);
+    return status > 0;
+#endif
+}
+
 void ensure_gstreamer_initialized() {
     if (!gst_is_initialized()) {
         gst_init(nullptr, nullptr);
@@ -221,7 +433,35 @@ bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
         g_object_set(G_OBJECT(audio_appsrc_), "block", FALSE, nullptr);
     }
     gst_app_src_set_stream_type(GST_APP_SRC(appsrc_), GST_APP_STREAM_TYPE_STREAM);
-    g_object_set(G_OBJECT(appsrc_), "block", FALSE, nullptr);
+    const size_t dma_frame_size = recorder_dma_frame_size(output_width, output_height);
+    g_object_set(G_OBJECT(appsrc_),
+                 "block", FALSE,
+                 "max-bytes", static_cast<guint64>(dma_frame_size) * 2,
+                 nullptr);
+
+    dma_allocator_ = gst_dmabuf_allocator_new();
+    dma_pool_ = std::make_shared<Mp4RecorderDmaPoolState>();
+    if (!dma_allocator_ || !dma_pool_) {
+        g_printerr("[recorder] failed to initialize DMA-BUF pool\n");
+        if (dma_allocator_) {
+            gst_object_unref(dma_allocator_);
+            dma_allocator_ = nullptr;
+        }
+        dma_pool_.reset();
+        if (audio_appsrc_) {
+            gst_object_unref(audio_appsrc_);
+            audio_appsrc_ = nullptr;
+        }
+        gst_object_unref(appsrc_);
+        appsrc_ = nullptr;
+        gst_object_unref(splitmuxsink_);
+        splitmuxsink_ = nullptr;
+        gst_object_unref(pipeline_);
+        pipeline_ = nullptr;
+        last_file_.clear();
+        segment_closed_callback_ = {};
+        return false;
+    }
 
     GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
     uint64_t play_end_ns = mono_time_ns();
@@ -239,6 +479,9 @@ bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
         splitmuxsink_ = nullptr;
         gst_object_unref(pipeline_);
         pipeline_ = nullptr;
+        gst_object_unref(dma_allocator_);
+        dma_allocator_ = nullptr;
+        dma_pool_.reset();
         last_file_.clear();
         segment_closed_callback_ = {};
         return false;
@@ -247,13 +490,14 @@ bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
     bus_ = gst_element_get_bus(pipeline_);
 
     frame_size_ = frame_size;
+    dma_frame_size_ = dma_frame_size;
     source_frame_size_ =
         static_cast<size_t>(source_width) * static_cast<size_t>(source_height) * 3 / 2;
     source_width_ = source_width;
     source_height_ = source_height;
     output_width_ = output_width;
     output_height_ = output_height;
-    scaled_frame_.assign(frame_size_, 0);
+    dma_pool_drop_count_ = 0;
     frame_duration_ns_ = GST_SECOND / fps;
     frame_index_ = 0;
     first_frame_ts_ns_ = 0;
@@ -282,7 +526,14 @@ bool Mp4Recorder::start_segmented(const std::string &temporary_file_pattern,
 }
 
 void Mp4Recorder::stop() {
-    if (!pipeline_) return;
+    if (!pipeline_) {
+        if (dma_allocator_) {
+            gst_object_unref(dma_allocator_);
+            dma_allocator_ = nullptr;
+        }
+        dma_pool_.reset();
+        return;
+    }
 
     uint64_t stop_begin_ns = mono_time_ns();
     rec_trace("stop enter frame_index=%llu", static_cast<unsigned long long>(frame_index_));
@@ -332,17 +583,23 @@ void Mp4Recorder::stop() {
     }
     gst_object_unref(pipeline_);
     pipeline_ = nullptr;
+    if (dma_allocator_) {
+        gst_object_unref(dma_allocator_);
+        dma_allocator_ = nullptr;
+    }
+    dma_pool_.reset();
 
     uint64_t stop_end_ns = mono_time_ns();
     rec_trace("stop done total_ms=%.3f", static_cast<double>(stop_end_ns - stop_begin_ns) / 1000000.0);
 
     frame_size_ = 0;
+    dma_frame_size_ = 0;
     source_frame_size_ = 0;
     source_width_ = 0;
     source_height_ = 0;
     output_width_ = 0;
     output_height_ = 0;
-    scaled_frame_.clear();
+    dma_pool_drop_count_ = 0;
     frame_duration_ns_ = 0;
     frame_index_ = 0;
     first_frame_ts_ns_ = 0;
@@ -355,8 +612,15 @@ void Mp4Recorder::stop() {
     segment_closed_callback_ = {};
 }
 
-bool Mp4Recorder::write_frame(const uint8_t *data, size_t size, uint64_t frame_ts_ns) {
-    if (!pipeline_ || !appsrc_ || !data || size < source_frame_size_) return false;
+bool Mp4Recorder::write_frame(const uint8_t *data,
+                              size_t size,
+                              uint64_t frame_ts_ns,
+                              int dmabuf_fd,
+                              uint32_t stride_y) {
+    if (!pipeline_ || !appsrc_ || !dma_allocator_ || !dma_pool_ || !data ||
+        dmabuf_fd < 0 || size < source_frame_size_ || dma_frame_size_ == 0) {
+        return false;
+    }
     const uint64_t frame_idx = frame_index_;
     uint64_t wf_begin_ns = mono_time_ns();
     rec_trace("write enter idx=%llu size=%zu", static_cast<unsigned long long>(frame_idx), size);
@@ -376,47 +640,100 @@ bool Mp4Recorder::write_frame(const uint8_t *data, size_t size, uint64_t frame_t
               static_cast<double>(bus_end_ns - bus_begin_ns) / 1000000.0);
 
     uint64_t alloc_begin_ns = mono_time_ns();
-    const uint8_t *encoded_input = data;
-    if (source_width_ != output_width_ || source_height_ != output_height_) {
-        image_buffer_t source{};
-        source.width = static_cast<int>(source_width_);
-        source.height = static_cast<int>(source_height_);
-        source.format = IMAGE_FORMAT_YUV420SP_NV12;
-        source.size = static_cast<int>(source_frame_size_);
-        source.virt_addr = const_cast<uint8_t *>(data);
-        source.fd = -1;
-
-        image_buffer_t output{};
-        output.width = static_cast<int>(output_width_);
-        output.height = static_cast<int>(output_height_);
-        output.format = IMAGE_FORMAT_YUV420SP_NV12;
-        output.size = static_cast<int>(frame_size_);
-        output.virt_addr = scaled_frame_.data();
-        output.fd = -1;
-        if (convert_image(&source, &output, nullptr, nullptr, 0) != 0) {
-            g_printerr("[recorder] RGA scale failed %ux%u -> %ux%u\n",
-                       source_width_, source_height_, output_width_, output_height_);
-            return false;
+    bool pool_exhausted = false;
+    auto dma_lease = acquire_recorder_dma_buffer(
+        dma_pool_, dma_frame_size_, &pool_exhausted);
+    if (!dma_lease) {
+        if (pool_exhausted) {
+            ++dma_pool_drop_count_;
+            if (dma_pool_drop_count_ == 1 || dma_pool_drop_count_ % 120 == 0) {
+                g_printerr("[recorder] drop frame reason=dmabuf-pool-unavailable drops=%llu frame_bytes=%zu\n",
+                           static_cast<unsigned long long>(dma_pool_drop_count_),
+                           dma_frame_size_);
+            }
+            return true;
         }
-        encoded_input = scaled_frame_.data();
+        return false;
     }
 
-    GstBuffer *buffer = gst_buffer_new_allocate(nullptr, frame_size_, nullptr);
+    int rga_status = 0;
+    if (!copy_recorder_frame_to_dma(
+            dmabuf_fd,
+            source_width_,
+            source_height_,
+            stride_y,
+            dma_lease->fd,
+            output_width_,
+            output_height_,
+            &rga_status)) {
+        g_printerr("[recorder] RGA DMA copy failed status=%d %ux%u stride=%u fd=%d -> %ux%u fd=%d\n",
+                   rga_status,
+                   source_width_,
+                   source_height_,
+                   stride_y,
+                   dmabuf_fd,
+                   output_width_,
+                   output_height_,
+                   dma_lease->fd);
+        release_recorder_dma_buffer(dma_lease.release());
+        return false;
+    }
+
+    const int gst_memory_fd = ::dup(dma_lease->fd);
+    if (gst_memory_fd < 0) {
+        g_printerr("[recorder] duplicate DMA-BUF fd failed fd=%d errno=%d error=%s\n",
+                   dma_lease->fd,
+                   errno,
+                   std::strerror(errno));
+        release_recorder_dma_buffer(dma_lease.release());
+        return false;
+    }
+    GstMemory *memory = gst_dmabuf_allocator_alloc(
+        dma_allocator_, gst_memory_fd, dma_frame_size_);
+    if (!memory) {
+        ::close(gst_memory_fd);
+        release_recorder_dma_buffer(dma_lease.release());
+        return false;
+    }
+    GstBuffer *buffer = gst_buffer_new();
     uint64_t alloc_end_ns = mono_time_ns();
     rec_trace("write buffer alloc idx=%llu alloc_ms=%.3f",
               static_cast<unsigned long long>(frame_idx),
               static_cast<double>(alloc_end_ns - alloc_begin_ns) / 1000000.0);
-    if (!buffer) return false;
-
-    GstMapInfo map;
-    if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
-        gst_buffer_unref(buffer);
+    if (!buffer) {
+        gst_memory_unref(memory);
+        release_recorder_dma_buffer(dma_lease.release());
         return false;
     }
-    std::memcpy(map.data, encoded_input, frame_size_);
-    gst_buffer_unmap(buffer, &map);
+    gst_buffer_append_memory(buffer, memory);
+
+    gsize offsets[GST_VIDEO_MAX_PLANES] = {};
+    gint strides[GST_VIDEO_MAX_PLANES] = {};
+    const uint32_t output_hstride = align_recorder_height(output_height_);
+    offsets[0] = 0;
+    offsets[1] = static_cast<gsize>(output_width_) * output_hstride;
+    strides[0] = static_cast<gint>(output_width_);
+    strides[1] = static_cast<gint>(output_width_);
+    if (!gst_buffer_add_video_meta_full(
+            buffer,
+            GST_VIDEO_FRAME_FLAG_NONE,
+            GST_VIDEO_FORMAT_NV12,
+            output_width_,
+            output_height_,
+            2,
+            offsets,
+            strides)) {
+        gst_buffer_unref(buffer);
+        release_recorder_dma_buffer(dma_lease.release());
+        return false;
+    }
+    const int output_dma_fd = dma_lease->fd;
+    gst_mini_object_weak_ref(
+        GST_MINI_OBJECT(memory),
+        on_recorder_dma_buffer_released,
+        dma_lease.release());
     uint64_t copy_end_ns = mono_time_ns();
-    rec_trace("write map+copy idx=%llu copy_ms=%.3f",
+    rec_trace("write DMA copy+wrap idx=%llu copy_ms=%.3f",
               static_cast<unsigned long long>(frame_idx),
               static_cast<double>(copy_end_ns - alloc_end_ns) / 1000000.0);
 
@@ -458,6 +775,14 @@ bool Mp4Recorder::write_frame(const uint8_t *data, size_t size, uint64_t frame_t
               flow_ret,
               static_cast<double>(push_end_ns - push_begin_ns) / 1000000.0,
               static_cast<double>(push_end_ns - wf_begin_ns) / 1000000.0);
+    if (frame_idx < 5 || frame_idx % 600 == 0 || flow_ret != GST_FLOW_OK) {
+        g_print("[recorder] appsrc push DMA-BUF count=%llu bytes=%zu fd=%d flow=%d pts_ns=%llu\n",
+                static_cast<unsigned long long>(frame_idx + 1),
+                dma_frame_size_,
+                output_dma_fd,
+                static_cast<int>(flow_ret),
+                static_cast<unsigned long long>(pts_ns));
+    }
     return flow_ret == GST_FLOW_OK;
 }
 

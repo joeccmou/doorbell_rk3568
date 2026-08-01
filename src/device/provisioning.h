@@ -141,7 +141,7 @@ private:
     std::string mqtt_host_;
     std::string mqtt_ca_dir_;
     bool mqtt_tls_ = true;
-    bool mqtt_tls_insecure_ = true;
+    bool mqtt_tls_insecure_ = false;
     int mqtt_port_ = 8883;
     int http_port_ = 80;
     std::string led_name_;

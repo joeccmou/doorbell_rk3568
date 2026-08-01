@@ -13,6 +13,20 @@ namespace {
 
 constexpr unsigned kChimeRepeatCount = 2;
 
+class ChimeMixScope {
+public:
+    explicit ChimeMixScope(AudioCaptureManager *audio) : audio_(audio) {
+        if (audio_) audio_->set_chime_active(true);
+    }
+
+    ~ChimeMixScope() {
+        if (audio_) audio_->set_chime_active(false);
+    }
+
+private:
+    AudioCaptureManager *audio_ = nullptr;
+};
+
 }
 
 DoorbellChimePlayer::DoorbellChimePlayer(
@@ -60,6 +74,8 @@ void DoorbellChimePlayer::worker_loop() {
             handled_play_sequence = play_sequence;
         }
 
+        // 铃声和远端语音由独立输入混合；播放期间仅轻微压低远端语音。
+        ChimeMixScope mix_scope(audio_);
         for (unsigned repeat_index = 1;
              repeat_index <= kChimeRepeatCount;
              ++repeat_index) {
@@ -153,7 +169,7 @@ DoorbellChimePlayer::PlaybackResult DoorbellChimePlayer::play_file_once(
                     : 20ULL * 1000ULL * 1000ULL;
                 sample_count += map.size / sizeof(int16_t);
                 duration_ns += frame.duration_ns;
-                ok = audio_->push_playback_frame(frame) && ok;
+                ok = audio_->push_chime_playback_frame(frame) && ok;
                 gst_buffer_unmap(buffer, &map);
             }
             gst_sample_unref(sample);

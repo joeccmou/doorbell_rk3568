@@ -414,7 +414,7 @@ DoorbellProvisioning::DoorbellProvisioning()
       mqtt_host_(env_or("DOORBELL_MQTT_HOST", "smartdoorbell.site")),
       mqtt_ca_dir_(env_or("DOORBELL_MQTT_CA_DIR", "/etc/ssl/certs")),
       mqtt_tls_(env_bool_or("DOORBELL_MQTT_TLS", true)),
-      mqtt_tls_insecure_(env_bool_or("DOORBELL_MQTT_TLS_INSECURE", true)),
+      mqtt_tls_insecure_(env_bool_or("DOORBELL_MQTT_TLS_INSECURE", false)),
       mqtt_port_(env_int_or("DOORBELL_MQTT_PORT", 8883)),
       http_port_(env_int_or("DOORBELL_PROVISION_HTTP_PORT", 80)),
       led_name_(env_or("DOORBELL_LED_NAME", "work-led")),

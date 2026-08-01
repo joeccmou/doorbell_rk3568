@@ -71,8 +71,10 @@ private:
                              const std::string &media_state,
                              const std::string &error_code = "",
                              const std::string &error_message = "");
-    static LiveWebRtcSession::StartRequest parse_start_request(const std::string &device_id,
-                                                               const nlohmann::json &command);
+    static bool parse_start_request(const std::string &device_id,
+                                    const nlohmann::json &command,
+                                    LiveWebRtcSession::StartRequest *request,
+                                    std::string *error_message);
 
     std::string device_id_;
     std::string current_mode_ = "live_view";

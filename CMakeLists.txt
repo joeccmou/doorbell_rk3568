@@ -115,7 +115,13 @@ if (CONFIG_LV_USE_SDL OR CONFIG_LV_USE_DRAW_SDL)
 endif()
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-webrtc-1.0 gstreamer-sdp-1.0)
+pkg_check_modules(GSTREAMER REQUIRED
+    gstreamer-1.0
+    gstreamer-app-1.0
+    gstreamer-allocators-1.0
+    gstreamer-video-1.0
+    gstreamer-webrtc-1.0
+    gstreamer-sdp-1.0)
 list(APPEND PKG_CONFIG_LIB ${GSTREAMER_LIBRARIES})
 list(APPEND PKG_CONFIG_INC ${GSTREAMER_INCLUDE_DIRS})
 
@@ -165,6 +171,7 @@ add_executable(doorbell
     src/events/person_event_gate.cpp
     src/events/snapshot_candidate_selector.cpp
     src/events/snapshot_service.cpp
+    src/ui/rga_display_pipeline.cpp
 	src/ui/settings.cpp
     src/utils/file_utils.cpp
     src/utils/file_sha256.cpp

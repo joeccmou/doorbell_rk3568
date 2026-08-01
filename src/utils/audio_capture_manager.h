@@ -3,11 +3,14 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <gst/gst.h>
 
@@ -54,9 +57,19 @@ public:
   void unregister_consumer(size_t consumer_id);
   size_t consumer_count() const { return dispatcher_.consumer_count(); }
   AudioFrameDispatcher *dispatcher() { return &dispatcher_; }
-  bool push_playback_frame(const AudioFrame &frame);
+  bool push_remote_playback_frame(const AudioFrame &frame);
+  bool push_chime_playback_frame(const AudioFrame &frame);
+  void set_chime_active(bool active);
 
 private:
+  enum class PlaybackSource {
+    kRemote,
+    kChime,
+  };
+
+  bool enqueue_playback_frame(const AudioFrame &frame, PlaybackSource source);
+  bool push_mixed_playback_buffer(const std::vector<int16_t> &samples);
+  void playback_loop();
   void pull_loop();
 
   AudioFrameDispatcher dispatcher_;
@@ -66,9 +79,16 @@ private:
   GstPad *playback_sink_pad_ = nullptr;
   gulong playback_sink_probe_id_ = 0;
   std::mutex playback_mtx_;
+  std::condition_variable playback_cv_;
+  std::deque<int16_t> remote_playback_samples_;
+  std::deque<int16_t> chime_playback_samples_;
+  std::thread playback_thread_;
   std::thread pull_thread_;
   std::atomic<bool> stop_requested_{false};
-  PcmS16LevelMeter playback_level_meter_;
+  std::atomic<bool> chime_active_{false};
+  PcmS16LevelMeter remote_playback_level_meter_;
+  PcmS16LevelMeter chime_playback_level_meter_;
+  PcmS16LevelMeter mixed_playback_level_meter_;
   PcmS16LevelMeter playback_sink_level_meter_;
   PcmS16LevelMeter capture_level_meter_;
   std::atomic<uint64_t> latest_playback_pts_ns_{0};

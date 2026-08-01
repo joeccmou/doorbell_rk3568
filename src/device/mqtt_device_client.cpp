@@ -51,7 +51,15 @@ bool configure_mqtt_client(mosquitto *client,
                          mosquitto_strerror(rc));
             return false;
         }
-        mosquitto_tls_insecure_set(client, tls_insecure);
+        rc = mosquitto_tls_insecure_set(client, tls_insecure);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            std::fprintf(stderr,
+                         "[mqtt] tls hostname verification setup failed phase=%s rc=%d error=%s\n",
+                         phase,
+                         rc,
+                         mosquitto_strerror(rc));
+            return false;
+        }
     }
     return true;
 }

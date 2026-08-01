@@ -35,6 +35,7 @@
 #include "events/person_event_gate.h"
 #include "events/person_recording_policy.h"
 #include "events/snapshot_candidate_selector.h"
+#include "ui/rga_display_pipeline.h"
 #include "ui/settings.h"
 #include "ai/yolo_person_detector.h"
 #include "utils/mp4_recorder.h"
@@ -142,7 +143,8 @@ struct UiContext {
 
     uint32_t perf_last_log_ms = 0;
 
-    std::vector<uint8_t> display_frame;
+    std::vector<uint8_t> display_fallback;
+    std::unique_ptr<RgaDisplayPipeline> display_pipeline;
     Mp4Recorder recorder;
     AudioCaptureManager audio_capture;
     std::unique_ptr<DoorbellChimePlayer> doorbell_chime;
@@ -635,7 +637,12 @@ void recorder_worker(UiContext *ctx) {
         // }
 
         uint64_t write_begin_ns = monotonic_time_ns();
-        bool write_ok = ctx->recorder.write_frame(media_frame.data, media_frame.size, frame.ts_ns);
+        bool write_ok = ctx->recorder.write_frame(
+            media_frame.data,
+            media_frame.size,
+            frame.ts_ns,
+            media_frame.fd,
+            media_frame.stride_y);
         uint64_t write_end_ns = monotonic_time_ns();
         perf_log("record write ts_ns=%llu seq=%llu wait_ms=%.3f write_ms=%.3f ok=%d bytes=%zu\n",
                  static_cast<unsigned long long>(frame.ts_ns),
@@ -758,8 +765,6 @@ void camera_timer_cb(lv_timer_t *timer) {
     const uint32_t width = ctx->camera->width();
     const uint32_t height = ctx->camera->height();
     const size_t rgb_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 3;
-    const size_t bgra_size =
-        static_cast<size_t>(kDisplayWidth) * static_cast<size_t>(kDisplayHeight) * 4;
     uint64_t frame_seq = 0;
     uint64_t frame_ts_ns = 0;
     uint64_t copy_begin_ns = monotonic_time_ns();
@@ -783,10 +788,6 @@ void camera_timer_cb(lv_timer_t *timer) {
     if (ctx->blank.size() < rgb_size) {
         ctx->blank.resize(rgb_size);
     }
-    if (ctx->display_frame.size() != bgra_size) {
-        ctx->display_frame.resize(bgra_size);
-    }
-
     const uint32_t now = lv_tick_get();
     std::optional<EventRecord> completed_ring_snapshot_event;
     std::optional<SelectedSnapshot> selected_ring_snapshot;
@@ -912,24 +913,33 @@ void camera_timer_cb(lv_timer_t *timer) {
         ctx->perf_last_log_ms = now;
     }
 
-    image_buffer_t dst_bgra{};
-    dst_bgra.width = static_cast<int>(kDisplayWidth);
-    dst_bgra.height = static_cast<int>(kDisplayHeight);
-    dst_bgra.format = IMAGE_FORMAT_BGRA8888;
-    dst_bgra.size = static_cast<int>(bgra_size);
-    dst_bgra.virt_addr = ctx->display_frame.data();
-    dst_bgra.fd = -1;
-
-    if (convert_image(&rgb_img, &dst_bgra, nullptr, nullptr, 0) != 0) {
-		uint64_t cb_end_ns = monotonic_time_ns();
-		perf_logger_log("[camera_timer_cb] total_ms=%.3f reason=convert_image_fail\n",
-					static_cast<double>(cb_end_ns - cb_begin_ns) / 1000000.0);
+    if (!ctx->display_pipeline) {
+        return;
+    }
+    const RgaDisplayPipeline::RenderResult display_result =
+        ctx->display_pipeline->render(ctx->blank.data(), rgb_size);
+    if (display_result != RgaDisplayPipeline::RenderResult::Rendered) {
+        if (display_result == RgaDisplayPipeline::RenderResult::Failed &&
+            !ctx->display_fallback.empty() &&
+            ctx->image_dsc.data != ctx->display_fallback.data()) {
+            ctx->image_dsc.data = ctx->display_fallback.data();
+            ctx->image_dsc.data_size = ctx->display_fallback.size();
+            if (ctx->image_obj) {
+                lv_image_set_src(ctx->image_obj, &ctx->image_dsc);
+                lv_obj_invalidate(ctx->image_obj);
+            }
+        }
         return;
     }
     const uint64_t convert_end_ns = monotonic_time_ns();
 
-    ctx->image_dsc.data = ctx->display_frame.data();
-    ctx->image_dsc.data_size = bgra_size;
+    const uint8_t *display_data = ctx->display_pipeline->output_data();
+    const bool display_buffer_changed = ctx->image_dsc.data != display_data;
+    ctx->image_dsc.data = display_data;
+    ctx->image_dsc.data_size = ctx->display_pipeline->output_size();
+    if (display_buffer_changed && ctx->image_obj) {
+        lv_image_set_src(ctx->image_obj, &ctx->image_dsc);
+    }
     // Invalidate the whole screen to clear leftover regions when resolution shrinks.
     lv_obj_invalidate(lv_screen_active());
 
@@ -1014,8 +1024,10 @@ bool restart_camera(void *user_ctx, uint32_t pixfmt, uint32_t w, uint32_t h) {
     size_t bgra_size =
         static_cast<size_t>(kDisplayWidth) * static_cast<size_t>(kDisplayHeight) * 4;
     ctx->image_dsc.data_size = bgra_size;
-    ctx->display_frame.assign(bgra_size, 0);
-    ctx->image_dsc.data = ctx->display_frame.data();
+    if (!ctx->image_dsc.data) {
+        ctx->display_fallback.assign(bgra_size, 0);
+        ctx->image_dsc.data = ctx->display_fallback.data();
+    }
     ctx->image_dsc.reserved = nullptr;
     ctx->image_dsc.reserved_2 = nullptr;
     ctx->blank.clear();
@@ -1181,8 +1193,14 @@ int main(int argc, char **argv) {
     size_t bgra_size =
         static_cast<size_t>(kDisplayWidth) * static_cast<size_t>(kDisplayHeight) * 4;
     ctx.image_dsc.data_size = bgra_size;
-    ctx.display_frame.assign(bgra_size, 0);
-    ctx.image_dsc.data = ctx.display_frame.data();
+    ctx.display_fallback.assign(bgra_size, 0);
+    ctx.image_dsc.data = ctx.display_fallback.data();
+    ctx.display_pipeline = std::make_unique<RgaDisplayPipeline>(
+        kMasterCaptureWidth, kMasterCaptureHeight, kDisplayWidth, kDisplayHeight);
+    if (ctx.display_pipeline->initialize()) {
+        ctx.image_dsc.data = ctx.display_pipeline->output_data();
+        ctx.image_dsc.data_size = ctx.display_pipeline->output_size();
+    }
     ctx.image_dsc.reserved = nullptr;
     ctx.image_dsc.reserved_2 = nullptr;
 

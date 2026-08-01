@@ -4,9 +4,12 @@
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -16,6 +19,31 @@ std::once_flag g_audio_gst_init_once;
 
 constexpr uint64_t kDefaultAudioFrameNs = 20ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kMetricsLogIntervalNs = 1000ULL * 1000ULL * 1000ULL;
+constexpr size_t kPlaybackFrameSamples = 960;
+constexpr size_t kRemotePlaybackQueueMaxSamples = 9600;
+constexpr size_t kChimePlaybackQueueMaxSamples = 48000;
+constexpr double kPlaybackGain = 0.3548;
+constexpr double kRemotePlaybackGainDuringChime = 0.1778;
+
+int16_t decode_s16le(const uint8_t *data) {
+  const uint16_t raw = static_cast<uint16_t>(data[0]) |
+                       (static_cast<uint16_t>(data[1]) << 8);
+  return static_cast<int16_t>(raw);
+}
+
+int16_t mix_pcm_sample(int16_t remote, int16_t chime, bool duck_remote) {
+  const double remote_gain =
+      duck_remote ? kRemotePlaybackGainDuringChime : kPlaybackGain;
+  const int32_t mixed =
+      static_cast<int32_t>(std::lround(static_cast<double>(remote) *
+                                      remote_gain)) +
+      static_cast<int32_t>(
+          std::lround(static_cast<double>(chime) * kPlaybackGain));
+  return static_cast<int16_t>(
+      std::clamp(mixed,
+                 static_cast<int32_t>(std::numeric_limits<int16_t>::min()),
+                 static_cast<int32_t>(std::numeric_limits<int16_t>::max())));
+}
 
 uint64_t monotonic_time_ns() {
   return static_cast<uint64_t>(
@@ -86,21 +114,20 @@ bool AudioCaptureManager::start(const std::string &device,
 
   std::call_once(g_audio_gst_init_once, []() { gst_init(nullptr, nullptr); });
 
-  // 先创建回声参考探针，再激活采集侧 DSP；AEC 要求二者位于同一个顶层 pipeline。
+  // 远端语音和门铃声先在 C++ 中按 20 ms 帧混音，再经唯一的 appsrc
+  // 送入 AEC 和 ALSA。没有真实播放数据时不持续写入静音帧。
   gchar *pipeline_desc = g_strdup_printf(
       "appsrc name=playback_src is-live=true block=false format=time "
       "do-timestamp=true "
       "caps=%s "
-      "! "
-      "queue leaky=downstream max-size-buffers=16 ! audioconvert ! "
+      "! queue leaky=downstream max-size-buffers=16 ! audioconvert ! "
       "audioresample ! "
       "%s ! "
-      "volume name=live_playback_gain volume=0.3548 ! "
+      "volume name=live_playback_gain volume=1.0 ! "
       "webrtcechoprobe name=echo_probe ! "
       "audioconvert ! audioresample ! "
       "%s ! "
-      "alsasink name=playback_sink device=%s sync=true "
-      "async=false "
+      "alsasink name=playback_sink device=%s sync=true async=false "
       "alsasrc device=%s do-timestamp=true ! "
       "%s ! "
       "queue leaky=downstream max-size-buffers=8 ! audioconvert ! "
@@ -162,7 +189,9 @@ bool AudioCaptureManager::start(const std::string &device,
                               GST_APP_STREAM_TYPE_STREAM);
   g_object_set(G_OBJECT(playback_appsrc), "block", FALSE, nullptr);
 
-  playback_level_meter_.snapshot_and_reset();
+  remote_playback_level_meter_.snapshot_and_reset();
+  chime_playback_level_meter_.snapshot_and_reset();
+  mixed_playback_level_meter_.snapshot_and_reset();
   playback_sink_level_meter_.snapshot_and_reset();
   capture_level_meter_.snapshot_and_reset();
   const gulong playback_sink_probe_id = gst_pad_add_probe(
@@ -206,13 +235,18 @@ bool AudioCaptureManager::start(const std::string &device,
   playback_sink_pad_ = playback_sink_pad;
   playback_sink_probe_id_ = playback_sink_probe_id;
   stop_requested_.store(false);
+  chime_active_.store(false);
+  remote_playback_samples_.clear();
+  chime_playback_samples_.clear();
   latest_playback_pts_ns_.store(0);
   last_metrics_log_ns_ = monotonic_time_ns();
   seq_ = 0;
+  playback_thread_ = std::thread(&AudioCaptureManager::playback_loop, this);
   pull_thread_ = std::thread(&AudioCaptureManager::pull_loop, this);
   std::fprintf(stdout,
                "[audio] capture started device=%s hardware_rate=%d "
-               "hardware_channels=%d webrtc_rate=%d webrtc_channels=%d\n",
+               "hardware_channels=%d webrtc_rate=%d webrtc_channels=%d "
+               "playback_mixer=cpp_pcm playback_clock=active_source\n",
                device.c_str(), kAudioHardwareRate, kAudioHardwareChannels,
                kAudioWebRtcRate, kAudioWebRtcChannels);
   return true;
@@ -220,6 +254,10 @@ bool AudioCaptureManager::start(const std::string &device,
 
 void AudioCaptureManager::stop() {
   stop_requested_.store(true);
+  playback_cv_.notify_all();
+  if (playback_thread_.joinable()) {
+    playback_thread_.join();
+  }
   if (pull_thread_.joinable()) {
     pull_thread_.join();
   }
@@ -233,6 +271,8 @@ void AudioCaptureManager::stop() {
     std::lock_guard<std::mutex> lock(playback_mtx_);
     playback_appsrc = playback_appsrc_;
     playback_appsrc_ = nullptr;
+    remote_playback_samples_.clear();
+    chime_playback_samples_.clear();
   }
   appsink_ = nullptr;
   pipeline_ = nullptr;
@@ -265,15 +305,94 @@ void AudioCaptureManager::unregister_consumer(size_t consumer_id) {
   dispatcher_.unregister_consumer(consumer_id);
 }
 
-bool AudioCaptureManager::push_playback_frame(const AudioFrame &frame) {
-  if (!frame.data || frame.size == 0)
+bool AudioCaptureManager::push_remote_playback_frame(const AudioFrame &frame) {
+  return enqueue_playback_frame(frame, PlaybackSource::kRemote);
+}
+
+bool AudioCaptureManager::push_chime_playback_frame(const AudioFrame &frame) {
+  return enqueue_playback_frame(frame, PlaybackSource::kChime);
+}
+
+void AudioCaptureManager::set_chime_active(bool active) {
+  {
+    std::lock_guard<std::mutex> lock(playback_mtx_);
+    if (!playback_appsrc_)
+      return;
+    const bool was_active = chime_active_.exchange(active);
+    if (active && !was_active) {
+      // 新一轮按铃从头播放，避免上一次被中断的尾音残留到队列中。
+      chime_playback_samples_.clear();
+    }
+  }
+  playback_cv_.notify_all();
+  const double remote_gain =
+      active ? kRemotePlaybackGainDuringChime : kPlaybackGain;
+  std::fprintf(stdout,
+               "[audio] chime mix active=%d remote_gain=%.4f\n",
+               active ? 1 : 0,
+               remote_gain);
+}
+
+bool AudioCaptureManager::enqueue_playback_frame(const AudioFrame &frame,
+                                                 PlaybackSource source) {
+  if (!frame.data || frame.size < sizeof(int16_t))
     return false;
 
-  std::lock_guard<std::mutex> lock(playback_mtx_);
-  if (!playback_appsrc_)
+  const size_t sample_count = frame.size / sizeof(int16_t);
+  std::vector<int16_t> samples(sample_count);
+  for (size_t i = 0; i < sample_count; ++i) {
+    samples[i] = decode_s16le(frame.data + i * sizeof(int16_t));
+  }
+
+  size_t dropped_samples = 0;
+  {
+    std::lock_guard<std::mutex> lock(playback_mtx_);
+    if (stop_requested_.load() || !playback_appsrc_)
+      return false;
+
+    std::deque<int16_t> &queue =
+        source == PlaybackSource::kRemote ? remote_playback_samples_
+                                          : chime_playback_samples_;
+    const size_t max_samples = source == PlaybackSource::kRemote
+                                   ? kRemotePlaybackQueueMaxSamples
+                                   : kChimePlaybackQueueMaxSamples;
+    const size_t kept_samples = std::min(samples.size(), max_samples);
+    const size_t source_offset = samples.size() - kept_samples;
+    const size_t required_size = queue.size() + kept_samples;
+    if (required_size > max_samples) {
+      dropped_samples = required_size - max_samples;
+      for (size_t i = 0; i < dropped_samples; ++i) {
+        queue.pop_front();
+      }
+    }
+    queue.insert(queue.end(), samples.begin() + source_offset, samples.end());
+  }
+
+  if (source == PlaybackSource::kRemote) {
+    remote_playback_level_meter_.add(frame.data,
+                                     sample_count * sizeof(int16_t));
+  } else {
+    chime_playback_level_meter_.add(frame.data,
+                                    sample_count * sizeof(int16_t));
+  }
+  if (dropped_samples > 0) {
+    std::fprintf(stderr,
+                 "[audio] playback queue overflow source=%s "
+                 "dropped_samples=%llu\n",
+                 source == PlaybackSource::kRemote ? "remote" : "chime",
+                 static_cast<unsigned long long>(dropped_samples));
+  }
+  playback_cv_.notify_one();
+  return true;
+}
+
+bool AudioCaptureManager::push_mixed_playback_buffer(
+    const std::vector<int16_t> &samples) {
+  if (samples.empty() || !playback_appsrc_)
     return false;
 
-  GstBuffer *buffer = gst_buffer_new_allocate(nullptr, frame.size, nullptr);
+  const size_t byte_count = samples.size() * sizeof(int16_t);
+  GstBuffer *buffer = gst_buffer_new_allocate(nullptr, byte_count, nullptr);
   if (!buffer)
     return false;
 
@@ -282,26 +401,93 @@ bool AudioCaptureManager::push_playback_frame(const AudioFrame &frame) {
     gst_buffer_unref(buffer);
     return false;
   }
-  std::memcpy(map.data, frame.data, frame.size);
+  std::memcpy(map.data, samples.data(), byte_count);
   gst_buffer_unmap(buffer, &map);
 
   // 由 playback appsrc 按音频管理器当前 running-time 打时间戳，供 AEC
   // 对齐参考信号。
   GST_BUFFER_PTS(buffer) = GST_CLOCK_TIME_NONE;
   GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
-  GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(frame.duration_ns);
+  GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(
+      samples.size() * GST_SECOND / kAudioWebRtcRate);
 
   const uint64_t playback_pts_ns = pipeline_running_time_ns(pipeline_);
   const GstFlowReturn flow_ret =
       gst_app_src_push_buffer(GST_APP_SRC(playback_appsrc_), buffer);
   if (flow_ret == GST_FLOW_OK) {
-    playback_level_meter_.add(frame.data, frame.size);
+    mixed_playback_level_meter_.add(
+        reinterpret_cast<const uint8_t *>(samples.data()), byte_count);
     latest_playback_pts_ns_.store(playback_pts_ns);
   }
   if (flow_ret != GST_FLOW_OK && flow_ret != GST_FLOW_FLUSHING) {
-    std::fprintf(stderr, "[audio] playback appsrc push failed: %d\n", flow_ret);
+    std::fprintf(stderr, "[audio] playback appsrc push failed flow=%d\n",
+                 flow_ret);
   }
   return flow_ret == GST_FLOW_OK;
+}
+
+void AudioCaptureManager::playback_loop() {
+  using Clock = std::chrono::steady_clock;
+  auto next_push_time = Clock::now();
+  bool playback_clock_active = false;
+
+  while (!stop_requested_.load()) {
+    std::vector<int16_t> mixed_samples;
+    {
+      std::unique_lock<std::mutex> lock(playback_mtx_);
+      if (remote_playback_samples_.empty() &&
+          chime_playback_samples_.empty()) {
+        playback_clock_active = false;
+        playback_cv_.wait(lock, [this] {
+          return stop_requested_.load() ||
+                 !remote_playback_samples_.empty() ||
+                 !chime_playback_samples_.empty();
+        });
+      }
+      if (stop_requested_.load())
+        break;
+
+      if (!playback_clock_active) {
+        next_push_time = Clock::now();
+        playback_clock_active = true;
+      }
+      const size_t remote_count =
+          std::min(kPlaybackFrameSamples, remote_playback_samples_.size());
+      const size_t chime_count =
+          std::min(kPlaybackFrameSamples, chime_playback_samples_.size());
+      const size_t mixed_count = std::max(remote_count, chime_count);
+      const bool duck_remote = chime_active_.load() || chime_count > 0 ||
+                               !chime_playback_samples_.empty();
+      mixed_samples.reserve(mixed_count);
+      for (size_t i = 0; i < mixed_count; ++i) {
+        int16_t remote = 0;
+        int16_t chime = 0;
+        if (i < remote_count) {
+          remote = remote_playback_samples_.front();
+          remote_playback_samples_.pop_front();
+        }
+        if (i < chime_count) {
+          chime = chime_playback_samples_.front();
+          chime_playback_samples_.pop_front();
+        }
+        mixed_samples.push_back(mix_pcm_sample(remote, chime, duck_remote));
+      }
+    }
+
+    if (mixed_samples.empty())
+      continue;
+    if (!push_mixed_playback_buffer(mixed_samples) &&
+        stop_requested_.load()) {
+      break;
+    }
+
+    const auto frame_duration = std::chrono::nanoseconds(
+        mixed_samples.size() * 1000000000ULL / kAudioWebRtcRate);
+    next_push_time += frame_duration;
+    std::unique_lock<std::mutex> lock(playback_mtx_);
+    playback_cv_.wait_until(lock, next_push_time,
+                            [this] { return stop_requested_.load(); });
+  }
 }
 
 void AudioCaptureManager::pull_loop() {
@@ -328,14 +514,19 @@ void AudioCaptureManager::pull_loop() {
 
       const uint64_t now_ns = monotonic_time_ns();
       if (now_ns - last_metrics_log_ns_ >= kMetricsLogIntervalNs) {
+        const AudioLevelSnapshot remote_playback =
+            remote_playback_level_meter_.snapshot_and_reset();
+        const AudioLevelSnapshot chime_playback =
+            chime_playback_level_meter_.snapshot_and_reset();
         const AudioLevelSnapshot playback =
-            playback_level_meter_.snapshot_and_reset();
+            mixed_playback_level_meter_.snapshot_and_reset();
         const AudioLevelSnapshot playback_sink =
             playback_sink_level_meter_.snapshot_and_reset();
         const AudioLevelSnapshot capture =
             capture_level_meter_.snapshot_and_reset();
         last_metrics_log_ns_ = now_ns;
-        if (playback.sample_count > 0 || playback_sink.sample_count > 0) {
+        if (remote_playback.peak > 0 || chime_playback.peak > 0 ||
+            playback.peak > 0 || playback_sink.peak > 0) {
           const AudioPlaybackPathState playback_path =
               audio_playback_path_state(playback, playback_sink);
           const uint64_t playback_pts_ns = latest_playback_pts_ns_.load();
@@ -346,6 +537,9 @@ void AudioCaptureManager::pull_loop() {
               "[audio] aec metrics playback_path=%s "
               "playback_samples=%llu playback_rms=%.1f "
               "playback_dbfs=%.1f playback_peak=%u "
+              "remote_samples=%llu remote_rms=%.1f remote_dbfs=%.1f "
+              "remote_peak=%u chime_samples=%llu chime_rms=%.1f "
+              "chime_dbfs=%.1f chime_peak=%u "
               "playback_sink_samples=%llu playback_sink_rms=%.1f "
               "playback_sink_dbfs=%.1f playback_sink_peak=%u "
               "capture_after_aec_samples=%llu capture_after_aec_rms=%.1f "
@@ -356,6 +550,14 @@ void AudioCaptureManager::pull_loop() {
               playback.rms,
               playback.rms_dbfs,
               playback.peak,
+              static_cast<unsigned long long>(remote_playback.sample_count),
+              remote_playback.rms,
+              remote_playback.rms_dbfs,
+              remote_playback.peak,
+              static_cast<unsigned long long>(chime_playback.sample_count),
+              chime_playback.rms,
+              chime_playback.rms_dbfs,
+              chime_playback.peak,
               static_cast<unsigned long long>(playback_sink.sample_count),
               playback_sink.rms,
               playback_sink.rms_dbfs,

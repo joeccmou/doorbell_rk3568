@@ -1,22 +1,38 @@
 ﻿#include "device/live_webrtc_session.h"
 
-#include "utils/image_utils.h"
-
+#include <gst/allocators/gstdmabuf.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <gst/sdp/sdp.h>
+#include <gst/video/video.h>
 #include <gst/webrtc/webrtc.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <thread>
-#include <linux/videodev2.h>
 #include <cstdio>
+#include <cstdlib>
+#include <fcntl.h>
+#include <linux/videodev2.h>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <sys/ioctl.h>
+#include <thread>
+#include <unistd.h>
 #include <utility>
+#include <vector>
+
+#if __has_include(<linux/dma-heap.h>)
+#include <linux/dma-heap.h>
+#else
+#include "../../../kernel/include/uapi/linux/dma-heap.h"
+#endif
+
+#if !defined(DOORBELL_DISABLE_RGA)
+#include <rga/im2d.h>
+#endif
 
 namespace {
 
@@ -29,6 +45,216 @@ constexpr const char *kH264RtpCaps =
 constexpr const char *kOpusRtpCaps =
     "application/x-rtp,media=(string)audio,encoding-name=(string)OPUS,"
     "payload=(int)97,clock-rate=(int)48000,encoding-params=(string)2";
+
+constexpr size_t kLiveDmaPoolMaxSlots = 6;
+
+// 摄像头的 DMA 双缓冲会被采集线程复用；编码链路必须持有独立缓冲直到 GstMemory 释放。
+
+struct LiveDmaSlot {
+    int fd = -1;
+    size_t size = 0;
+    bool in_use = false;
+};
+
+struct LiveDmaPoolState {
+    ~LiveDmaPoolState() {
+        for (auto &slot : slots) {
+            if (slot.fd >= 0) ::close(slot.fd);
+        }
+        if (heap_fd >= 0) ::close(heap_fd);
+    }
+
+    std::mutex mutex;
+    int heap_fd = -1;
+    std::vector<LiveDmaSlot> slots;
+};
+
+struct LiveDmaLease {
+    std::shared_ptr<LiveDmaPoolState> state;
+    size_t slot_index = 0;
+    int fd = -1;
+    size_t size = 0;
+};
+
+const char *select_live_dma_heap_path() {
+    static const char *chosen = [] {
+        if (const char *value = std::getenv("DOORBELL_DMA_HEAP")) return value;
+        static const char *candidates[] = {
+            "/dev/dma_heap/system-dma32",
+            "/dev/dma_heap/system",
+            "/dev/dma_heap/cma",
+        };
+        for (const char *path : candidates) {
+            if (::access(path, F_OK) == 0) return path;
+        }
+        return candidates[0];
+    }();
+    return chosen;
+}
+
+int allocate_live_dma_buffer(int heap_fd, size_t size) {
+    dma_heap_allocation_data allocation{};
+    allocation.len = size;
+    allocation.fd_flags = O_RDWR | O_CLOEXEC;
+    allocation.heap_flags = 0;
+    if (::ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &allocation) < 0) {
+        return -1;
+    }
+    return static_cast<int>(allocation.fd);
+}
+
+std::unique_ptr<LiveDmaLease> acquire_live_dma_buffer(
+    const std::shared_ptr<LiveDmaPoolState> &state,
+    size_t size) {
+    if (!state || size == 0) return nullptr;
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->heap_fd < 0) {
+        state->heap_fd = ::open(select_live_dma_heap_path(), O_RDWR | O_CLOEXEC);
+        if (state->heap_fd < 0) {
+            std::fprintf(stderr,
+                         "[live] open DMA heap failed path=%s errno=%d error=%s\n",
+                         select_live_dma_heap_path(),
+                         errno,
+                         std::strerror(errno));
+            return nullptr;
+        }
+    }
+
+    size_t slot_index = state->slots.size();
+    for (size_t i = 0; i < state->slots.size(); ++i) {
+        if (!state->slots[i].in_use && state->slots[i].size == size) {
+            slot_index = i;
+            break;
+        }
+    }
+    if (slot_index == state->slots.size()) {
+        for (size_t i = 0; i < state->slots.size(); ++i) {
+            if (!state->slots[i].in_use) {
+                slot_index = i;
+                break;
+            }
+        }
+    }
+    if (slot_index == state->slots.size()) {
+        if (state->slots.size() >= kLiveDmaPoolMaxSlots) return nullptr;
+        state->slots.emplace_back();
+    }
+
+    LiveDmaSlot &slot = state->slots[slot_index];
+    if (slot.fd < 0 || slot.size != size) {
+        if (slot.fd >= 0) ::close(slot.fd);
+        slot.fd = allocate_live_dma_buffer(state->heap_fd, size);
+        slot.size = slot.fd >= 0 ? size : 0;
+        if (slot.fd < 0) {
+            std::fprintf(stderr,
+                         "[live] allocate DMA-BUF failed size=%zu errno=%d error=%s\n",
+                         size,
+                         errno,
+                         std::strerror(errno));
+            return nullptr;
+        }
+    }
+    slot.in_use = true;
+    return std::make_unique<LiveDmaLease>(
+        LiveDmaLease{state, slot_index, slot.fd, slot.size});
+}
+
+void release_live_dma_buffer(LiveDmaLease *lease) {
+    if (!lease) return;
+    if (lease->state) {
+        std::lock_guard<std::mutex> lock(lease->state->mutex);
+        if (lease->slot_index < lease->state->slots.size()) {
+            lease->state->slots[lease->slot_index].in_use = false;
+        }
+    }
+    delete lease;
+}
+
+void on_live_dma_buffer_released(gpointer data, GstMiniObject *) {
+    release_live_dma_buffer(static_cast<LiveDmaLease *>(data));
+}
+
+uint32_t align_live_height(uint32_t height) {
+    return (height + 15U) & ~15U;
+}
+
+size_t live_dma_frame_size(uint32_t pixfmt, uint32_t width, uint32_t height) {
+    const size_t stride = static_cast<size_t>(width);
+    const size_t aligned_height = align_live_height(height);
+    switch (pixfmt) {
+        case V4L2_PIX_FMT_NV12:
+        case V4L2_PIX_FMT_NV21:
+            return stride * aligned_height * 3 / 2;
+        default:
+            return 0;
+    }
+}
+
+GstVideoFormat gst_video_format_for_pixfmt(uint32_t pixfmt) {
+    switch (pixfmt) {
+        case V4L2_PIX_FMT_NV12:
+            return GST_VIDEO_FORMAT_NV12;
+        case V4L2_PIX_FMT_NV21:
+            return GST_VIDEO_FORMAT_NV21;
+        default:
+            return GST_VIDEO_FORMAT_UNKNOWN;
+    }
+}
+
+bool copy_live_frame_to_dma(const LiveWebRtcSession::VideoFrame &frame,
+                            uint32_t output_width,
+                            uint32_t output_height,
+                            int output_fd,
+                            int *rga_status) {
+#if defined(DOORBELL_DISABLE_RGA)
+    (void)frame;
+    (void)output_width;
+    (void)output_height;
+    (void)output_fd;
+    if (rga_status) *rga_status = -1;
+    return false;
+#else
+    if (frame.dmabuf_fd < 0 || output_fd < 0 ||
+        (frame.pixfmt != V4L2_PIX_FMT_NV12 &&
+         frame.pixfmt != V4L2_PIX_FMT_NV21)) {
+        if (rga_status) *rga_status = -1;
+        return false;
+    }
+
+    const int rga_format = frame.pixfmt == V4L2_PIX_FMT_NV12
+        ? RK_FORMAT_YCbCr_420_SP
+        : RK_FORMAT_YCrCb_420_SP;
+    const int source_stride = static_cast<int>(
+        frame.stride_y >= frame.width ? frame.stride_y : frame.width);
+    const int output_stride = static_cast<int>(output_width);
+    const int output_hstride = static_cast<int>(align_live_height(output_height));
+    rga_buffer_t source = wrapbuffer_fd(
+        frame.dmabuf_fd,
+        static_cast<int>(frame.width),
+        static_cast<int>(frame.height),
+        rga_format,
+        source_stride,
+        static_cast<int>(frame.height));
+    rga_buffer_t output = wrapbuffer_fd(
+        output_fd,
+        static_cast<int>(output_width),
+        static_cast<int>(output_height),
+        rga_format,
+        output_stride,
+        output_hstride);
+    rga_buffer_t pattern{};
+    im_rect source_rect{
+        0, 0, static_cast<int>(frame.width), static_cast<int>(frame.height)};
+    im_rect output_rect{
+        0, 0, static_cast<int>(output_width), static_cast<int>(output_height)};
+    im_rect pattern_rect{};
+    const IM_STATUS status = improcess(
+        source, output, pattern, source_rect, output_rect, pattern_rect, 0);
+    if (rga_status) *rga_status = static_cast<int>(status);
+    return status > 0;
+#endif
+}
 
 const char *gst_format_for_pixfmt(uint32_t pixfmt) {
     switch (pixfmt) {
@@ -254,6 +480,83 @@ std::string normalize_stun_url(const std::string &url) {
     return url;
 }
 
+std::string build_turn_uri(const LiveWebRtcSession::IceServer &server,
+                           const std::string &url) {
+    std::string endpoint = url;
+    if (endpoint.rfind("turn://", 0) == 0) {
+        endpoint = endpoint.substr(7);
+    } else if (endpoint.rfind("turn:", 0) == 0) {
+        endpoint = endpoint.substr(5);
+    }
+
+    gchar *escaped_username =
+        g_uri_escape_string(server.username.c_str(), nullptr, FALSE);
+    gchar *escaped_credential =
+        g_uri_escape_string(server.credential.c_str(), nullptr, FALSE);
+    const std::string uri =
+        "turn://" +
+        std::string(escaped_username ? escaped_username : "") + ":" +
+        std::string(escaped_credential ? escaped_credential : "") + "@" +
+        endpoint;
+    g_free(escaped_username);
+    g_free(escaped_credential);
+    return uri;
+}
+
+std::string turn_host_for_log(const std::string &url) {
+    std::string host = url;
+    if (host.rfind("turn://", 0) == 0) {
+        host = host.substr(7);
+    } else if (host.rfind("turn:", 0) == 0) {
+        host = host.substr(5);
+    }
+    const size_t query = host.find('?');
+    if (query != std::string::npos) host.resize(query);
+    return host;
+}
+
+std::string turn_transport_for_log(const std::string &url) {
+    const std::string marker = "transport=";
+    const size_t start = url.find(marker);
+    if (start == std::string::npos) return "default";
+    const size_t value_start = start + marker.size();
+    const size_t end = url.find('&', value_start);
+    return url.substr(value_start, end - value_start);
+}
+
+std::string turn_expires_for_log(const std::string &username) {
+    const size_t separator = username.find(':');
+    return username.substr(0, separator);
+}
+
+struct TurnServerEntry {
+    std::string uri;
+    std::string host;
+    std::string expires;
+    std::string transport;
+};
+
+std::vector<TurnServerEntry> build_turn_servers(
+    const std::vector<LiveWebRtcSession::IceServer> &ice_servers) {
+    std::vector<TurnServerEntry> result;
+    for (const auto &server : ice_servers) {
+        if (server.username.empty() || server.credential.empty()) continue;
+        for (const auto &url : server.urls) {
+            if (url.rfind("turn:", 0) != 0 &&
+                url.rfind("turn://", 0) != 0) {
+                continue;
+            }
+            result.push_back({
+                build_turn_uri(server, url),
+                turn_host_for_log(url),
+                turn_expires_for_log(server.username),
+                turn_transport_for_log(url),
+            });
+        }
+    }
+    return result;
+}
+
 std::string summarize_ice_candidate(const std::string &candidate) {
     std::string normalized = candidate;
     if (normalized.rfind("candidate:", 0) == 0) {
@@ -424,7 +727,7 @@ std::string LiveWebRtcSession::stun_server_for(const std::vector<IceServer> &ice
             }
         }
     }
-    return "stun://smartdoorbell.site:3478";
+    return "";
 }
 
 bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_message) {
@@ -433,6 +736,12 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
 
     const QualityProfile profile = profile_for_quality(request.quality);
     const std::string stun_server = stun_server_for(request.ice_servers);
+    const std::vector<TurnServerEntry> turn_servers =
+        build_turn_servers(request.ice_servers);
+    if (stun_server.empty() && turn_servers.empty()) {
+        if (error_message) *error_message = "no valid STUN or TURN server";
+        return false;
+    }
 
     FrameProvider provider;
     AudioCaptureManager *audio_manager = nullptr;
@@ -465,10 +774,15 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
 
     const char *gst_format = gst_format_for_pixfmt(initial_frame.pixfmt);
     const size_t frame_size = raw_frame_size(initial_frame.pixfmt, initial_frame.width, initial_frame.height);
-    if (!gst_format || frame_size == 0 || initial_frame.size < frame_size) {
+    const size_t dma_frame_size = live_dma_frame_size(
+        initial_frame.pixfmt,
+        static_cast<uint32_t>(profile.width),
+        static_cast<uint32_t>(profile.height));
+    if (!gst_format || frame_size == 0 || dma_frame_size == 0 ||
+        initial_frame.size < frame_size || initial_frame.dmabuf_fd < 0) {
         if (error_message) *error_message = "camera frame format unsupported for WebRTC";
         std::fprintf(stderr,
-                     "[live] unsupported camera frame fmt=%c%c%c%c size=%ux%u bytes=%zu expected=%zu\n",
+                     "[live] unsupported camera frame fmt=%c%c%c%c size=%ux%u bytes=%zu expected=%zu dmabuf_fd=%d\n",
                      initial_frame.pixfmt & 0xFF,
                      (initial_frame.pixfmt >> 8) & 0xFF,
                      (initial_frame.pixfmt >> 16) & 0xFF,
@@ -476,11 +790,16 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
                      initial_frame.width,
                      initial_frame.height,
                      initial_frame.size,
-                     frame_size);
+                     frame_size,
+                     initial_frame.dmabuf_fd);
         return false;
     }
     std::ostringstream desc;
-    desc << "webrtcbin name=webrtc bundle-policy=max-bundle stun-server=" << stun_server
+    desc << "webrtcbin name=webrtc bundle-policy=max-bundle";
+    if (!stun_server.empty()) {
+        desc << " stun-server=" << stun_server;
+    }
+    desc
          << " appsrc name=live_appsrc is-live=true block=false format=time do-timestamp=false "
          << "caps=video/x-raw,format=" << gst_format
          << ",width=" << profile.width
@@ -527,10 +846,8 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         return false;
     }
     gst_app_src_set_stream_type(GST_APP_SRC(appsrc), GST_APP_STREAM_TYPE_STREAM);
-    const guint64 appsrc_max_bytes = static_cast<guint64>(
-        raw_frame_size(initial_frame.pixfmt,
-                       static_cast<uint32_t>(profile.width),
-                       static_cast<uint32_t>(profile.height))) * 2;
+    const guint64 appsrc_max_bytes =
+        static_cast<guint64>(dma_frame_size) * 2;
     g_object_set(G_OBJECT(appsrc),
                  "block", FALSE,
                  "max-bytes", appsrc_max_bytes,
@@ -542,6 +859,29 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         gst_object_unref(pipeline);
         if (error_message) *error_message = "live video encoder element not found";
         return false;
+    }
+    for (size_t index = 0; index < turn_servers.size(); ++index) {
+        gboolean added = FALSE;
+        g_signal_emit_by_name(
+            webrtc,
+            "add-turn-server",
+            turn_servers[index].uri.c_str(),
+            &added);
+        if (!added) {
+            const auto &server = turn_servers[index];
+            std::fprintf(
+                stderr,
+                "[live] add TURN server failed host=%s expires=%s transport=%s\n",
+                server.host.c_str(),
+                server.expires.c_str(),
+                server.transport.c_str());
+            gst_object_unref(video_encoder);
+            gst_object_unref(appsrc);
+            gst_object_unref(webrtc);
+            gst_object_unref(pipeline);
+            if (error_message) *error_message = "configure TURN server failed";
+            return false;
+        }
     }
 
     GstElement *rtp_queue = gst_bin_get_by_name(GST_BIN(pipeline), "rtp_queue");
@@ -1093,7 +1433,7 @@ GstFlowReturn LiveWebRtcSession::on_remote_audio_sample(GstElement *sink) {
         frame.duration_ns = GST_CLOCK_TIME_IS_VALID(GST_BUFFER_DURATION(buffer))
             ? GST_BUFFER_DURATION(buffer)
             : 20ULL * 1000ULL * 1000ULL;
-        pushed = manager->push_playback_frame(frame);
+        pushed = manager->push_remote_playback_frame(frame);
         gst_buffer_unmap(buffer, &map);
     }
     gst_sample_unref(sample);
@@ -1315,7 +1655,13 @@ void LiveWebRtcSession::frame_push_loop() {
     uint64_t last_pts_ns = 0;
     uint64_t pushed = 0;
     uint64_t queue_full_drops = 0;
-    std::vector<uint8_t> scaled_frame;
+    uint64_t dma_pool_drops = 0;
+    const auto dma_pool = std::make_shared<LiveDmaPoolState>();
+    GstAllocator *dma_allocator = gst_dmabuf_allocator_new();
+    if (!dma_allocator) {
+        std::fprintf(stderr, "[live] create DMA-BUF allocator failed\n");
+        return;
+    }
 
     while (!frame_stop_.load()) {
         if (video_paused_.load()) {
@@ -1358,6 +1704,20 @@ void LiveWebRtcSession::frame_push_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(3));
             continue;
         }
+        const size_t expected_dma_size = live_dma_frame_size(
+            expected_pixfmt, expected_width, expected_height);
+        if (expected_dma_size == 0) {
+            std::fprintf(stderr,
+                         "[live] drop camera frame reason=unsupported-dmabuf-format call_id=%s fmt=%c%c%c%c\n",
+                         call_id.c_str(),
+                         expected_pixfmt & 0xFF,
+                         (expected_pixfmt >> 8) & 0xFF,
+                         (expected_pixfmt >> 16) & 0xFF,
+                         (expected_pixfmt >> 24) & 0xFF);
+            last_seq = frame.seq;
+            gst_object_unref(appsrc);
+            continue;
+        }
         guint64 current_level_bytes = 0;
         guint64 max_bytes = 0;
         g_object_get(
@@ -1366,7 +1726,7 @@ void LiveWebRtcSession::frame_push_loop() {
             "max-bytes", &max_bytes,
             nullptr);
         if (max_bytes > 0 &&
-            current_level_bytes + static_cast<guint64>(expected_size) >
+            current_level_bytes + static_cast<guint64>(expected_dma_size) >
                 max_bytes) {
             ++queue_full_drops;
             if (queue_full_drops == 1 || queue_full_drops % 120 == 0) {
@@ -1377,7 +1737,7 @@ void LiveWebRtcSession::frame_push_loop() {
                     static_cast<unsigned long long>(queue_full_drops),
                     static_cast<unsigned long long>(current_level_bytes),
                     static_cast<unsigned long long>(max_bytes),
-                    expected_size);
+                    expected_dma_size);
             }
             last_seq = frame.seq;
             gst_object_unref(appsrc);
@@ -1386,7 +1746,7 @@ void LiveWebRtcSession::frame_push_loop() {
         }
         const size_t source_size =
             raw_frame_size(frame.pixfmt, frame.width, frame.height);
-        if (frame.data == nullptr ||
+        if (frame.data == nullptr || frame.dmabuf_fd < 0 ||
             frame.pixfmt != expected_pixfmt ||
             source_size == 0 ||
             frame.size < source_size) {
@@ -1409,53 +1769,100 @@ void LiveWebRtcSession::frame_push_loop() {
             continue;
         }
 
-        const uint8_t *output_data = frame.data;
-        if (frame.width != expected_width || frame.height != expected_height) {
-            scaled_frame.assign(expected_size, 0);
-            image_buffer_t source{};
-            source.width = static_cast<int>(frame.width);
-            source.height = static_cast<int>(frame.height);
-            source.format = IMAGE_FORMAT_YUV420SP_NV12;
-            source.size = static_cast<int>(source_size);
-            source.virt_addr = const_cast<uint8_t *>(frame.data);
-            source.fd = frame.dmabuf_fd;
-
-            image_buffer_t output{};
-            output.width = static_cast<int>(expected_width);
-            output.height = static_cast<int>(expected_height);
-            output.format = IMAGE_FORMAT_YUV420SP_NV12;
-            output.size = static_cast<int>(expected_size);
-            output.virt_addr = scaled_frame.data();
-            output.fd = -1;
-            if (convert_image(&source, &output, nullptr, nullptr, 0) != 0) {
-                std::fprintf(stderr,
-                             "[live] RGA scale failed seq=%llu %ux%u -> %ux%u\n",
-                             static_cast<unsigned long long>(frame.seq),
-                             frame.width,
-                             frame.height,
-                             expected_width,
-                             expected_height);
-                last_seq = frame.seq;
-                gst_object_unref(appsrc);
-                continue;
+        auto dma_lease = acquire_live_dma_buffer(dma_pool, expected_dma_size);
+        if (!dma_lease) {
+            ++dma_pool_drops;
+            if (dma_pool_drops == 1 || dma_pool_drops % 120 == 0) {
+                std::fprintf(
+                    stderr,
+                    "[live] drop camera frame reason=dmabuf-pool-unavailable call_id=%s drops=%llu frame_bytes=%zu\n",
+                    call_id.c_str(),
+                    static_cast<unsigned long long>(dma_pool_drops),
+                    expected_dma_size);
             }
-            output_data = scaled_frame.data();
+            last_seq = frame.seq;
+            gst_object_unref(appsrc);
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            continue;
         }
 
-        GstBuffer *buffer = gst_buffer_new_allocate(nullptr, expected_size, nullptr);
+        int rga_status = 0;
+        if (!copy_live_frame_to_dma(
+                frame,
+                expected_width,
+                expected_height,
+                dma_lease->fd,
+                &rga_status)) {
+            std::fprintf(stderr,
+                         "[live] RGA DMA copy failed seq=%llu status=%d %ux%u fd=%d -> %ux%u fd=%d\n",
+                         static_cast<unsigned long long>(frame.seq),
+                         rga_status,
+                         frame.width,
+                         frame.height,
+                         frame.dmabuf_fd,
+                         expected_width,
+                         expected_height,
+                         dma_lease->fd);
+            release_live_dma_buffer(dma_lease.release());
+            last_seq = frame.seq;
+            gst_object_unref(appsrc);
+            continue;
+        }
+
+        const int gst_memory_fd = ::dup(dma_lease->fd);
+        if (gst_memory_fd < 0) {
+            std::fprintf(stderr,
+                         "[live] duplicate DMA-BUF fd failed fd=%d errno=%d error=%s\n",
+                         dma_lease->fd,
+                         errno,
+                         std::strerror(errno));
+            release_live_dma_buffer(dma_lease.release());
+            gst_object_unref(appsrc);
+            continue;
+        }
+        GstMemory *memory = gst_dmabuf_allocator_alloc(
+            dma_allocator, gst_memory_fd, expected_dma_size);
+        if (!memory) {
+            ::close(gst_memory_fd);
+            release_live_dma_buffer(dma_lease.release());
+            gst_object_unref(appsrc);
+            continue;
+        }
+        GstBuffer *buffer = gst_buffer_new();
         if (!buffer) {
+            gst_memory_unref(memory);
+            release_live_dma_buffer(dma_lease.release());
             gst_object_unref(appsrc);
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        GstMapInfo map;
-        if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+        gst_buffer_append_memory(buffer, memory);
+
+        gsize offsets[GST_VIDEO_MAX_PLANES] = {};
+        gint strides[GST_VIDEO_MAX_PLANES] = {};
+        const uint32_t output_hstride = align_live_height(expected_height);
+        offsets[0] = 0;
+        offsets[1] = static_cast<gsize>(expected_width) * output_hstride;
+        strides[0] = static_cast<gint>(expected_width);
+        strides[1] = static_cast<gint>(expected_width);
+        if (!gst_buffer_add_video_meta_full(
+                buffer,
+                GST_VIDEO_FRAME_FLAG_NONE,
+                gst_video_format_for_pixfmt(expected_pixfmt),
+                expected_width,
+                expected_height,
+                2,
+                offsets,
+                strides)) {
             gst_buffer_unref(buffer);
+            release_live_dma_buffer(dma_lease.release());
             gst_object_unref(appsrc);
             continue;
         }
-        std::memcpy(map.data, output_data, expected_size);
-        gst_buffer_unmap(buffer, &map);
+        const int output_dma_fd = dma_lease->fd;
+        gst_mini_object_weak_ref(
+            GST_MINI_OBJECT(memory),
+            on_live_dma_buffer_released,
+            dma_lease.release());
 
         uint64_t pts_ns = pushed * kFrameDurationNs;
         if (frame.ts_ns != 0) {
@@ -1485,11 +1892,12 @@ void LiveWebRtcSession::frame_push_loop() {
 
         if (pushed <= 5 || pushed % 600 == 0 || flow_ret != GST_FLOW_OK) {
             std::fprintf(stderr,
-                         "[live] appsrc push call_id=%s seq=%llu count=%llu bytes=%zu flow=%d pts_ns=%llu\n",
+                         "[live] appsrc push DMA-BUF call_id=%s seq=%llu count=%llu bytes=%zu fd=%d flow=%d pts_ns=%llu\n",
                          call_id.c_str(),
                          static_cast<unsigned long long>(frame.seq),
                          static_cast<unsigned long long>(pushed),
-                         expected_size,
+                         expected_dma_size,
+                         output_dma_fd,
                          static_cast<int>(flow_ret),
                          static_cast<unsigned long long>(pts_ns));
         }
@@ -1508,6 +1916,7 @@ void LiveWebRtcSession::frame_push_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
+    gst_object_unref(dma_allocator);
 }
 void LiveWebRtcSession::publish_signal(const std::string &signal_type,
                                        const std::string *sdp,
@@ -1746,7 +2155,11 @@ bool LiveWebRtcSession::reconfigure_video_branch(
             pixfmt,
             static_cast<uint32_t>(profile.width),
             static_cast<uint32_t>(profile.height));
-        if (!format || frame_size == 0) {
+        const size_t dma_frame_size = live_dma_frame_size(
+            pixfmt,
+            static_cast<uint32_t>(profile.width),
+            static_cast<uint32_t>(profile.height));
+        if (!format || frame_size == 0 || dma_frame_size == 0) {
             ok = false;
         } else {
             GstCaps *caps = gst_caps_new_simple(
@@ -1760,7 +2173,7 @@ bool LiveWebRtcSession::reconfigure_video_branch(
             gst_caps_unref(caps);
             g_object_set(
                 G_OBJECT(appsrc),
-                "max-bytes", static_cast<guint64>(frame_size) * 2,
+                "max-bytes", static_cast<guint64>(dma_frame_size) * 2,
                 nullptr);
             g_object_set(
                 G_OBJECT(encoder),

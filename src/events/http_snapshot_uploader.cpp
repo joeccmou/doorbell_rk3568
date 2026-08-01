@@ -45,8 +45,16 @@ bool HttpSnapshotUploader::upload(const std::string &jpeg_path,
                                   std::string *snapshot_url,
                                   std::string *error,
                                   long timeout_ms) const {
-    if (api_base_url_.rfind("https://", 0) != 0 || !is_canonical_snapshot_path(device_relative_path)) {
+    if (api_base_url_.rfind("https://", 0) != 0) {
         if (error) *error = "snapshot upload requires HTTPS";
+        return false;
+    }
+    if (device_relative_path.empty()) {
+        if (error) *error = "snapshot path is empty";
+        return false;
+    }
+    if (!is_canonical_snapshot_path(device_relative_path)) {
+        if (error) *error = "snapshot path is non-canonical";
         return false;
     }
 	static std::once_flag curl_init_once;

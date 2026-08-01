@@ -116,8 +116,22 @@ bool LiveViewSession::handle_command(const std::string &payload) {
             publish_command_ack(trace_id, cmd_id, true);
             publish_media_state(trace_id, call_id, "connecting");
 
-            LiveWebRtcSession::StartRequest request = parse_start_request(device_id_, in);
             std::string error_message;
+            LiveWebRtcSession::StartRequest request;
+            if (!parse_start_request(device_id_, in, &request, &error_message)) {
+                publish_media_state(
+                    trace_id,
+                    call_id,
+                    "idle",
+                    "INVALID_ICE_SERVERS",
+                    error_message);
+                std::fprintf(
+                    stderr,
+                    "[mqtt] media start rejected call_id=%s error=%s\n",
+                    call_id.c_str(),
+                    error_message.c_str());
+                return true;
+            }
             if (!backend_ || !backend_->start(request, &error_message)) {
                 publish_media_state(trace_id, call_id, "idle", "MEDIA_PIPELINE_FAILED", error_message);
                 std::fprintf(stderr, "[mqtt] start_live failed call_id=%s error=%s\n", call_id.c_str(), error_message.c_str());
@@ -258,29 +272,79 @@ bool LiveViewSession::publish_media_state(const std::string &trace_id,
     return publishers_.media_state_publisher(media.dump());
 }
 
-LiveWebRtcSession::StartRequest LiveViewSession::parse_start_request(const std::string &device_id,
-                                                                     const nlohmann::json &command) {
-    LiveWebRtcSession::StartRequest request;
-    request.trace_id = command.value("trace_id", "");
-    request.call_id = command.value("call_id", "");
-    request.device_id = device_id;
-    request.quality = command.value("quality", "1080p");
-    if (command.contains("ice_servers") && command["ice_servers"].is_array()) {
-        for (const auto &item : command["ice_servers"]) {
-            LiveWebRtcSession::IceServer server;
-            if (item.contains("urls")) {
-                if (item["urls"].is_array()) {
-                    for (const auto &url : item["urls"]) {
-                        if (url.is_string()) server.urls.push_back(url.get<std::string>());
-                    }
-                } else if (item["urls"].is_string()) {
-                    server.urls.push_back(item["urls"].get<std::string>());
-                }
-            }
-            server.username = item.value("username", "");
-            server.credential = item.value("credential", "");
-            request.ice_servers.push_back(std::move(server));
-        }
+bool LiveViewSession::parse_start_request(
+    const std::string &device_id,
+    const nlohmann::json &command,
+    LiveWebRtcSession::StartRequest *request,
+    std::string *error_message) {
+    if (!request) {
+        if (error_message) *error_message = "ICE request output is null";
+        return false;
     }
-    return request;
+    request->trace_id = command.value("trace_id", "");
+    request->call_id = command.value("call_id", "");
+    request->device_id = device_id;
+    request->quality = command.value("quality", "1080p");
+
+    if (!command.contains("ice_servers") || !command["ice_servers"].is_array() ||
+        command["ice_servers"].empty()) {
+        if (error_message) *error_message = "ice_servers must be a non-empty array";
+        return false;
+    }
+
+    bool has_supported_url = false;
+    for (const auto &item : command["ice_servers"]) {
+        if (!item.is_object() || !item.contains("urls") ||
+            !item["urls"].is_array() || item["urls"].empty()) {
+            if (error_message) *error_message = "ICE urls must be a non-empty string array";
+            return false;
+        }
+
+        LiveWebRtcSession::IceServer server;
+        for (const auto &url_value : item["urls"]) {
+            if (!url_value.is_string()) {
+                if (error_message) *error_message = "ICE urls must contain strings only";
+                return false;
+            }
+            const std::string url = url_value.get<std::string>();
+            const bool is_stun =
+                url.rfind("stun:", 0) == 0 || url.rfind("stun://", 0) == 0;
+            const bool is_turn =
+                url.rfind("turn:", 0) == 0 || url.rfind("turn://", 0) == 0;
+            if (url.empty() || (!is_stun && !is_turn)) {
+                if (error_message) *error_message = "unsupported ICE URL scheme";
+                return false;
+            }
+            server.urls.push_back(url);
+            has_supported_url = true;
+        }
+        if (item.contains("username") && !item["username"].is_string()) {
+            if (error_message) *error_message = "ICE username must be a string";
+            return false;
+        }
+        if (item.contains("credential") && !item["credential"].is_string()) {
+            if (error_message) *error_message = "ICE credential must be a string";
+            return false;
+        }
+        server.username = item.value("username", "");
+        server.credential = item.value("credential", "");
+
+        for (const auto &url : server.urls) {
+            const bool is_turn =
+                url.rfind("turn:", 0) == 0 || url.rfind("turn://", 0) == 0;
+            if (is_turn && (server.username.empty() || server.credential.empty())) {
+                if (error_message) {
+                    *error_message = "TURN URL requires username and credential";
+                }
+                return false;
+            }
+        }
+        request->ice_servers.push_back(std::move(server));
+    }
+
+    if (!has_supported_url) {
+        if (error_message) *error_message = "no supported ICE URL";
+        return false;
+    }
+    return true;
 }
