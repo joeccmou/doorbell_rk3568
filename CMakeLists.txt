@@ -163,6 +163,7 @@ add_executable(doorbell
     src/device/time_sync_service.cpp
     src/device/live_view_session.cpp
     src/device/live_webrtc_session.cpp
+    src/device/webrtc_sdp_utils.cpp
     src/events/device_event_processor.cpp
     src/events/event_paths.cpp
     src/events/event_store.cpp
@@ -298,6 +299,7 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/live_view_session_test.cp
         tests/live_view_session_test.cpp
         src/device/live_view_session.cpp
         src/device/live_webrtc_session.cpp
+        src/device/webrtc_sdp_utils.cpp
         src/utils/audio_capture_manager.cpp
     )
     target_compile_definitions(live_view_session_test PRIVATE GST_USE_UNSTABLE_API)
@@ -313,6 +315,15 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/live_view_session_test.cp
         ${GSTREAMER_LIBRARIES}
     )
     add_test(NAME live_view_session_test COMMAND live_view_session_test)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/webrtc_sdp_utils_test.cpp")
+    add_executable(webrtc_sdp_utils_test
+        tests/webrtc_sdp_utils_test.cpp
+        src/device/webrtc_sdp_utils.cpp
+    )
+    target_include_directories(webrtc_sdp_utils_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME webrtc_sdp_utils_test COMMAND webrtc_sdp_utils_test)
 endif()
 
 if(BUILD_TESTING AND EXISTS "${CMAKE_SOURCE_DIR}/tests/camera_rga_state_test.cpp")

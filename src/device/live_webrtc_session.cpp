@@ -1,5 +1,7 @@
 ﻿#include "device/live_webrtc_session.h"
 
+#include "device/webrtc_sdp_utils.h"
+
 #include <gst/allocators/gstdmabuf.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
@@ -1080,6 +1082,7 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         video_paused_.store(false);
         active_published_ = false;
         offer_requested_ = false;
+        local_offer_sdp_.clear();
         pending_quality_switch_.reset();
         quality_switch_deadline_ = {};
         quality_switch_answer_applied_ = false;
@@ -1276,6 +1279,7 @@ void LiveWebRtcSession::stop() {
         appsrc_frame_size_ = 0;
         active_published_ = false;
         offer_requested_ = false;
+        local_offer_sdp_.clear();
         pending_quality_switch_.reset();
         quality_switch_deadline_ = {};
         quality_switch_answer_applied_ = false;
@@ -2027,12 +2031,23 @@ void LiveWebRtcSession::on_offer_created(GstPromise *promise) {
         return;
     }
 
+    gchar *sdp_text = gst_sdp_message_as_text(offer->sdp);
+    if (sdp_text) {
+        std::string sdp(sdp_text);
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            local_offer_sdp_ = sdp;
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(mtx_);
+        local_offer_sdp_.clear();
+    }
+
     GstPromise *local_promise = gst_promise_new();
     g_signal_emit_by_name(webrtc, "set-local-description", offer, local_promise);
     gst_promise_interrupt(local_promise);
     gst_promise_unref(local_promise);
 
-    gchar *sdp_text = gst_sdp_message_as_text(offer->sdp);
     if (sdp_text) {
         std::string sdp(sdp_text);
         std::fprintf(stderr, "[live] offer created sdp_len=%zu\n", sdp.size());
@@ -2049,14 +2064,28 @@ void LiveWebRtcSession::on_offer_created(GstPromise *promise) {
 void LiveWebRtcSession::on_ice_candidate(unsigned int mline_index, const char *candidate) {
     if (!candidate || candidate[0] == '\0') return;
     const std::string candidate_text(candidate);
+    std::string local_offer_sdp;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        local_offer_sdp = local_offer_sdp_;
+    }
+    const auto sdp_mid = webrtc_sdp_mid_for_mline(local_offer_sdp, mline_index);
+    if (!sdp_mid) {
+        std::fprintf(stderr,
+                     "[live] drop ICE local candidate: missing SDP mid mline=%u len=%zu\n",
+                     mline_index,
+                     candidate_text.size());
+        return;
+    }
     std::fprintf(stderr,
-                 "[live] ICE local candidate mline=%u len=%zu %s\n",
+                 "[live] ICE local candidate mid=%s mline=%u len=%zu %s\n",
+                 sdp_mid->c_str(),
                  mline_index,
                  candidate_text.size(),
                  summarize_ice_candidate(candidate_text).c_str());
     nlohmann::json value;
     value["candidate"] = candidate_text;
-    value["sdpMid"] = "0";
+    value["sdpMid"] = *sdp_mid;
     value["sdpMLineIndex"] = mline_index;
     publish_signal("candidate", nullptr, &value);
 }

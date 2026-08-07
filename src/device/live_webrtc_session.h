@@ -163,6 +163,7 @@ private:
     std::atomic<uint64_t> video_input_count_{0};
     bool active_published_ = false;
     bool offer_requested_ = false;
+    std::string local_offer_sdp_;
     bool quality_switch_answer_applied_ = false;
     std::optional<PendingQualitySwitch> pending_quality_switch_;
     std::condition_variable quality_switch_cv_;
