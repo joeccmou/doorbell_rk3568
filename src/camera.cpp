@@ -395,7 +395,8 @@ bool Camera::copy_latest_media_frame(MediaFrame &out_frame) const {
 	return false;
 }
 
-void Camera::set_frame_ready_callback(std::function<void()> cb) {
+void Camera::set_frame_ready_callback(
+	std::function<void(uint64_t seq, uint64_t ts_ns)> cb) {
 	std::lock_guard<std::mutex> lock(frame_ready_cb_mtx_);
 	frame_ready_cb_ = std::move(cb);
 }
@@ -799,13 +800,13 @@ void Camera::capture_loop() {
 			frame_ts_ns_[write_index].store(now_ns, std::memory_order_release);
 			frame_seq_[write_index].store(seq, std::memory_order_release);
 			latest_.store(write_index, std::memory_order_release);
-			std::function<void()> frame_ready_cb;
+			std::function<void(uint64_t seq, uint64_t ts_ns)> frame_ready_cb;
 			{
 				std::lock_guard<std::mutex> lock(frame_ready_cb_mtx_);
 				frame_ready_cb = frame_ready_cb_;
 			}
 			if (frame_ready_cb) {
-				frame_ready_cb();
+				frame_ready_cb(seq, now_ns);
 			}
 			write_index ^= 1;
 		}

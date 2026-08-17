@@ -51,7 +51,8 @@ constexpr uint32_t kDetectIntervalMs = 250;
 constexpr uint32_t kRecordFpsLimit = 24;
 constexpr uint64_t kRecordFrameIntervalNs = 1000000000ULL / kRecordFpsLimit;
 constexpr uint64_t kOverlayFreshNs = 300ULL * 1000ULL * 1000ULL;
-constexpr uint32_t kRingSnapshotSampleIntervalMs = 100;
+constexpr uint64_t kRingSnapshotSampleIntervalNs = 100ULL * 1000ULL * 1000ULL;
+constexpr std::chrono::seconds kRingSnapshotWindow{1};
 constexpr uint32_t kMasterCaptureWidth = 2560;
 constexpr uint32_t kMasterCaptureHeight = 1440;
 constexpr uint32_t kMasterCaptureFps = 24;
@@ -129,10 +130,20 @@ struct UiContext {
     SnapshotCandidateSelector snapshot_candidate_selector{std::chrono::seconds(2)};
     std::optional<EventRecord> pending_person_event;
     std::mutex ring_snapshot_mtx;
+    std::mutex ring_snapshot_wake_mtx;
+    std::condition_variable ring_snapshot_cv;
     SnapshotCandidateSelector ring_snapshot_candidate_selector{
-        std::chrono::seconds(1), true};
+        kRingSnapshotWindow, true};
     std::optional<EventRecord> pending_ring_snapshot_event;
-    uint32_t ring_snapshot_last_sample_ms = 0;
+    bool ring_snapshot_exit = false;
+    uint64_t ring_snapshot_request_gen = 0;
+    uint64_t ring_snapshot_frame_gen = 0;
+    uint64_t ring_snapshot_latest_seq = 0;
+    uint64_t ring_snapshot_latest_ts_ns = 0;
+    uint64_t ring_snapshot_start_frame_gen = 0;
+    std::chrono::steady_clock::time_point ring_snapshot_started_at{};
+    std::chrono::steady_clock::time_point ring_snapshot_deadline{};
+    std::thread ring_snapshot_thread;
     std::unique_ptr<DeviceEventProcessor> event_processor;
 
     bool record_exit = false;
@@ -162,18 +173,33 @@ struct UiContext {
     // SDL_Window *sdl_window = nullptr;
 };
 
-void notify_record_new_frame(UiContext *ctx) {
+void notify_camera_new_frame(UiContext *ctx, uint64_t seq, uint64_t ts_ns) {
     if (!ctx) return;
     {
         std::lock_guard<std::mutex> lock(ctx->record_mtx);
         ++ctx->record_frame_gen;
     }
     ctx->record_cv.notify_one();
+
+    // 相机采集回调只发布元数据并唤醒抓拍线程，不在采集线程复制整帧。
+    {
+        std::lock_guard<std::mutex> lock(ctx->ring_snapshot_wake_mtx);
+        ctx->ring_snapshot_latest_seq = seq;
+        ctx->ring_snapshot_latest_ts_ns = ts_ns;
+        ++ctx->ring_snapshot_frame_gen;
+    }
+    ctx->ring_snapshot_cv.notify_one();
 }
 
 uint64_t monotonic_time_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::chrono::steady_clock::time_point monotonic_time_point(uint64_t ts_ns) {
+    return std::chrono::steady_clock::time_point(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::nanoseconds(ts_ns)));
 }
 
 bool detection_is_fresh(uint64_t frame_ts_ns, uint64_t det_ts_ns) {
@@ -186,6 +212,250 @@ bool detection_is_fresh(uint64_t frame_ts_ns, uint64_t det_ts_ns) {
 
 bool ring_recording_active(bool ring_event_open) {
     return ring_event_open;
+}
+
+void ring_snapshot_worker(UiContext *ctx) {
+    std::vector<uint8_t> rgb;
+    std::string active_event_id;
+    bool selection_active = false;
+    uint64_t consumed_request_gen = 0;
+    uint64_t consumed_frame_gen = 0;
+    uint64_t frame_notifications = 0;
+    uint64_t last_notified_seq = 0;
+    uint64_t last_sample_ts_ns = 0;
+    uint64_t first_sample_seq = 0;
+    uint64_t last_sample_seq = 0;
+    uint64_t max_sample_interval_ns = 0;
+    uint32_t sample_count = 0;
+    uint32_t copy_failures = 0;
+
+    auto reset_stats = [&] {
+        frame_notifications = 0;
+        last_notified_seq = 0;
+        last_sample_ts_ns = 0;
+        first_sample_seq = 0;
+        last_sample_seq = 0;
+        max_sample_interval_ns = 0;
+        sample_count = 0;
+        copy_failures = 0;
+    };
+
+    while (true) {
+        std::chrono::steady_clock::time_point selection_started_at{};
+        std::chrono::steady_clock::time_point deadline{};
+        if (!selection_active) {
+            {
+                std::unique_lock<std::mutex> wake_lock(ctx->ring_snapshot_wake_mtx);
+                ctx->ring_snapshot_cv.wait(wake_lock, [ctx, &consumed_request_gen] {
+                    return ctx->ring_snapshot_exit || g_stop.load() ||
+                           ctx->ring_snapshot_request_gen != consumed_request_gen;
+                });
+                if (ctx->ring_snapshot_exit || g_stop.load()) break;
+                consumed_request_gen = ctx->ring_snapshot_request_gen;
+                consumed_frame_gen = ctx->ring_snapshot_start_frame_gen;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(ctx->ring_snapshot_mtx);
+                if (!ctx->ring_snapshot_candidate_selector.active() ||
+                    !ctx->pending_ring_snapshot_event) {
+                    continue;
+                }
+                active_event_id = ctx->pending_ring_snapshot_event->event_id;
+                selection_started_at = ctx->ring_snapshot_started_at;
+                deadline = ctx->ring_snapshot_deadline;
+            }
+            reset_stats();
+            selection_active = true;
+        } else {
+            std::lock_guard<std::mutex> lock(ctx->ring_snapshot_mtx);
+            selection_started_at = ctx->ring_snapshot_started_at;
+            deadline = ctx->ring_snapshot_deadline;
+        }
+
+        bool should_sample = false;
+        bool should_finish = false;
+        bool request_changed = false;
+
+        {
+            std::unique_lock<std::mutex> wake_lock(ctx->ring_snapshot_wake_mtx);
+            ctx->ring_snapshot_cv.wait_until(
+                wake_lock,
+                deadline,
+                [ctx, &consumed_request_gen, &consumed_frame_gen] {
+                return ctx->ring_snapshot_exit || g_stop.load() ||
+                       ctx->ring_snapshot_request_gen != consumed_request_gen ||
+                       ctx->ring_snapshot_frame_gen != consumed_frame_gen;
+            });
+            if (ctx->ring_snapshot_exit || g_stop.load()) break;
+            request_changed =
+                ctx->ring_snapshot_request_gen != consumed_request_gen;
+            if (request_changed) {
+                selection_active = false;
+                continue;
+            }
+
+            const uint64_t published_gen = ctx->ring_snapshot_frame_gen;
+            if (published_gen != consumed_frame_gen) {
+                frame_notifications += published_gen - consumed_frame_gen;
+                consumed_frame_gen = published_gen;
+                last_notified_seq = ctx->ring_snapshot_latest_seq;
+                const uint64_t notified_ts_ns = ctx->ring_snapshot_latest_ts_ns;
+                const uint64_t deadline_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        deadline.time_since_epoch()).count());
+                const uint64_t started_at_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        selection_started_at.time_since_epoch()).count());
+                should_sample = notified_ts_ns >= started_at_ns &&
+                    notified_ts_ns <= deadline_ns &&
+                    (last_sample_ts_ns == 0 ||
+                     (notified_ts_ns > last_sample_ts_ns &&
+                      notified_ts_ns - last_sample_ts_ns >=
+                          kRingSnapshotSampleIntervalNs));
+            }
+            should_finish = std::chrono::steady_clock::now() >= deadline;
+        }
+
+        if (should_sample) {
+            uint64_t frame_seq = 0;
+            uint64_t frame_ts_ns = 0;
+            bool copied = false;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            {
+                // 禁止持有 ring_snapshot_mtx 时获取 camera_mtx，避免相机重启锁反转。
+                std::lock_guard<std::mutex> camera_lock(ctx->camera_mtx);
+                if (ctx->camera && ctx->camera->ready()) {
+                    width = ctx->camera->width();
+                    height = ctx->camera->height();
+                    copied = ctx->camera->copy_latest_frame(
+                        rgb, frame_seq, frame_ts_ns);
+                }
+            }
+
+            if (!copied) {
+                ++copy_failures;
+            } else {
+                bool selection_replaced = false;
+                std::lock_guard<std::mutex> lock(ctx->ring_snapshot_mtx);
+                if (ctx->ring_snapshot_candidate_selector.active() &&
+                    ctx->pending_ring_snapshot_event &&
+                    ctx->pending_ring_snapshot_event->event_id == active_event_id) {
+                    const uint64_t deadline_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            ctx->ring_snapshot_deadline.time_since_epoch()).count());
+                    const uint64_t started_at_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            ctx->ring_snapshot_started_at.time_since_epoch()).count());
+                    if (frame_ts_ns >= started_at_ns && frame_ts_ns <= deadline_ns &&
+                        (last_sample_ts_ns == 0 ||
+                         (frame_ts_ns > last_sample_ts_ns &&
+                          frame_ts_ns - last_sample_ts_ns >=
+                              kRingSnapshotSampleIntervalNs))) {
+                        ctx->ring_snapshot_candidate_selector.consider(
+                            rgb,
+                            width,
+                            height,
+                            {},
+                            monotonic_time_point(frame_ts_ns));
+                        if (sample_count == 0) {
+                            first_sample_seq = frame_seq;
+                        } else {
+                            max_sample_interval_ns = std::max(
+                                max_sample_interval_ns,
+                                frame_ts_ns - last_sample_ts_ns);
+                        }
+                        last_sample_ts_ns = frame_ts_ns;
+                        last_sample_seq = frame_seq;
+                        ++sample_count;
+                    }
+                } else {
+                    selection_replaced = true;
+                }
+                if (selection_replaced) selection_active = false;
+            }
+            if (!selection_active) continue;
+            should_finish = should_finish ||
+                std::chrono::steady_clock::now() >= deadline;
+        }
+
+        if (!should_finish) continue;
+
+        std::optional<EventRecord> completed_event;
+        std::optional<SelectedSnapshot> selected_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(ctx->ring_snapshot_mtx);
+            const auto selection_now = std::chrono::steady_clock::now();
+            if (ctx->ring_snapshot_candidate_selector.active() &&
+                ctx->pending_ring_snapshot_event &&
+                ctx->pending_ring_snapshot_event->event_id == active_event_id &&
+                selection_now >= ctx->ring_snapshot_deadline) {
+                selected_snapshot =
+                    ctx->ring_snapshot_candidate_selector.take_if_ready(selection_now);
+                if (!ctx->ring_snapshot_candidate_selector.active() &&
+                    ctx->pending_ring_snapshot_event) {
+                    completed_event = std::move(ctx->pending_ring_snapshot_event);
+                    ctx->pending_ring_snapshot_event.reset();
+                    ctx->ring_snapshot_started_at = {};
+                    ctx->ring_snapshot_deadline = {};
+                }
+            } else if (!ctx->pending_ring_snapshot_event ||
+                       ctx->pending_ring_snapshot_event->event_id != active_event_id) {
+                selection_active = false;
+            }
+        }
+
+        if (!completed_event) {
+            if (!selection_active) active_event_id.clear();
+            continue;
+        }
+
+        const char *reason = "selected";
+        if (!selected_snapshot) {
+            if (frame_notifications == 0) {
+                reason = "no_v4l2_frame";
+            } else if (copy_failures > 0) {
+                reason = "rgb_copy_failed";
+            } else {
+                reason = "no_eligible_frame";
+            }
+        }
+        const double max_sample_interval_ms =
+            static_cast<double>(max_sample_interval_ns) / 1000000.0;
+        const double score = selected_snapshot ? selected_snapshot->score : -1.0;
+        std::fprintf(stdout,
+                     "[ring] snapshot selection completed event_id=%s reason=%s "
+                     "frame_notifications=%llu samples=%u first_seq=%llu "
+                     "last_seq=%llu last_notified_seq=%llu "
+                     "max_sample_interval_ms=%.3f "
+                     "copy_failures=%u score=%.3f\n",
+                     completed_event->event_id.c_str(),
+                     reason,
+                     static_cast<unsigned long long>(frame_notifications),
+                     sample_count,
+                     static_cast<unsigned long long>(first_sample_seq),
+                     static_cast<unsigned long long>(last_sample_seq),
+                     static_cast<unsigned long long>(last_notified_seq),
+                     max_sample_interval_ms,
+                     copy_failures,
+                     score);
+
+        if (ctx->event_processor) {
+            if (selected_snapshot) {
+                ctx->event_processor->submit_ring_snapshot(
+                    std::move(*completed_event),
+                    std::move(selected_snapshot->rgb),
+                    selected_snapshot->width,
+                    selected_snapshot->height);
+            } else {
+                ctx->event_processor->submit_ring_snapshot(
+                    std::move(*completed_event), {}, 0, 0);
+            }
+        }
+        active_event_id.clear();
+        selection_active = false;
+    }
 }
 
 void inference_worker(UiContext *ctx) {
@@ -789,42 +1059,6 @@ void camera_timer_cb(lv_timer_t *timer) {
         ctx->blank.resize(rgb_size);
     }
     const uint32_t now = lv_tick_get();
-    std::optional<EventRecord> completed_ring_snapshot_event;
-    std::optional<SelectedSnapshot> selected_ring_snapshot;
-    {
-        std::lock_guard<std::mutex> lock(ctx->ring_snapshot_mtx);
-        if (ctx->ring_snapshot_candidate_selector.active()) {
-            const auto selection_now = std::chrono::steady_clock::now();
-            if (ctx->ring_snapshot_last_sample_ms == 0 ||
-                now - ctx->ring_snapshot_last_sample_ms >=
-                    kRingSnapshotSampleIntervalMs) {
-                ctx->ring_snapshot_last_sample_ms = now;
-                ctx->ring_snapshot_candidate_selector.consider(
-                    ctx->blank, width, height, {}, selection_now);
-            }
-            selected_ring_snapshot =
-                ctx->ring_snapshot_candidate_selector.take_if_ready(selection_now);
-            if (!ctx->ring_snapshot_candidate_selector.active() &&
-                ctx->pending_ring_snapshot_event) {
-                completed_ring_snapshot_event =
-                    std::move(ctx->pending_ring_snapshot_event);
-                ctx->pending_ring_snapshot_event.reset();
-                ctx->ring_snapshot_last_sample_ms = 0;
-            }
-        }
-    }
-    if (completed_ring_snapshot_event && ctx->event_processor) {
-        if (selected_ring_snapshot) {
-            ctx->event_processor->submit_ring_snapshot(
-                std::move(*completed_ring_snapshot_event),
-                std::move(selected_ring_snapshot->rgb),
-                selected_ring_snapshot->width,
-                selected_ring_snapshot->height);
-        } else {
-            ctx->event_processor->submit_ring_snapshot(
-                std::move(*completed_ring_snapshot_event), {}, 0, 0);
-        }
-    }
 
     image_buffer_t rgb_img{};
     rgb_img.width = static_cast<int>(width);
@@ -1009,8 +1243,8 @@ bool restart_camera(void *user_ctx, uint32_t pixfmt, uint32_t w, uint32_t h) {
         if (old) old->start();
         return false;
     }
-    cam->set_frame_ready_callback([ctx] {
-        notify_record_new_frame(ctx);
+    cam->set_frame_ready_callback([ctx](uint64_t seq, uint64_t ts_ns) {
+        notify_camera_new_frame(ctx, seq, ts_ns);
     });
 
     delete old;
@@ -1135,8 +1369,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "Camera start failed on %s\n", cfg.device.c_str());
         return EXIT_FAILURE;
     }
-    ctx.camera->set_frame_ready_callback([&ctx] {
-        notify_record_new_frame(&ctx);
+    ctx.camera->set_frame_ready_callback([&ctx](uint64_t seq, uint64_t ts_ns) {
+        notify_camera_new_frame(&ctx, seq, ts_ns);
     });
     provisioning.set_live_frame_provider([&ctx](LiveWebRtcSession::VideoFrame &frame) {
         Camera::MediaFrame media_frame;
@@ -1330,17 +1564,47 @@ int main(int argc, char **argv) {
                         }
                         ctx.record_cv.notify_all();
                     }
+                    std::chrono::steady_clock::time_point selection_started_at{};
+                    uint64_t selection_start_frame_gen = 0;
+                    {
+                        std::lock_guard<std::mutex> wake_lock(
+                            ctx.ring_snapshot_wake_mtx);
+                        selection_start_frame_gen = ctx.ring_snapshot_frame_gen;
+                        selection_started_at = std::chrono::steady_clock::now();
+                    }
                     {
                         std::lock_guard<std::mutex> lock(ctx.ring_snapshot_mtx);
                         ctx.pending_ring_snapshot_event = press->event;
-                        ctx.ring_snapshot_last_sample_ms = 0;
+                        ctx.ring_snapshot_started_at = selection_started_at;
+                        ctx.ring_snapshot_deadline =
+                            selection_started_at + kRingSnapshotWindow;
                         ctx.ring_snapshot_candidate_selector.start(
-                            std::chrono::steady_clock::now());
+                            selection_started_at);
                     }
+                    {
+                        std::lock_guard<std::mutex> wake_lock(
+                            ctx.ring_snapshot_wake_mtx);
+                        ctx.ring_snapshot_start_frame_gen =
+                            selection_start_frame_gen;
+                        ++ctx.ring_snapshot_request_gen;
+                    }
+                    ctx.ring_snapshot_cv.notify_one();
+                    const uint64_t selection_started_at_ns =
+                        static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                selection_started_at.time_since_epoch()).count());
+                    const uint64_t selection_deadline_ns =
+                        selection_started_at_ns + static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                kRingSnapshotWindow).count());
                     std::fprintf(stdout,
                                  "[ring] one-second snapshot selection started "
-                                 "event_id=%s\n",
-                                 press->event.event_id.c_str());
+                                 "event_id=%s started_at_ns=%llu deadline_ns=%llu\n",
+                                 press->event.event_id.c_str(),
+                                 static_cast<unsigned long long>(
+                                     selection_started_at_ns),
+                                 static_cast<unsigned long long>(
+                                     selection_deadline_ns));
                 }
                 std::fprintf(stdout,
                              "[ring] short press persisted event_id=%s press_seq=%d initial=%d "
@@ -1380,6 +1644,7 @@ int main(int argc, char **argv) {
 
     ctx.infer_thread = std::thread(inference_worker, &ctx);
     ctx.record_thread = std::thread(recorder_worker, &ctx);
+    ctx.ring_snapshot_thread = std::thread(ring_snapshot_worker, &ctx);
 
     SettingsHooks hooks{.user_ctx = &ctx, .restart_camera = restart_camera};
     settings_init(lv_screen_active(), hooks);
@@ -1419,6 +1684,15 @@ int main(int argc, char **argv) {
         ctx.record_exit = true;
     }
     ctx.record_cv.notify_all();
+    {
+        std::lock_guard<std::mutex> ring_snapshot_lock(
+            ctx.ring_snapshot_wake_mtx);
+        ctx.ring_snapshot_exit = true;
+    }
+    ctx.ring_snapshot_cv.notify_all();
+    if (ctx.ring_snapshot_thread.joinable()) {
+        ctx.ring_snapshot_thread.join();
+    }
     if (ctx.infer_thread.joinable()) {
         ctx.infer_thread.join();
     }

@@ -56,7 +56,8 @@ public:
                             uint64_t &ts_ns,
                             uint32_t &pixfmt) const;
     bool copy_latest_media_frame(MediaFrame &out_frame) const;
-    void set_frame_ready_callback(std::function<void()> cb);
+    void set_frame_ready_callback(
+        std::function<void(uint64_t seq, uint64_t ts_ns)> cb);
     bool set_rotate180(bool enabled);
     bool rotate180() const;
     size_t frame_size() const;
@@ -125,7 +126,7 @@ private:
     bool using_dmabuf_ = false;
     int dma_heap_fd_ = -1;
     uint32_t plane_stride_[VIDEO_MAX_PLANES] = {0};
-    std::function<void()> frame_ready_cb_;
+    std::function<void(uint64_t seq, uint64_t ts_ns)> frame_ready_cb_;
     mutable std::mutex frame_ready_cb_mtx_;
     CameraRgaState rga_state_;
 };
