@@ -27,8 +27,7 @@ function(doorbell_toolchain_is_sdk_root out_var candidate)
     endif()
 
     get_filename_component(candidate_abs "${candidate}" ABSOLUTE)
-    if(EXISTS "${candidate_abs}/external/lvgl/9.4/lv_port_linux/lvgl/CMakeLists.txt"
-       AND EXISTS "${candidate_abs}/external/rknpu2/runtime/RK356X/Linux/librknn_api"
+    if(EXISTS "${candidate_abs}/external/rknpu2/runtime/RK356X/Linux/librknn_api"
        AND EXISTS "${candidate_abs}/debian/sysroots/debian11-aarch64")
         set(${out_var} ON PARENT_SCOPE)
         set(DOORBELL_SDK_ROOT "${candidate_abs}" CACHE PATH "Rockchip SDK root for doorbell_rk3568" FORCE)
@@ -76,4 +75,3 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(ENV{PKG_CONFIG_SYSROOT_DIR} $ENV{STAGING_DIR})
 set(ENV{PKG_CONFIG_LIBDIR} "$ENV{STAGING_DIR}/usr/lib/aarch64-linux-gnu/pkgconfig:$ENV{STAGING_DIR}/usr/lib/pkgconfig:$ENV{STAGING_DIR}/usr/share/pkgconfig")
 set(ENV{PKG_CONFIG_PATH} "")
-

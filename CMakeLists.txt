@@ -22,8 +22,7 @@ function(doorbell_is_sdk_root out_var candidate)
     endif()
 
     get_filename_component(candidate_abs "${candidate}" ABSOLUTE)
-    if(EXISTS "${candidate_abs}/external/lvgl/9.4/lv_port_linux/lvgl/CMakeLists.txt"
-       AND EXISTS "${candidate_abs}/external/rknpu2/runtime/RK356X/Linux/librknn_api"
+    if(EXISTS "${candidate_abs}/external/rknpu2/runtime/RK356X/Linux/librknn_api"
        AND EXISTS "${candidate_abs}/debian/sysroots/debian11-aarch64")
         set(${out_var} ON PARENT_SCOPE)
         set(DOORBELL_SDK_ROOT "${candidate_abs}" CACHE PATH "Rockchip SDK root for doorbell_rk3568" FORCE)
@@ -62,6 +61,21 @@ endif()
 
 message(STATUS "Using Rockchip SDK root: ${DOORBELL_SDK_ROOT}")
 
+set(
+    DOORBELL_LVGL_ROOT
+    "/home/joeccmou/Solution/CommonLibrary/lvgl/9.4/lvgl"
+    CACHE PATH
+    "LVGL 9.4 source root"
+)
+get_filename_component(DOORBELL_LVGL_ROOT "${DOORBELL_LVGL_ROOT}" ABSOLUTE)
+if(NOT EXISTS "${DOORBELL_LVGL_ROOT}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "LVGL source not found at: ${DOORBELL_LVGL_ROOT}. Pass "
+        "-DDOORBELL_LVGL_ROOT=/path/to/lvgl."
+    )
+endif()
+message(STATUS "Using LVGL source: ${DOORBELL_LVGL_ROOT}")
+
 # camera.cpp still has an SDK-relative quoted fallback include:
 # ../../../kernel/include/uapi/linux/dma-heap.h. Build a private compatibility
 # root so the same source also compiles when -S points at smart_doorbell.
@@ -85,7 +99,7 @@ set(LV_BUILD_SET_CONFIG_OPTS ON CACHE BOOL
     "create CMAKE variables from lv_conf_internal.h" FORCE)
 
 # 1) 引入 LVGL 核心
-add_subdirectory(${DOORBELL_SDK_ROOT}/external/lvgl/9.4/lv_port_linux/lvgl
+add_subdirectory(${DOORBELL_LVGL_ROOT}
                  ${CMAKE_BINARY_DIR}/lvgl_build)
 
 # 2) 选择并加入移植层源码（从 lv_port_linux/src/lib/ 复制或引用）
@@ -290,7 +304,7 @@ target_include_directories(doorbell
     ${CMAKE_SOURCE_DIR}/src/utils
     ${CMAKE_SOURCE_DIR}/src/ai/yolov8/cpp
 	${CMAKE_SOURCE_DIR}/src/lvgl_port_linux      
-    ${DOORBELL_SDK_ROOT}/external/lvgl/9.4/lv_port_linux/lvgl
+    ${DOORBELL_LVGL_ROOT}
     ${PKG_CONFIG_INC}
 )
 
