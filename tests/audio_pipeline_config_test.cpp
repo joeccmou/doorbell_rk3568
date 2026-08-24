@@ -17,8 +17,19 @@ void test_audio_pipeline_caps_are_named_for_log_and_pipeline_use() {
          "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1");
 }
 
+void test_capture_mix_selects_hardware_channel_zero() {
+  const auto coefficients = audio_capture_channel_mix_coefficients();
+  const float channel_zero = 1000.0F;
+  const float channel_one = 30000.0F;
+  const float output = channel_zero * coefficients[0] +
+                       channel_one * coefficients[1];
+
+  assert(output == 1000.0F);
+}
+
 int main() {
   test_audio_pipeline_keeps_hardware_and_webrtc_rates_separate();
   test_audio_pipeline_caps_are_named_for_log_and_pipeline_use();
+  test_capture_mix_selects_hardware_channel_zero();
   return 0;
 }

@@ -68,6 +68,26 @@ uint64_t pipeline_running_time_ns(GstElement *pipeline) {
   return static_cast<uint64_t>(now - base);
 }
 
+void configure_capture_channel_mix(GstElement *channel_select) {
+  GValue matrix = G_VALUE_INIT;
+  GValue output_row = G_VALUE_INIT;
+  GValue coefficient = G_VALUE_INIT;
+
+  g_value_init(&matrix, GST_TYPE_ARRAY);
+  g_value_init(&output_row, GST_TYPE_ARRAY);
+  g_value_init(&coefficient, G_TYPE_DOUBLE);
+  for (const double value : audio_capture_channel_mix_coefficients()) {
+    g_value_set_double(&coefficient, value);
+    gst_value_array_append_value(&output_row, &coefficient);
+  }
+  gst_value_array_append_value(&matrix, &output_row);
+  g_object_set_property(G_OBJECT(channel_select), "mix-matrix", &matrix);
+
+  g_value_unset(&coefficient);
+  g_value_unset(&output_row);
+  g_value_unset(&matrix);
+}
+
 } // namespace
 
 size_t AudioFrameDispatcher::register_consumer(Consumer consumer) {
@@ -130,7 +150,8 @@ bool AudioCaptureManager::start(const std::string &device,
       "alsasink name=playback_sink device=%s sync=true async=false "
       "alsasrc device=%s do-timestamp=true ! "
       "%s ! "
-      "queue leaky=downstream max-size-buffers=8 ! audioconvert ! "
+      "queue leaky=downstream max-size-buffers=8 ! "
+      "audioconvert name=capture_channel_select ! "
       "audioresample ! "
       "%s ! "
       "webrtcdsp name=capture_dsp probe=echo_probe echo-cancel=true "
@@ -167,10 +188,13 @@ bool AudioCaptureManager::start(const std::string &device,
       gst_bin_get_by_name(GST_BIN(pipeline), "playback_src");
   GstElement *playback_sink =
       gst_bin_get_by_name(GST_BIN(pipeline), "playback_sink");
+  GstElement *capture_channel_select =
+      gst_bin_get_by_name(GST_BIN(pipeline), "capture_channel_select");
   GstPad *playback_sink_pad =
       playback_sink ? gst_element_get_static_pad(playback_sink, "sink")
                     : nullptr;
-  if (!appsink || !playback_appsrc || !playback_sink_pad) {
+  if (!appsink || !playback_appsrc || !playback_sink_pad ||
+      !capture_channel_select) {
     if (playback_sink_pad)
       gst_object_unref(playback_sink_pad);
     if (playback_sink)
@@ -179,11 +203,15 @@ bool AudioCaptureManager::start(const std::string &device,
       gst_object_unref(appsink);
     if (playback_appsrc)
       gst_object_unref(playback_appsrc);
+    if (capture_channel_select)
+      gst_object_unref(capture_channel_select);
     gst_object_unref(pipeline);
     if (error_message)
       *error_message = "audio manager app elements not found";
     return false;
   }
+  configure_capture_channel_mix(capture_channel_select);
+  gst_object_unref(capture_channel_select);
   gst_object_unref(playback_sink);
   gst_app_src_set_stream_type(GST_APP_SRC(playback_appsrc),
                               GST_APP_STREAM_TYPE_STREAM);
@@ -246,7 +274,8 @@ bool AudioCaptureManager::start(const std::string &device,
   std::fprintf(stdout,
                "[audio] capture started device=%s hardware_rate=%d "
                "hardware_channels=%d webrtc_rate=%d webrtc_channels=%d "
-               "playback_mixer=cpp_pcm playback_clock=active_source\n",
+               "capture_channel=0 playback_mixer=cpp_pcm "
+               "playback_clock=active_source\n",
                device.c_str(), kAudioHardwareRate, kAudioHardwareChannels,
                kAudioWebRtcRate, kAudioWebRtcChannels);
   return true;

@@ -1083,6 +1083,7 @@ bool LiveWebRtcSession::start(const StartRequest &request, std::string *error_me
         active_published_ = false;
         offer_requested_ = false;
         local_offer_sdp_.clear();
+        remote_ice_candidates_.begin_remote_description_update();
         pending_quality_switch_.reset();
         quality_switch_deadline_ = {};
         quality_switch_answer_applied_ = false;
@@ -1280,6 +1281,7 @@ void LiveWebRtcSession::stop() {
         active_published_ = false;
         offer_requested_ = false;
         local_offer_sdp_.clear();
+        remote_ice_candidates_.begin_remote_description_update();
         pending_quality_switch_.reset();
         quality_switch_deadline_ = {};
         quality_switch_answer_applied_ = false;
@@ -1973,6 +1975,7 @@ void LiveWebRtcSession::request_offer(const char *reason) {
             already_requested = true;
         } else {
             offer_requested_ = true;
+            remote_ice_candidates_.begin_remote_description_update();
         }
         if (webrtc) gst_object_ref(webrtc);
     }
@@ -2032,15 +2035,40 @@ void LiveWebRtcSession::on_offer_created(GstPromise *promise) {
     }
 
     gchar *sdp_text = gst_sdp_message_as_text(offer->sdp);
-    if (sdp_text) {
-        std::string sdp(sdp_text);
+    if (!sdp_text) {
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            local_offer_sdp_ = sdp;
+            local_offer_sdp_.clear();
         }
-    } else {
+        std::fprintf(stderr, "[live] offer created but SDP text is null\n");
+        gst_webrtc_session_description_free(offer);
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
+        return;
+    }
+
+    std::string sdp(sdp_text);
+    if (!webrtc_sdp_has_single_audio_video_pair(sdp)) {
+        bool switching = false;
+        std::fprintf(stderr,
+                     "[live] reject malformed local offer: expected one video and one audio m-line sdp_len=%zu\n",
+                     sdp.size());
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            switching = pending_quality_switch_.has_value();
+            local_offer_sdp_.clear();
+            offer_requested_ = false;
+        }
+        g_free(sdp_text);
+        gst_webrtc_session_description_free(offer);
+        finish_quality_switch(false, "LIVE_QUALITY_SWITCH_FAILED");
+        if (!switching) {
+            publish_state("idle");
+        }
+        return;
+    }
+    {
         std::lock_guard<std::mutex> lock(mtx_);
-        local_offer_sdp_.clear();
+        local_offer_sdp_ = sdp;
     }
 
     GstPromise *local_promise = gst_promise_new();
@@ -2048,16 +2076,10 @@ void LiveWebRtcSession::on_offer_created(GstPromise *promise) {
     gst_promise_interrupt(local_promise);
     gst_promise_unref(local_promise);
 
-    if (sdp_text) {
-        std::string sdp(sdp_text);
-        std::fprintf(stderr, "[live] offer created sdp_len=%zu\n", sdp.size());
-        log_sdp_candidate_lines("local-offer", sdp);
-        publish_signal("offer", &sdp, nullptr);
-        g_free(sdp_text);
-    }
-    else {
-        std::fprintf(stderr, "[live] offer created but SDP text is null\n");
-    }
+    std::fprintf(stderr, "[live] offer created sdp_len=%zu\n", sdp.size());
+    log_sdp_candidate_lines("local-offer", sdp);
+    publish_signal("offer", &sdp, nullptr);
+    g_free(sdp_text);
     gst_webrtc_session_description_free(offer);
 }
 
@@ -2359,10 +2381,23 @@ void LiveWebRtcSession::on_remote_description_set(
     gst_promise_unref(promise);
 
     bool current_session = false;
+    bool switching = false;
+    GstElement *webrtc = nullptr;
+    std::vector<RemoteIceCandidate> pending_candidates;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         current_session =
             webrtc_ != nullptr && current_.call_id == call_id;
+        if (current_session && result == GST_PROMISE_RESULT_REPLIED) {
+            webrtc = webrtc_;
+            gst_object_ref(webrtc);
+            pending_candidates =
+                remote_ice_candidates_.mark_remote_description_set();
+            if (pending_quality_switch_) {
+                quality_switch_answer_applied_ = true;
+                switching = true;
+            }
+        }
     }
     if (!current_session) {
         std::fprintf(
@@ -2375,16 +2410,17 @@ void LiveWebRtcSession::on_remote_description_set(
     if (result == GST_PROMISE_RESULT_REPLIED) {
         std::fprintf(
             stderr,
-            "[live] set remote answer completed call_id=%s\n",
-            call_id.c_str());
-        bool switching = false;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            if (pending_quality_switch_) {
-                quality_switch_answer_applied_ = true;
-                switching = true;
-            }
+            "[live] set remote answer completed call_id=%s pending_candidates=%zu\n",
+            call_id.c_str(),
+            pending_candidates.size());
+        for (const auto &candidate : pending_candidates) {
+            g_signal_emit_by_name(
+                webrtc,
+                "add-ice-candidate",
+                candidate.mline_index,
+                candidate.candidate.c_str());
         }
+        gst_object_unref(webrtc);
         if (switching) {
             // 等新分辨率实际产出首包 RTP 后再确认成功；首帧协商失败仍可回滚。
             request_video_keyframe();
@@ -2453,13 +2489,6 @@ void LiveWebRtcSession::handle_answer(const nlohmann::json &signal) {
 }
 
 void LiveWebRtcSession::handle_candidate(const nlohmann::json &signal) {
-    GstElement *webrtc = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        webrtc = webrtc_;
-    }
-    if (!webrtc) return;
-
     const auto candidate_value = signal.value("candidate", nlohmann::json(nullptr));
     if (!candidate_value.is_object()) return;
     const std::string candidate = candidate_value.value("candidate", "");
@@ -2470,5 +2499,25 @@ void LiveWebRtcSession::handle_candidate(const nlohmann::json &signal) {
                  mline_index,
                  candidate.size(),
                  summarize_ice_candidate(candidate).c_str());
+
+    GstElement *webrtc = nullptr;
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!webrtc_) return;
+        queued = remote_ice_candidates_.enqueue_if_pending(
+            mline_index, candidate);
+        if (!queued) {
+            webrtc = webrtc_;
+            gst_object_ref(webrtc);
+        }
+    }
+    if (queued) {
+        std::fprintf(stderr,
+                     "[live] defer ICE remote candidate until answer mline=%u\n",
+                     mline_index);
+        return;
+    }
     g_signal_emit_by_name(webrtc, "add-ice-candidate", mline_index, candidate.c_str());
+    gst_object_unref(webrtc);
 }

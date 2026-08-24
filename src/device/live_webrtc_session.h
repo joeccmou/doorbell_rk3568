@@ -15,6 +15,7 @@
 #include <gst/gst.h>
 #include <nlohmann/json.hpp>
 
+#include "device/webrtc_sdp_utils.h"
 #include "utils/audio_capture_manager.h"
 
 class LiveWebRtcSession {
@@ -164,6 +165,7 @@ private:
     bool active_published_ = false;
     bool offer_requested_ = false;
     std::string local_offer_sdp_;
+    RemoteIceCandidateBuffer remote_ice_candidates_;
     bool quality_switch_answer_applied_ = false;
     std::optional<PendingQualitySwitch> pending_quality_switch_;
     std::condition_variable quality_switch_cv_;
